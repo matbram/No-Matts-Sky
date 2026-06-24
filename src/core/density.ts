@@ -34,12 +34,14 @@ export interface TerrainRecipe {
 /** The slice's single recipe, keyed off the planet's terrain seed. [T] tunable. */
 export function sliceTerrainRecipe(terrainSeed: number): TerrainRecipe {
   return {
-    noiseScale: 22,
-    height: 12_000,
+    // ~280 features across the sphere → several hills per leaf at slice depth
+    // (at noiseScale 22 a leaf was smaller than one feature, so it read flat).
+    noiseScale: 140,
+    height: 14_000,
     octaves: 5,
     lacunarity: 2.0,
     gain: 0.5,
-    warpStrength: 0.6,
+    warpStrength: 0.7,
     seed: terrainSeed >>> 0,
   };
 }

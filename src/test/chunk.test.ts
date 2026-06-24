@@ -121,11 +121,11 @@ describe('meshChunk', () => {
       triangleCount: m.triangleCount,
     }).toMatchInlineSnapshot(`
       {
-        "indices": "885d387c",
-        "normals": "a157f755",
-        "positions": "fd5615a2",
-        "triangleCount": 882,
-        "vertexCount": 459,
+        "indices": "602e89e0",
+        "normals": "15c40a9a",
+        "positions": "39fc27a5",
+        "triangleCount": 968,
+        "vertexCount": 483,
       }
     `);
   });
