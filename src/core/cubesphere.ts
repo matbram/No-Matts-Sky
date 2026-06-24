@@ -39,6 +39,22 @@ export const CUBE_FACES: readonly CubeFace[] = [
   { normal: [0, 0, -1], uDir: [0, 1, 0], vDir: [1, 0, 0] }, // -Z
 ];
 
+/**
+ * Project a face's (u,v) ∈ [-1,1]² onto the UNIT sphere — the single source of
+ * truth for the cube→sphere mapping (used by `buildCubeSphere` and by the chunk
+ * mesher). Simple normalization: exact and seamless, because adjacent faces
+ * compute identical cube coordinates on a shared edge and normalize identically.
+ * The arithmetic order is load-bearing — it's frozen by the Step 0 golden test.
+ */
+export function faceDirection(faceIndex: number, u: number, v: number): [number, number, number] {
+  const f = CUBE_FACES[faceIndex]!;
+  const cx = f.normal[0] + u * f.uDir[0] + v * f.vDir[0];
+  const cy = f.normal[1] + u * f.uDir[1] + v * f.vDir[1];
+  const cz = f.normal[2] + u * f.uDir[2] + v * f.vDir[2];
+  const invLen = 1 / Math.sqrt(cx * cx + cy * cy + cz * cz);
+  return [cx * invLen, cy * invLen, cz * invLen];
+}
+
 /** Plain mesh data — no Three.js types cross this boundary. */
 export interface SphereMesh {
   positions: Float32Array; // x,y,z per vertex
@@ -72,23 +88,13 @@ export function buildCubeSphere(subdivisions: number, radius: number): SphereMes
   let iPtr = 0; // cursor into indices
   let baseVertex = 0; // first vertex index of the current face
 
-  for (const face of CUBE_FACES) {
-    const [nx, ny, nz] = face.normal;
-    const [ux, uy, uz] = face.uDir;
-    const [vx, vy, vz] = face.vDir;
-
+  for (let fi = 0; fi < 6; fi++) {
     // Vertices: row-major in (i along uDir, j along vDir).
     for (let i = 0; i < side; i++) {
       const u = -1 + (2 * i) / s;
       for (let j = 0; j < side; j++) {
         const v = -1 + (2 * j) / s;
-        const cx = nx + u * ux + v * vx;
-        const cy = ny + u * uy + v * vy;
-        const cz = nz + u * uz + v * vz;
-        const invLen = 1 / Math.sqrt(cx * cx + cy * cy + cz * cz);
-        const dirx = cx * invLen;
-        const diry = cy * invLen;
-        const dirz = cz * invLen;
+        const [dirx, diry, dirz] = faceDirection(fi, u, v);
         positions[vPtr] = dirx * radius;
         positions[vPtr + 1] = diry * radius;
         positions[vPtr + 2] = dirz * radius;
