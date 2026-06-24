@@ -182,13 +182,24 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       vel.copy(worldCam).sub(prevWorldCam); // world units / frame
       prevWorldCam.copy(worldCam);
 
+      // Dynamic near/far from altitude + horizon distance, every frame. Fixed
+      // per-preset planes blacked the planet out on zoom-out (far too small);
+      // this always reaches the visible limb and keeps a sane depth ratio.
+      const distCenter = worldCam.length();
+      const alt = Math.max(distCenter - R, 1);
+      const horizon = Math.sqrt(Math.max(0, distCenter * distCenter - R * R));
+      camera.near = Math.max(1, alt * 0.05);
+      camera.far = horizon + recipe.height * 8 + alt * 0.1;
+      camera.updateProjectionMatrix();
+
       const distToTarget = worldCam.distanceTo(targetWorld);
       // Re-cut when the camera has moved enough (adaptive: tighter near surface).
       const moved = worldCam.distanceTo(lastCutPos);
       if (forceCut || moved > Math.max(50, distToTarget * 0.02)) {
         forward.copy(targetWorld).sub(worldCam).normalize(); // orbit controls always look at target
-        // Cone half-angle covering the frustum corners (+margin), for view culling.
-        const halfFov = Math.atan(Math.tan(fovY / 2) * Math.sqrt(1 + aspect * aspect)) * 1.15;
+        // Cone half-angle covering the frustum corners, with margin so leaves just
+        // off-screen are pre-meshed before they rotate into view (fewer reveals).
+        const halfFov = Math.atan(Math.tan(fovY / 2) * Math.sqrt(1 + aspect * aspect)) * 1.35;
         lookahead.copy(worldCam).addScaledVector(vel, LOOKAHEAD_FRAMES); // generate ahead of motion
         manager.update(
           {

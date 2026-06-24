@@ -15,7 +15,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Scene, Mesh, BufferGeometry, BufferAttribute, type Material } from 'three';
-import { selectCut, nodeBounds, type CameraView, type QuadNode } from '../core/quadtree.ts';
+import {
+  selectCut,
+  nodeBounds,
+  retainedShouldRemove,
+  type CameraView,
+  type QuadNode,
+} from '../core/quadtree.ts';
 import { chunkKey, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
 import type { TerrainRecipe } from '../core/density.ts';
 
@@ -52,6 +58,7 @@ export class QuadtreeManager {
   private readonly pendingQueue: string[] = []; // keys, nearest-first
   private readonly readyQueue: string[] = []; // meshed, awaiting GPU upload
   private readonly jobKey = new Map<number, string>();
+  private wanted = new Set<string>();
   private readonly workers: Worker[] = [];
   private readonly idle: Worker[] = [];
   private readonly heightMargin: number;
@@ -109,16 +116,15 @@ export class QuadtreeManager {
         this.entries.set(key, { node, status: 'pending', center: b.center, mesh: null, ready: null });
       }
     }
-    // Drop leaves no longer wanted (cancels pending work; in-flight results are
-    // discarded on arrival because the entry is gone).
+    this.wanted = wanted;
+    // Unwanted NON-LIVE entries are cancelled now (no point finishing work we no
+    // longer want). Unwanted LIVE leaves are RETAINED — kept rendered until their
+    // replacement is live (purgeRetained), so no hole/black-flash appears during
+    // the LOD transition. (Cancelled pending: pump skips; inflight: onMesh
+    // discards; ready: uploadReady skips — all keyed off the entry being gone.)
     for (const [key, e] of this.entries) {
-      if (!wanted.has(key)) {
-        if (e.mesh) {
-          this.scene.remove(e.mesh);
-          e.mesh.geometry.dispose();
-        }
-        this.entries.delete(key);
-      }
+      if (wanted.has(key) || e.status === 'live') continue;
+      this.entries.delete(key);
     }
 
     // Rebuild the dispatch queue, nearest-to-lookahead first.
@@ -127,6 +133,27 @@ export class QuadtreeManager {
     this.pendingQueue.sort((a, b) => this.dist2(b, lookahead) - this.dist2(a, lookahead)); // far→near
     // (we pop from the end, so the array is sorted far→near and pop() gives nearest)
     this.pump();
+    this.purgeRetained();
+  }
+
+  /** Remove retained (live, no-longer-wanted) leaves whose replacement is ready. */
+  private purgeRetained(): void {
+    if (this.wanted.size === 0) return;
+    const wantedArr: { node: QuadNode; live: boolean }[] = [];
+    for (const key of this.wanted) {
+      const e = this.entries.get(key);
+      if (e) wantedArr.push({ node: e.node, live: e.status === 'live' });
+    }
+    for (const [key, e] of this.entries) {
+      if (e.status !== 'live' || this.wanted.has(key)) continue;
+      if (retainedShouldRemove(e.node, wantedArr)) {
+        if (e.mesh) {
+          this.scene.remove(e.mesh);
+          e.mesh.geometry.dispose();
+        }
+        this.entries.delete(key);
+      }
+    }
   }
 
   /** Upload up to `budget` finished meshes to the GPU this frame; returns how many. */
@@ -154,6 +181,7 @@ export class QuadtreeManager {
       this.scene.add(mesh);
       n++;
     }
+    if (n > 0) this.purgeRetained(); // newly-live leaves may now cover retained ones
     return n;
   }
 

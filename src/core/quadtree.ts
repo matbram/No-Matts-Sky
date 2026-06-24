@@ -51,6 +51,49 @@ export function childrenOf(node: QuadNode): QuadNode[] {
   return [0, 1, 2, 3].map((q) => ({ face: node.face, path: [...node.path, q] }));
 }
 
+/** True if path `a` is a prefix of path `b` (a is an ancestor-or-equal of b). */
+export function isPathPrefix(a: number[], b: number[]): boolean {
+  if (a.length > b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * Deferred-removal predicate: should a retained (live, no-longer-wanted) leaf `x`
+ * be removed now? The wanted cut is a partition, so the wanted leaves overlapping
+ * x's region are EITHER one ancestor (the camera merged up) OR a set of
+ * descendants (it split down). Remove x when its replacement is fully on screen:
+ *   • no wanted leaf overlaps x        → x left the view entirely;
+ *   • the overlapping ancestor is live → the merge is ready;
+ *   • all overlapping descendants live → the split is ready.
+ * Otherwise keep x rendered so no hole (black flash) appears mid-transition.
+ */
+export function retainedShouldRemove(
+  x: QuadNode,
+  wanted: ReadonlyArray<{ node: QuadNode; live: boolean }>,
+): boolean {
+  let anyOverlap = false;
+  let descCount = 0;
+  let descLive = 0;
+  for (const w of wanted) {
+    if (w.node.face !== x.face) continue;
+    const xPrefixOfW = isPathPrefix(x.path, w.node.path); // w is descendant-or-equal of x
+    const wPrefixOfX = isPathPrefix(w.node.path, x.path); // w is ancestor-or-equal of x
+    if (!xPrefixOfW && !wPrefixOfX) continue;
+    anyOverlap = true;
+    if (w.node.path.length < x.path.length) {
+      if (w.live) return true; // a live ancestor covers x (merge done)
+    } else if (w.node.path.length > x.path.length) {
+      descCount++;
+      if (w.live) descLive++;
+    } else if (w.live) {
+      return true; // x itself is wanted-and-live (defensive)
+    }
+  }
+  if (!anyOverlap) return true; // x's region is gone from the cut → remove
+  return descCount > 0 && descCount === descLive; // all split children live → remove
+}
+
 /** World-space bounding sphere of a node: its surface patch ± the terrain margin. */
 export function nodeBounds(
   face: number,

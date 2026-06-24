@@ -4,6 +4,8 @@ import {
   nodeBounds,
   projectedSize,
   selectCut,
+  isPathPrefix,
+  retainedShouldRemove,
   type CameraView,
   type SelectOpts,
   type QuadNode,
@@ -43,6 +45,39 @@ describe('quadtree node math', () => {
   it('projectedSize grows as distance shrinks, and is Infinity inside the bounds', () => {
     expect(projectedSize(1000, 1e6, VP, FOVY)).toBeLessThan(projectedSize(1000, 1e5, VP, FOVY));
     expect(projectedSize(1000, 500, VP, FOVY)).toBe(Infinity);
+  });
+});
+
+describe('isPathPrefix', () => {
+  it('detects ancestor-or-equal paths', () => {
+    expect(isPathPrefix([1], [1, 2, 3])).toBe(true);
+    expect(isPathPrefix([], [0, 1])).toBe(true);
+    expect(isPathPrefix([1, 2], [1, 3])).toBe(false);
+    expect(isPathPrefix([1, 2, 3], [1, 2])).toBe(false); // longer can't be a prefix
+  });
+});
+
+describe('retainedShouldRemove (deferred LOD removal)', () => {
+  const n = (face: number, path: number[]): QuadNode => ({ face, path });
+  const other = { node: n(1, [2]), live: true }; // unrelated leaf, must be ignored
+
+  it('keeps a retained leaf until its merge ancestor is live', () => {
+    const x = n(0, [0, 1, 2]);
+    expect(retainedShouldRemove(x, [{ node: n(0, [0]), live: false }, other])).toBe(false);
+    expect(retainedShouldRemove(x, [{ node: n(0, [0]), live: true }, other])).toBe(true);
+  });
+
+  it('keeps a retained leaf until all split children are live', () => {
+    const x = n(0, [2]);
+    const kids = (live: boolean[]): { node: QuadNode; live: boolean }[] =>
+      [0, 1, 2, 3].map((q, i) => ({ node: n(0, [2, q]), live: live[i]! }));
+    expect(retainedShouldRemove(x, [...kids([true, true, true, false]), other])).toBe(false);
+    expect(retainedShouldRemove(x, [...kids([true, true, true, true]), other])).toBe(true);
+  });
+
+  it('removes a retained leaf whose region left the view entirely', () => {
+    const x = n(0, [3]);
+    expect(retainedShouldRemove(x, [{ node: n(0, [0]), live: true }, other])).toBe(true);
   });
 });
 
