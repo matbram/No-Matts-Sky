@@ -3,6 +3,9 @@
 // screen from Step 0." Green when within budget, red when over.
 
 const FRAME_BUDGET_MS = 1000 / 60; // 16.67
+// Turn the readout red only when genuinely below ~55 fps, so a 60 Hz vsync cap
+// (a normal ~16.7 ms frame) isn't a false alarm.
+const RED_THRESHOLD_MS = 1000 / 55; // ~18.2
 
 export class Stats {
   private readonly el: HTMLDivElement;
@@ -46,7 +49,7 @@ export class Stats {
     this.frames++;
     if (this.acc >= 250) {
       const fps = (this.frames * 1000) / this.acc;
-      const overBudget = this.smoothedMs > FRAME_BUDGET_MS;
+      const overBudget = this.smoothedMs > RED_THRESHOLD_MS;
       this.el.style.color = overBudget ? '#ff6b6b' : '#7cfc8a';
       this.el.textContent =
         `${fps.toFixed(0)} fps   ${this.smoothedMs.toFixed(2)} ms` +

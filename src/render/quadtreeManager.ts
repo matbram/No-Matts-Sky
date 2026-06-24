@@ -31,13 +31,18 @@ interface Entry {
   status: Status;
   center: [number, number, number];
   mesh: Mesh | null;
+  mat: Material | null; // per-leaf material clone (independent opacity for the fade)
   ready: ChunkMesh | null;
+  fade: number; // 0..1 dithered cross-fade-in progress
 }
 interface MeshResult {
   id: number;
   mesh: ChunkMesh;
   ms: number;
 }
+
+/** LOD cross-fade duration (ms): detail dithers in over this long instead of snapping. */
+const FADE_MS = 350;
 
 export interface ManagerOpts {
   splitPx: number;
@@ -113,7 +118,15 @@ export class QuadtreeManager {
       wanted.add(key);
       if (!this.entries.has(key)) {
         const b = nodeBounds(node.face, node.path, this.radius, 0);
-        this.entries.set(key, { node, status: 'pending', center: b.center, mesh: null, ready: null });
+        this.entries.set(key, {
+          node,
+          status: 'pending',
+          center: b.center,
+          mesh: null,
+          mat: null,
+          ready: null,
+          fade: 0,
+        });
       }
     }
     this.wanted = wanted;
@@ -136,13 +149,18 @@ export class QuadtreeManager {
     this.purgeRetained();
   }
 
-  /** Remove retained (live, no-longer-wanted) leaves whose replacement is ready. */
+  /**
+   * Remove retained (live, no-longer-wanted) leaves whose replacement has fully
+   * FADED IN — so the old leaf stays opaque behind the new one until the cross-fade
+   * completes, then disappears with nothing visible changing.
+   */
   private purgeRetained(): void {
     if (this.wanted.size === 0) return;
     const wantedArr: { node: QuadNode; live: boolean }[] = [];
     for (const key of this.wanted) {
       const e = this.entries.get(key);
-      if (e) wantedArr.push({ node: e.node, live: e.status === 'live' });
+      // A replacement only "covers" once it's live AND has finished fading in.
+      if (e) wantedArr.push({ node: e.node, live: e.status === 'live' && e.fade >= 1 });
     }
     for (const [key, e] of this.entries) {
       if (e.status !== 'live' || this.wanted.has(key)) continue;
@@ -151,9 +169,31 @@ export class QuadtreeManager {
           this.scene.remove(e.mesh);
           e.mesh.geometry.dispose();
         }
+        e.mat?.dispose();
         this.entries.delete(key);
       }
     }
+  }
+
+  /**
+   * Advance LOD cross-fades — call once per frame. Newly-live leaves dither in
+   * (opacity 0→1 over FADE_MS); when one finishes, drop its polygon-offset bias and
+   * purge any retained leaf it now fully covers.
+   */
+  tick(dtMs: number): void {
+    if (this.entries.size === 0) return;
+    const step = dtMs / FADE_MS;
+    let anyCompleted = false;
+    for (const e of this.entries.values()) {
+      if (e.status !== 'live' || e.fade >= 1 || !e.mat) continue;
+      e.fade = Math.min(1, e.fade + step);
+      e.mat.opacity = e.fade;
+      if (e.fade >= 1) {
+        e.mat.polygonOffset = false; // settle depth once fully resolved
+        anyCompleted = true;
+      }
+    }
+    if (anyCompleted) this.purgeRetained();
   }
 
   /** Upload up to `budget` finished meshes to the GPU this frame; returns how many. */
@@ -168,21 +208,30 @@ export class QuadtreeManager {
       geometry.setAttribute('position', new BufferAttribute(m.positions, 3));
       geometry.setAttribute('normal', new BufferAttribute(m.normals, 3));
       geometry.setIndex(new BufferAttribute(m.indices, 1));
-      const mesh = new Mesh(geometry, this.material);
+      // Per-leaf material clone so its opacity (the dither fade) is independent.
+      // Start invisible and biased toward the camera so it wins the depth test over
+      // the retained leaf it's fading in over (tick() settles both once faded).
+      const mat = this.material.clone();
+      mat.opacity = 0;
+      mat.polygonOffset = true;
+      mat.polygonOffsetFactor = -1;
+      mat.polygonOffsetUnits = -1;
+      const mesh = new Mesh(geometry, mat);
       mesh.position.set(
         m.origin[0] - this.renderOrigin[0],
         m.origin[1] - this.renderOrigin[1],
         m.origin[2] - this.renderOrigin[2],
       );
       e.mesh = mesh;
+      e.mat = mat;
       e.center = m.origin;
       e.ready = null;
       e.status = 'live';
+      e.fade = 0;
       this.scene.add(mesh);
       n++;
     }
-    if (n > 0) this.purgeRetained(); // newly-live leaves may now cover retained ones
-    return n;
+    return n; // purge happens in tick() when fades complete, and in update()
   }
 
   stats(): StreamStats {
@@ -202,6 +251,7 @@ export class QuadtreeManager {
         this.scene.remove(e.mesh);
         e.mesh.geometry.dispose();
       }
+      e.mat?.dispose();
     }
     this.entries.clear();
   }

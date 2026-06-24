@@ -91,12 +91,15 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // Terrain recipe from the slice planet's coordinate-derived seed.
   const terrainSeed = childSeed(sliceFacts().seed, 0, SALT.terrain);
   const recipe = sliceTerrainRecipe(terrainSeed);
-  // Double-sided so skirt curtains show regardless of winding.
+  // Double-sided so skirt curtains show regardless of winding. alphaHash turns
+  // per-mesh `opacity` into a pixel-footprint dither, which the manager drives
+  // 0→1 per leaf for the LOD cross-fade (detail resolves in instead of snapping).
   const material = new MeshStandardNodeMaterial({
     color: 0x9a8c7a,
     roughness: 0.92,
     metalness: 0.0,
     side: DoubleSide,
+    alphaHash: true,
   });
   // splitPx 300 (smaller, gentler LOD steps — affordable after the ~13× meshing
   // speedup); maxDepth 10 caps leaf counts.
@@ -114,7 +117,14 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     g.setIndex(new BufferAttribute(s.indices, 1));
     return g;
   })();
-  const backdrop = new Mesh(backdropGeo, material);
+  // The backdrop is always fully opaque (no alphaHash — it must never dither).
+  const backdropMaterial = new MeshStandardNodeMaterial({
+    color: 0x9a8c7a,
+    roughness: 0.92,
+    metalness: 0.0,
+    side: DoubleSide,
+  });
+  const backdrop = new Mesh(backdropGeo, backdropMaterial);
   scene.add(backdrop);
 
   // ── Camera presets (the gate's "static camera positions") ──────────────────
@@ -188,6 +198,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
 
   let vpHeight = window.innerHeight;
   let aspect = 1;
+  let lastFrame = performance.now();
   const worldCam = new Vector3();
   const forward = new Vector3();
   const vel = new Vector3();
@@ -196,6 +207,9 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   return {
     renderer,
     render(): void {
+      const now = performance.now();
+      const dt = now - lastFrame;
+      lastFrame = now;
       controls.update();
       worldCam.copy(camera.position).add(renderOrigin);
       vel.copy(worldCam).sub(prevWorldCam); // world units / frame
@@ -216,9 +230,11 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       const moved = worldCam.distanceTo(lastCutPos);
       if (forceCut || moved > Math.max(50, distToTarget * 0.02)) {
         forward.copy(targetWorld).sub(worldCam).normalize(); // orbit controls always look at target
-        // Cone half-angle covering the frustum corners, with margin so leaves just
-        // off-screen are pre-meshed before they rotate into view (fewer reveals).
-        const halfFov = Math.atan(Math.tan(fovY / 2) * Math.sqrt(1 + aspect * aspect)) * 1.35;
+        // Cone half-angle covering the frustum corners, with a small margin so
+        // leaves just off-screen are pre-meshed before rotating in. Tighter now
+        // (1.2) than before — the cross-fade hides reveals, so we mesh a smaller
+        // ring and keep the queue shallow on fast rotation.
+        const halfFov = Math.atan(Math.tan(fovY / 2) * Math.sqrt(1 + aspect * aspect)) * 1.2;
         lookahead.copy(worldCam).addScaledVector(vel, LOOKAHEAD_FRAMES); // generate ahead of motion
         manager.update(
           {
@@ -236,6 +252,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // Drain finished meshes onto the GPU under the per-frame budget (the only
       // generation cost in-frame; generation itself ran on the worker pool).
       manager.uploadReady(UPLOAD_PER_FRAME);
+      manager.tick(dt); // advance LOD cross-fades
       renderer.render(scene, camera);
     },
     streamInfo(): string {
@@ -254,6 +271,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       manager.dispose();
       controls.dispose();
       backdropGeo.dispose();
+      backdropMaterial.dispose();
       material.dispose();
       renderer.dispose();
     },
