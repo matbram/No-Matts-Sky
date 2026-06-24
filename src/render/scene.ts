@@ -18,8 +18,9 @@ import {
   BufferGeometry,
   BufferAttribute,
   DirectionalLight,
-  AmbientLight,
+  HemisphereLight,
   Color,
+  ACESFilmicToneMapping,
 } from 'three';
 import { WebGPURenderer, MeshStandardNodeMaterial } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
@@ -40,6 +41,10 @@ export interface SliceScene {
 export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene> {
   const renderer = new WebGPURenderer({ canvas, antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  // r184 WebGPU uses physically-based lighting; without tone mapping, bright
+  // lights clip to white. ACES keeps the lit hemisphere readable.
+  renderer.toneMapping = ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
   // CRITICAL (CLAUDE.md §2): WebGPURenderer init is async. Forget the await and
   // you get a blank screen with NO error.
   await renderer.init();
@@ -70,12 +75,13 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const planet = new Mesh(geometry, material);
   scene.add(planet);
 
-  // One directional "sun" + faint fill. (Real day/night comes from planet spin
-  // at Step 5; this is just enough to read the sphere's form.)
-  const sun = new DirectionalLight(0xfff4e6, 3.0);
+  // One directional "sun" + a faint hemisphere fill so the dark side and the
+  // terminator still read. (Real day/night comes from planet spin at Step 5;
+  // intensities tuned for ACES tone mapping above.)
+  const sun = new DirectionalLight(0xfff4e6, 1.4);
   sun.position.set(1, 0.35, 0.6);
   scene.add(sun);
-  scene.add(new AmbientLight(0x223044, 0.5));
+  scene.add(new HemisphereLight(0x88aacc, 0x141018, 0.25));
 
   const controls = new OrbitControls(camera, canvas);
   controls.enableDamping = true;

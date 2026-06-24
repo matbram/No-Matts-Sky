@@ -73,6 +73,67 @@ describe('buildCubeSphere — geometry', () => {
     }
   });
 
+  it('is watertight: welding by exact position, every edge is shared by exactly two triangles', () => {
+    // The definitive "no gaps anywhere" check — covers all 12 cube edges and 8
+    // corners at once (not just one face pair). A seam gap would leave boundary
+    // edges used by a single triangle.
+    const s = 6;
+    const mesh = buildCubeSphere(s, EARTH_RADIUS_M);
+    const keyToId = new Map<string, number>();
+    const remap = new Uint32Array(mesh.vertexCount);
+    for (let v = 0; v < mesh.vertexCount; v++) {
+      const k = `${mesh.positions[v * 3]},${mesh.positions[v * 3 + 1]},${mesh.positions[v * 3 + 2]}`;
+      let id = keyToId.get(k);
+      if (id === undefined) {
+        id = keyToId.size;
+        keyToId.set(k, id);
+      }
+      remap[v] = id;
+    }
+    const edgeUse = new Map<string, number>();
+    const addEdge = (a: number, b: number): void => {
+      const key = a < b ? `${a}_${b}` : `${b}_${a}`;
+      edgeUse.set(key, (edgeUse.get(key) ?? 0) + 1);
+    };
+    for (let t = 0; t < mesh.indices.length; t += 3) {
+      const a = remap[mesh.indices[t]!]!;
+      const b = remap[mesh.indices[t + 1]!]!;
+      const c = remap[mesh.indices[t + 2]!]!;
+      addEdge(a, b);
+      addEdge(b, c);
+      addEdge(c, a);
+    }
+    let boundaryEdges = 0;
+    for (const count of edgeUse.values()) if (count !== 2) boundaryEdges++;
+    expect(boundaryEdges).toBe(0);
+  });
+
+  it('all triangles wind outward (no culled/black faces that read as holes)', () => {
+    const mesh = buildCubeSphere(4, 1);
+    for (let t = 0; t < mesh.indices.length; t += 3) {
+      const ia = mesh.indices[t]! * 3;
+      const ib = mesh.indices[t + 1]! * 3;
+      const ic = mesh.indices[t + 2]! * 3;
+      const ax = mesh.positions[ia]!,
+        ay = mesh.positions[ia + 1]!,
+        az = mesh.positions[ia + 2]!;
+      const e1x = mesh.positions[ib]! - ax,
+        e1y = mesh.positions[ib + 1]! - ay,
+        e1z = mesh.positions[ib + 2]! - az;
+      const e2x = mesh.positions[ic]! - ax,
+        e2y = mesh.positions[ic + 1]! - ay,
+        e2z = mesh.positions[ic + 2]! - az;
+      // face normal = e1 × e2; centroid points radially outward from origin
+      const nx = e1y * e2z - e1z * e2y;
+      const ny = e1z * e2x - e1x * e2z;
+      const nz = e1x * e2y - e1y * e2x;
+      const cx = (ax + mesh.positions[ib]! + mesh.positions[ic]!) / 3;
+      const cy = (ay + mesh.positions[ib + 1]! + mesh.positions[ic + 1]!) / 3;
+      const cz = (az + mesh.positions[ib + 2]! + mesh.positions[ic + 2]!) / 3;
+      expect(nx * cx + ny * cy + nz * cz).toBeGreaterThan(0);
+    }
+  });
+
   it('has the canonical 6-face order +X −X +Y −Y +Z −Z', () => {
     expect(CUBE_FACES.map((f) => f.normal)).toEqual([
       [1, 0, 0],
