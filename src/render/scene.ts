@@ -1,29 +1,26 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// The Three.js WebGPU render shell — Step 1.
+// The Three.js WebGPU render shell — Step 2.
 //
-// It still consumes only PLAIN data from the pure core, but now that data is a
-// MESHED TERRAIN CHUNK produced OFF the main thread: a worker runs the density
-// field + Surface Nets and transfers back position/normal/index buffers, which we
-// drop straight into a BufferGeometry (no core module imports Three.js — that
-// boundary is the architecture, CLAUDE.md §3).
+// The whole planet is back, now built from a quadtree LOD: the QuadtreeManager
+// asks the pure core for the visible leaf cut, the worker meshes leaves, and
+// detail refines as the camera approaches — coarse from orbit, fine at the
+// surface. Skirts (in the core mesher) hide the cracks between LOD levels.
 //
-// Step 1 scope (slice spec §6): show ONE quadtree leaf with correct analytic
-// normals, meshed off-thread, lit by one sun. Vertices arrive RELATIVE to the
-// chunk origin, so we render in that chunk-local frame and orbit the patch. LOD
-// across the whole sphere is Step 2; continuous streaming + the floating origin
-// are Steps 3–4.
+// Step 2 scope (slice spec §6): seamless orbit→surface detail, no visible cracks,
+// correct LOD selection. Camera presets 1/2/3 (orbit/mid/surface) exercise it;
+// continuous async streaming with a worker pool is Step 3; the full floating
+// origin + walking is Step 4. We render relative to a per-preset renderOrigin to
+// keep GPU floats small.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import {
   Scene,
   PerspectiveCamera,
-  Mesh,
-  BufferGeometry,
-  BufferAttribute,
   DirectionalLight,
   HemisphereLight,
   Color,
   Vector3,
+  DoubleSide,
   ACESFilmicToneMapping,
 } from 'three';
 import { WebGPURenderer, MeshStandardNodeMaterial } from 'three/webgpu';
@@ -32,14 +29,7 @@ import { EARTH_RADIUS_M } from '../core/constants.ts';
 import { sliceTerrainRecipe } from '../core/density.ts';
 import { sliceFacts } from '../core/facts.ts';
 import { childSeed, SALT } from '../core/seedchain.ts';
-import type { ChunkMesh, MeshJob } from '../core/chunk.ts';
-
-interface IncomingJob extends MeshJob {
-  id: number;
-}
-
-// The one chunk Step 1 shows: a mid-depth leaf on the +Y face.
-const DEMO_REQUEST = { face: 2, path: [2, 1, 2, 1], lod: 4 } as const;
+import { QuadtreeManager } from './quadtreeManager.ts';
 
 export interface SliceScene {
   readonly renderer: WebGPURenderer;
@@ -48,15 +38,24 @@ export interface SliceScene {
   dispose(): void;
 }
 
+// A fixed surface look-at direction for the close presets (some arbitrary spot).
+const SURFACE_DIR = new Vector3(0.2, 1, 0.15).normalize();
+
+interface Preset {
+  target: Vector3; // world-space look-at
+  cam: Vector3; // world-space camera position
+  near: number;
+  far: number;
+  minD: number;
+  maxD: number;
+}
+
 export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene> {
   const renderer = new WebGPURenderer({ canvas, antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  // r184 WebGPU uses physically-based lighting; without tone mapping, bright
-  // lights clip to white. ACES keeps the lit surface readable.
   renderer.toneMapping = ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
-  // CRITICAL (CLAUDE.md §2): WebGPURenderer init is async. Forget the await and
-  // you get a blank screen with NO error.
+  // CRITICAL (CLAUDE.md §2): WebGPURenderer init is async — await before render.
   await renderer.init();
 
   const R = EARTH_RADIUS_M;
@@ -64,9 +63,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const scene = new Scene();
   scene.background = new Color(0x05070d);
 
-  // Placeholder framing; set for real once the chunk's bounds arrive.
-  const camera = new PerspectiveCamera(55, 1, 1000, R);
-  camera.position.set(0, 0, 1);
+  const camera = new PerspectiveCamera(55, 1, R * 0.4, R * 8);
+  const fovY = (camera.fov * Math.PI) / 180;
 
   const sun = new DirectionalLight(0xfff4e6, 1.4);
   sun.position.set(1, 0.35, 0.6);
@@ -77,74 +75,129 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   controls.rotateSpeed = 0.5;
-  controls.zoomSpeed = 0.7;
+  controls.zoomSpeed = 0.8;
 
-  const material = new MeshStandardNodeMaterial({ color: 0x9a8c7a, roughness: 0.92, metalness: 0.0 });
-  let patch: Mesh | null = null;
-  let geometry: BufferGeometry | null = null;
-
-  // ── Kick off off-thread meshing ────────────────────────────────────────────
+  // Terrain recipe from the slice planet's coordinate-derived seed.
   const terrainSeed = childSeed(sliceFacts().seed, 0, SALT.terrain);
   const recipe = sliceTerrainRecipe(terrainSeed);
-  const worker = new Worker(new URL('../workers/mesher.worker.ts', import.meta.url), {
-    type: 'module',
+  // Double-sided so skirt curtains show regardless of winding.
+  const material = new MeshStandardNodeMaterial({
+    color: 0x9a8c7a,
+    roughness: 0.92,
+    metalness: 0.0,
+    side: DoubleSide,
   });
-  const job: IncomingJob = { id: 1, req: { ...DEMO_REQUEST, path: [...DEMO_REQUEST.path] }, recipe, radius: R };
-  worker.onmessage = (e: MessageEvent<{ id: number; mesh: ChunkMesh }>): void => {
-    addPatch(e.data.mesh);
+  // maxDepth 10 caps the leaf count (~50 orbit / ~230 mid / ~185 surface with
+  // frustum + horizon culling) for the single Step-1 worker; Step 3's worker pool
+  // lifts the cap for walking-scale detail. splitPx 400 per slice spec §5.
+  const manager = new QuadtreeManager(scene, material, recipe, R, { splitPx: 400, maxDepth: 10 });
+
+  // ── Camera presets (the gate's "static camera positions") ──────────────────
+  const surf = SURFACE_DIR.clone().multiplyScalar(R);
+  const tangent = new Vector3()
+    .crossVectors(SURFACE_DIR, new Vector3(0, 0, 1))
+    .normalize();
+  const altMid = R * 0.12;
+  const altSurf = 28_000;
+  const presets: Record<string, Preset> = {
+    orbit: {
+      target: new Vector3(0, 0, 0),
+      cam: SURFACE_DIR.clone().multiplyScalar(R * 3),
+      near: R * 0.4,
+      far: R * 8,
+      minD: R * 1.3,
+      maxD: R * 6,
+    },
+    mid: {
+      target: surf.clone(),
+      cam: SURFACE_DIR.clone()
+        .multiplyScalar(R + altMid)
+        .addScaledVector(tangent, altMid * 0.5),
+      near: altMid * 0.08,
+      far: R * 2,
+      minD: altMid * 0.2,
+      maxD: R * 1.5,
+    },
+    surface: {
+      target: surf.clone(),
+      cam: SURFACE_DIR.clone()
+        .multiplyScalar(R + altSurf)
+        .addScaledVector(tangent, altSurf * 0.8),
+      near: altSurf * 0.05,
+      far: 800_000,
+      minD: altSurf * 0.15,
+      maxD: R * 0.3,
+    },
   };
-  worker.postMessage(job);
 
-  function addPatch(mesh: ChunkMesh): void {
-    geometry = new BufferGeometry();
-    geometry.setAttribute('position', new BufferAttribute(mesh.positions, 3));
-    geometry.setAttribute('normal', new BufferAttribute(mesh.normals, 3));
-    geometry.setIndex(new BufferAttribute(mesh.indices, 1));
-    patch = new Mesh(geometry, material);
-    scene.add(patch);
-    frameCamera(mesh);
-  }
+  let renderOrigin = new Vector3(0, 0, 0);
+  let targetWorld = new Vector3(0, 0, 0);
+  let forceCut = true;
+  const lastCutPos = new Vector3();
 
-  function frameCamera(mesh: ChunkMesh): void {
-    const { min, max } = mesh.bounds;
-    const center = new Vector3((min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2);
-    const size = Math.max(max[0] - min[0], max[1] - min[1], max[2] - min[2]);
-    const dist = size * 1.6;
-
-    // The patch's outward direction (its origin points away from planet center).
-    const out = new Vector3(...mesh.origin).normalize();
-    const upHint = Math.abs(out.y) > 0.9 ? new Vector3(1, 0, 0) : new Vector3(0, 1, 0);
-    const tangent = new Vector3().crossVectors(out, upHint).normalize();
-
-    camera.position
-      .copy(center)
-      .addScaledVector(out, dist * 0.95)
-      .addScaledVector(tangent, dist * 0.45);
-    camera.near = dist * 0.15;
-    camera.far = dist * 6;
+  function applyPreset(p: Preset): void {
+    renderOrigin = p.target.clone();
+    targetWorld = p.target.clone();
+    manager.setRenderOrigin([renderOrigin.x, renderOrigin.y, renderOrigin.z]);
+    camera.near = p.near;
+    camera.far = p.far;
+    camera.position.copy(p.cam).sub(renderOrigin);
     camera.updateProjectionMatrix();
-
-    controls.target.copy(center);
-    controls.minDistance = dist * 0.4;
-    controls.maxDistance = dist * 3;
+    controls.target.copy(p.target).sub(renderOrigin); // == 0
+    controls.minDistance = p.minD;
+    controls.maxDistance = p.maxD;
     controls.update();
+    forceCut = true;
   }
+  applyPreset(presets.orbit!);
+
+  const onKey = (e: KeyboardEvent): void => {
+    if (e.key === '1') applyPreset(presets.orbit!);
+    else if (e.key === '2') applyPreset(presets.mid!);
+    else if (e.key === '3') applyPreset(presets.surface!);
+  };
+  window.addEventListener('keydown', onKey);
+
+  let vpHeight = window.innerHeight;
+  let aspect = 1;
+  const worldCam = new Vector3();
+  const forward = new Vector3();
 
   return {
     renderer,
     render(): void {
       controls.update();
+      worldCam.copy(camera.position).add(renderOrigin);
+      const distToTarget = worldCam.distanceTo(targetWorld);
+      // Re-cut when the camera has moved enough (adaptive: tighter near surface).
+      const moved = worldCam.distanceTo(lastCutPos);
+      if (forceCut || moved > Math.max(50, distToTarget * 0.02)) {
+        forward.copy(targetWorld).sub(worldCam).normalize(); // orbit controls always look at target
+        // Cone half-angle covering the frustum corners (+margin), for view culling.
+        const halfFov = Math.atan(Math.tan(fovY / 2) * Math.sqrt(1 + aspect * aspect)) * 1.15;
+        manager.update({
+          position: [worldCam.x, worldCam.y, worldCam.z],
+          viewportHeight: vpHeight,
+          fovY,
+          forward: [forward.x, forward.y, forward.z],
+          halfFov,
+        });
+        lastCutPos.copy(worldCam);
+        forceCut = false;
+      }
       renderer.render(scene, camera);
     },
     resize(width: number, height: number): void {
-      camera.aspect = width / height;
+      vpHeight = height;
+      aspect = width / height;
+      camera.aspect = aspect;
       camera.updateProjectionMatrix();
       renderer.setSize(width, height, false);
     },
     dispose(): void {
-      worker.terminate();
+      window.removeEventListener('keydown', onKey);
+      manager.dispose();
       controls.dispose();
-      geometry?.dispose();
       material.dispose();
       renderer.dispose();
     },

@@ -1,0 +1,104 @@
+import { describe, it, expect } from 'vitest';
+import {
+  childrenOf,
+  nodeBounds,
+  projectedSize,
+  selectCut,
+  type CameraView,
+  type SelectOpts,
+  type QuadNode,
+} from '../core/quadtree.ts';
+import { chunkKey } from '../core/chunk.ts';
+import { EARTH_RADIUS_M } from '../core/constants.ts';
+
+// Step 2 gate (slice spec §6): correct LOD selection, coarse far → fine near, far
+// side culled. All verified headlessly; the seamless/no-cracks half is in-browser.
+
+const R = EARTH_RADIUS_M;
+const FOVY = (55 * Math.PI) / 180;
+const VP = 1080;
+
+const keyOf = (n: QuadNode): string => chunkKey({ face: n.face, path: n.path, lod: n.path.length });
+const norm = (v: [number, number, number]): [number, number, number] => {
+  const l = Math.hypot(v[0], v[1], v[2]);
+  return [v[0] / l, v[1] / l, v[2] / l];
+};
+const dot = (a: readonly number[], b: readonly number[]): number =>
+  a[0]! * b[0]! + a[1]! * b[1]! + a[2]! * b[2]!;
+
+describe('quadtree node math', () => {
+  it('childrenOf appends quadrants 0..3 on the same face', () => {
+    const kids = childrenOf({ face: 3, path: [1] });
+    expect(kids.map((k) => k.path)).toEqual([[1, 0], [1, 1], [1, 2], [1, 3]]);
+    expect(kids.every((k) => k.face === 3)).toBe(true);
+  });
+
+  it('nodeBounds center sits on the sphere and bounds shrink with depth', () => {
+    const root = nodeBounds(0, [], R, 0);
+    expect(Math.abs(Math.hypot(...root.center) - R)).toBeLessThan(1); // center at radius
+    const deep = nodeBounds(0, [1, 1, 2, 0], R, 0);
+    expect(deep.radius).toBeLessThan(root.radius); // finer node → smaller bounds
+  });
+
+  it('projectedSize grows as distance shrinks, and is Infinity inside the bounds', () => {
+    expect(projectedSize(1000, 1e6, VP, FOVY)).toBeLessThan(projectedSize(1000, 1e5, VP, FOVY));
+    expect(projectedSize(1000, 500, VP, FOVY)).toBe(Infinity);
+  });
+});
+
+describe('selectCut', () => {
+  const opts: SelectOpts = { radius: R, heightMargin: 14_000 * 1.6, splitPx: 400, maxDepth: 12 };
+  const surfaceDir = norm([0.2, 1, 0.15]);
+  const lookDown: [number, number, number] = [-surfaceDir[0], -surfaceDir[1], -surfaceDir[2]];
+  const near: CameraView = {
+    position: [surfaceDir[0] * (R + 28_000), surfaceDir[1] * (R + 28_000), surfaceDir[2] * (R + 28_000)],
+    viewportHeight: VP,
+    fovY: FOVY,
+    forward: lookDown,
+    halfFov: 1.0,
+  };
+  const far: CameraView = {
+    position: [surfaceDir[0] * R * 80, surfaceDir[1] * R * 80, surfaceDir[2] * R * 80],
+    viewportHeight: VP,
+    fovY: FOVY,
+    forward: lookDown,
+    halfFov: 1.0,
+  };
+
+  it('is deterministic', () => {
+    const a = selectCut(near, opts).map(keyOf);
+    const b = selectCut(near, opts).map(keyOf);
+    expect(a).toEqual(b);
+  });
+
+  it('refines near the camera and stays coarse far away', () => {
+    const nearCut = selectCut(near, opts);
+    const farCut = selectCut(far, opts);
+    expect(nearCut.length).toBeGreaterThan(farCut.length);
+    const nearMaxDepth = Math.max(...nearCut.map((n) => n.path.length));
+    const farMaxDepth = Math.max(...farCut.map((n) => n.path.length));
+    expect(nearMaxDepth).toBeGreaterThan(farMaxDepth);
+    expect(nearMaxDepth).toBeGreaterThanOrEqual(6); // genuinely fine underfoot
+  });
+
+  it('puts the deepest leaf under the camera', () => {
+    const cut = selectCut(near, opts);
+    const deepest = cut.reduce((a, b) => (b.path.length > a.path.length ? b : a));
+    const c = nodeBounds(deepest.face, deepest.path, R, 0).center;
+    expect(dot(norm(c), surfaceDir)).toBeGreaterThan(0.9); // right under the camera
+  });
+
+  it('horizon-culls the far side (no leaf on the antipode)', () => {
+    const cut = selectCut(near, opts);
+    for (const n of cut) {
+      const c = nodeBounds(n.face, n.path, R, 0).center;
+      expect(dot(norm(c), surfaceDir)).toBeGreaterThan(-0.5);
+    }
+  });
+
+  it('stays within the leaf cap and is non-empty', () => {
+    const cut = selectCut(near, opts);
+    expect(cut.length).toBeGreaterThan(6);
+    expect(cut.length).toBeLessThanOrEqual(opts.maxLeaves ?? 4096);
+  });
+});

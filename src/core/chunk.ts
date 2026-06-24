@@ -42,6 +42,8 @@ export interface MeshJob {
   req: ChunkRequest;
   recipe: TerrainRecipe;
   radius: number;
+  /** Radial skirt depth (m) to hide LOD cracks; 0 = no skirt. */
+  skirtDepth?: number;
 }
 
 /** Default grid resolution: fine tangentially, modest radially (a thin shell). [T] */
@@ -78,6 +80,7 @@ export function meshChunk(
   radius: number,
   tan: number = CHUNK_GRID_TANGENTIAL,
   rad: number = CHUNK_GRID_RADIAL,
+  skirtDepth = 0,
 ): ChunkMesh {
   const rect = uvRectFromPath(req.path);
   const uc = (rect.u0 + rect.u1) / 2;
@@ -129,7 +132,7 @@ export function meshChunk(
   };
 
   const field: SampledField = { nx, ny, nz, density, cornerPos };
-  const m = surfaceNets(field, origin, normalAt);
+  const m = surfaceNets(field, origin, normalAt, skirtDepth);
 
   return {
     positions: m.positions,

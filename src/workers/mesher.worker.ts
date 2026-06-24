@@ -27,7 +27,7 @@ const ctx = self as unknown as WorkerScope;
 
 ctx.onmessage = (e: MessageEvent<IncomingJob>): void => {
   const job = e.data;
-  const mesh = meshChunk(job.req, job.recipe, job.radius);
+  const mesh = meshChunk(job.req, job.recipe, job.radius, undefined, undefined, job.skirtDepth ?? 0);
   ctx.postMessage({ id: job.id, mesh }, [
     mesh.positions.buffer,
     mesh.normals.buffer,

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>No Matt's Sky — Step 0 (real-scale cube-sphere)</title>
+    <title>No Matt's Sky — Step 2 (quadtree LOD planet)</title>
     <style>
       html,
       body {
@@ -29,10 +29,21 @@
         padding: 2rem;
         line-height: 1.6;
       }
+      #help {
+        position: fixed;
+        left: 8px;
+        bottom: 8px;
+        color: #6f6;
+        font-size: 12px;
+        opacity: 0.7;
+        pointer-events: none;
+        white-space: pre;
+      }
     </style>
   </head>
   <body>
     <canvas id="app"></canvas>
+    <div id="help">drag: orbit · scroll: zoom · 1 orbit · 2 mid · 3 surface</div>
     <div id="unsupported">
       <div>
         <h1>WebGPU not available</h1>

@@ -60,6 +60,7 @@ export function surfaceNets(
   field: SampledField,
   origin: readonly [number, number, number],
   normalAt: (x: number, y: number, z: number, out: Float64Array) => void,
+  skirtDepth = 0,
 ): ExtractedMesh {
   const { nx, ny, nz, density, cornerPos } = field;
   const cnx = nx + 1;
@@ -159,6 +160,74 @@ export function surfaceNets(
             cellVert[cellIdx(i, j, k)]!,
             cellVert[cellIdx(i - 1, j, k)]!,
           );
+        }
+      }
+    }
+  }
+
+  // Pass 3 — skirts. Extrude tangential-boundary vertices radially inward into
+  // curtains; a neighbor patch at a different LOD drops its own overlapping
+  // curtain, so the crack between them is hidden (slice spec §5). Rendered
+  // double-sided, so skirt winding is irrelevant.
+  if (skirtDepth > 0) {
+    const skirtOf = new Map<number, number>();
+    const makeSkirt = (v: number): number => {
+      const cached = skirtOf.get(v);
+      if (cached !== undefined) return cached;
+      const lx = pos[v * 3]!, ly = pos[v * 3 + 1]!, lz = pos[v * 3 + 2]!;
+      const wx = lx + origin[0], wy = ly + origin[1], wz = lz + origin[2];
+      const iw = 1 / Math.sqrt(wx * wx + wy * wy + wz * wz + 1e-30);
+      const sx = lx - wx * iw * skirtDepth;
+      const sy = ly - wy * iw * skirtDepth;
+      const sz = lz - wz * iw * skirtDepth;
+      const si = pos.length / 3;
+      pos.push(sx, sy, sz);
+      nrm.push(nrm[v * 3]!, nrm[v * 3 + 1]!, nrm[v * 3 + 2]!);
+      if (sx < minx) minx = sx;
+      if (sy < miny) miny = sy;
+      if (sz < minz) minz = sz;
+      if (sx > maxx) maxx = sx;
+      if (sy > maxy) maxy = sy;
+      if (sz > maxz) maxz = sz;
+      skirtOf.set(v, si);
+      return si;
+    };
+    const skirtQuad = (a: number, b: number): void => {
+      const a2 = makeSkirt(a);
+      const b2 = makeSkirt(b);
+      idx.push(a, b, b2, a, b2, a2);
+    };
+    // i-boundaries (patch edges in u): connect adjacent boundary cells in j and k.
+    for (const iB of [0, nx - 1]) {
+      for (let k = 0; k < nz; k++) {
+        for (let j = 0; j < ny; j++) {
+          const v = cellVert[cellIdx(iB, j, k)]!;
+          if (v < 0) continue;
+          if (j + 1 < ny) {
+            const vj = cellVert[cellIdx(iB, j + 1, k)]!;
+            if (vj >= 0) skirtQuad(v, vj);
+          }
+          if (k + 1 < nz) {
+            const vk = cellVert[cellIdx(iB, j, k + 1)]!;
+            if (vk >= 0) skirtQuad(v, vk);
+          }
+        }
+      }
+    }
+    // j-boundaries (patch edges in v): connect adjacent boundary cells in i and k.
+    for (const jB of [0, ny - 1]) {
+      for (let k = 0; k < nz; k++) {
+        for (let i = 0; i < nx; i++) {
+          const v = cellVert[cellIdx(i, jB, k)]!;
+          if (v < 0) continue;
+          if (i + 1 < nx) {
+            const vi = cellVert[cellIdx(i + 1, jB, k)]!;
+            if (vi >= 0) skirtQuad(v, vi);
+          }
+          if (k + 1 < nz) {
+            const vk = cellVert[cellIdx(i, jB, k + 1)]!;
+            if (vk >= 0) skirtQuad(v, vk);
+          }
         }
       }
     }

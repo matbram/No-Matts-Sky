@@ -129,4 +129,40 @@ describe('meshChunk', () => {
       }
     `);
   });
+
+  it('skirts add boundary geometry and stay deterministic', () => {
+    const bare = meshChunk(req, RECIPE, R, 16, 10, 0);
+    const skirted = meshChunk(req, RECIPE, R, 16, 10, 5000);
+    // Skirts add vertices + triangles around the patch boundary.
+    expect(skirted.vertexCount).toBeGreaterThan(bare.vertexCount);
+    expect(skirted.triangleCount).toBeGreaterThan(bare.triangleCount);
+    // Determinism holds with skirts on.
+    const again = meshChunk(req, RECIPE, R, 16, 10, 5000);
+    expect(fnv1a(skirted.positions)).toBe(fnv1a(again.positions));
+    expect(fnv1a(skirted.indices)).toBe(fnv1a(again.indices));
+    // Normals (including reused skirt normals) stay unit length.
+    for (let v = 0; v < skirted.vertexCount; v++) {
+      const nx = skirted.normals[v * 3]!;
+      const ny = skirted.normals[v * 3 + 1]!;
+      const nz = skirted.normals[v * 3 + 2]!;
+      expect(Math.abs(Math.sqrt(nx * nx + ny * ny + nz * nz) - 1)).toBeLessThan(1e-4);
+    }
+  });
+
+  it('skirts hang radially inward (lower the mesh min radius)', () => {
+    const minRadius = (m: { positions: Float32Array; vertexCount: number; origin: number[] }): number => {
+      let r = Infinity;
+      for (let v = 0; v < m.vertexCount; v++) {
+        const wx = m.positions[v * 3]! + m.origin[0]!;
+        const wy = m.positions[v * 3 + 1]! + m.origin[1]!;
+        const wz = m.positions[v * 3 + 2]! + m.origin[2]!;
+        r = Math.min(r, Math.hypot(wx, wy, wz));
+      }
+      return r;
+    };
+    // skirtDepth > 2·height guarantees the lowest skirt drops below any surface vertex.
+    const bare = meshChunk(req, RECIPE, R, 16, 10, 0);
+    const skirted = meshChunk(req, RECIPE, R, 16, 10, RECIPE.height * 3);
+    expect(minRadius(skirted)).toBeLessThan(minRadius(bare));
+  });
 });
