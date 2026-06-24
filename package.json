@@ -1,0 +1,27 @@
+{
+  "name": "no-matts-sky",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A real-scale, real-physics, procedurally-generated space exploration game. Vertical slice (Milestone 0).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "three": "^0.184.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.184.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.5",
+    "vitest": "^3.2.6"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  }
+}

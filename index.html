@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>No Matt's Sky — Step 0 (real-scale cube-sphere)</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #000;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      #app {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+      }
+      #unsupported {
+        position: fixed;
+        inset: 0;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        color: #ddd;
+        text-align: center;
+        padding: 2rem;
+        line-height: 1.6;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="app"></canvas>
+    <div id="unsupported">
+      <div>
+        <h1>WebGPU not available</h1>
+        <p>
+          No Matt's Sky needs a WebGPU-capable browser (Chrome/Edge 113+, Safari 26+, or
+          Firefox with WebGPU enabled) on a machine with a GPU.<br />
+          The generation core still runs headlessly — see <code>npm test</code>.
+        </p>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

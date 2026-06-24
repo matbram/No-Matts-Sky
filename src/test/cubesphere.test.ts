@@ -1,0 +1,111 @@
+import { describe, it, expect } from 'vitest';
+import { buildCubeSphere, CUBE_FACES } from '../core/cubesphere.ts';
+import { EARTH_RADIUS_M } from '../core/constants.ts';
+import { fnv1a } from './digest.ts';
+
+// Golden + correctness test for the Step 0 cube-sphere.
+// Step 0 gate (CLAUDE.md §6): seamless sphere, golden test passes. The seamless
+// check and the recorded digest are both verified HEADLESSLY here; the visual
+// "smooth orbit at 60fps" half of the gate needs a real browser + GPU.
+
+describe('buildCubeSphere — structure', () => {
+  it('produces the expected vertex/triangle counts', () => {
+    const s = 8;
+    const mesh = buildCubeSphere(s, 1);
+    expect(mesh.vertexCount).toBe(6 * (s + 1) * (s + 1)); // 486
+    expect(mesh.triangleCount).toBe(6 * s * s * 2); // 768
+    expect(mesh.positions.length).toBe(mesh.vertexCount * 3);
+    expect(mesh.normals.length).toBe(mesh.vertexCount * 3);
+    expect(mesh.indices.length).toBe(mesh.triangleCount * 3);
+  });
+
+  it('rejects bad subdivisions', () => {
+    expect(() => buildCubeSphere(0, 1)).toThrow();
+    expect(() => buildCubeSphere(1.5, 1)).toThrow();
+  });
+
+  it('every index is in range', () => {
+    const mesh = buildCubeSphere(8, 1);
+    for (const idx of mesh.indices) {
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(idx).toBeLessThan(mesh.vertexCount);
+    }
+  });
+});
+
+describe('buildCubeSphere — geometry', () => {
+  it('all vertices lie on the sphere of the given radius', () => {
+    const mesh = buildCubeSphere(16, 1); // unit radius → tight float32 tolerance
+    for (let v = 0; v < mesh.vertexCount; v++) {
+      const x = mesh.positions[v * 3]!;
+      const y = mesh.positions[v * 3 + 1]!;
+      const z = mesh.positions[v * 3 + 2]!;
+      const len = Math.sqrt(x * x + y * y + z * z);
+      expect(Math.abs(len - 1)).toBeLessThan(1e-5);
+    }
+  });
+
+  it('normals are unit and equal the normalized position', () => {
+    const mesh = buildCubeSphere(8, EARTH_RADIUS_M);
+    for (let v = 0; v < mesh.vertexCount; v++) {
+      const nx = mesh.normals[v * 3]!;
+      const ny = mesh.normals[v * 3 + 1]!;
+      const nz = mesh.normals[v * 3 + 2]!;
+      expect(Math.abs(Math.sqrt(nx * nx + ny * ny + nz * nz) - 1)).toBeLessThan(1e-5);
+    }
+  });
+
+  it('adjacent faces share an identical edge (seamless — no gaps)', () => {
+    // +X face (index 0) v=+1 edge meets +Z face (index 4) u=+1 edge; both are the
+    // cube edge (1, t, 1). The projected vertices must coincide exactly.
+    const s = 12;
+    const mesh = buildCubeSphere(s, EARTH_RADIUS_M);
+    const side = s + 1;
+    const vertsPerFace = side * side;
+    const xFaceBase = 0 * vertsPerFace;
+    const zFaceBase = 4 * vertsPerFace;
+    for (let k = 0; k <= s; k++) {
+      const xv = xFaceBase + k * side + (side - 1); // +X: (i=k, j=side-1)
+      const zv = zFaceBase + (side - 1) * side + k; // +Z: (i=side-1, j=k)
+      for (let c = 0; c < 3; c++) {
+        expect(mesh.positions[xv * 3 + c]).toBe(mesh.positions[zv * 3 + c]);
+      }
+    }
+  });
+
+  it('has the canonical 6-face order +X −X +Y −Y +Z −Z', () => {
+    expect(CUBE_FACES.map((f) => f.normal)).toEqual([
+      [1, 0, 0],
+      [-1, 0, 0],
+      [0, 1, 0],
+      [0, -1, 0],
+      [0, 0, 1],
+      [0, 0, -1],
+    ]);
+  });
+});
+
+describe('buildCubeSphere — determinism (golden)', () => {
+  it('is reproducible: same inputs → identical output', () => {
+    const a = buildCubeSphere(16, EARTH_RADIUS_M);
+    const b = buildCubeSphere(16, EARTH_RADIUS_M);
+    expect(fnv1a(a.positions)).toBe(fnv1a(b.positions));
+    expect(fnv1a(a.normals)).toBe(fnv1a(b.normals));
+    expect(fnv1a(a.indices)).toBe(fnv1a(b.indices));
+  });
+
+  it('matches recorded digests at (subdivisions=16, radius=Earth) (FROZEN)', () => {
+    const mesh = buildCubeSphere(16, EARTH_RADIUS_M);
+    expect({
+      positions: fnv1a(mesh.positions),
+      normals: fnv1a(mesh.normals),
+      indices: fnv1a(mesh.indices),
+    }).toMatchInlineSnapshot(`
+      {
+        "indices": "db735337",
+        "normals": "6447df35",
+        "positions": "9c80cb71",
+      }
+    `);
+  });
+});
