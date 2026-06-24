@@ -15,6 +15,7 @@ interface IncomingJob extends MeshJob {
 interface MeshResult {
   id: number;
   mesh: ChunkMesh;
+  ms: number; // wall-clock spent meshing (for the streaming HUD)
 }
 
 // The worker global, typed minimally so we get the (message, transfer[]) overload
@@ -27,8 +28,10 @@ const ctx = self as unknown as WorkerScope;
 
 ctx.onmessage = (e: MessageEvent<IncomingJob>): void => {
   const job = e.data;
+  const t0 = performance.now();
   const mesh = meshChunk(job.req, job.recipe, job.radius, undefined, undefined, job.skirtDepth ?? 0);
-  ctx.postMessage({ id: job.id, mesh }, [
+  const ms = performance.now() - t0;
+  ctx.postMessage({ id: job.id, mesh, ms }, [
     mesh.positions.buffer,
     mesh.normals.buffer,
     mesh.indices.buffer,

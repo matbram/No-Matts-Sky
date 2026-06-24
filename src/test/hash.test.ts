@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { pcg, pcg2d, pcg3d, pcg4d, toUnit, toInt } from '../core/hash.ts';
+import { pcg, pcg2d, pcg3d, pcg4d, pcg4dInto, toUnit, toInt } from '../core/hash.ts';
 
 // Golden test for the pinned PCG hash. This is the determinism wire (Constitution
 // II.14, pipeline §4.6): the recorded outputs must never change. When the Rust/WASM
@@ -111,6 +111,17 @@ describe('pcg — golden recorded values (FROZEN)', () => {
         ],
       ]
     `);
+  });
+});
+
+describe('pcg4dInto — non-allocating, bit-identical to pcg4d', () => {
+  it('writes exactly the same 4 u32 as pcg4d across a sweep', () => {
+    const out = new Uint32Array(4);
+    for (let i = 0; i < 1000; i++) {
+      const expected = pcg4d(i, i * 7 + 1, i + 13, 0xabcd ^ i);
+      pcg4dInto(i, i * 7 + 1, i + 13, 0xabcd ^ i, out);
+      expect([out[0], out[1], out[2], out[3]]).toEqual(expected);
+    }
   });
 });
 

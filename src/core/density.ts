@@ -38,7 +38,7 @@ export function sliceTerrainRecipe(terrainSeed: number): TerrainRecipe {
     // (at noiseScale 22 a leaf was smaller than one feature, so it read flat).
     noiseScale: 140,
     height: 14_000,
-    octaves: 5,
+    octaves: 4,
     lacunarity: 2.0,
     gain: 0.5,
     warpStrength: 0.7,

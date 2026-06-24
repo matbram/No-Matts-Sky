@@ -46,9 +46,10 @@ export interface MeshJob {
   skirtDepth?: number;
 }
 
-/** Default grid resolution: fine tangentially, modest radially (a thin shell). [T] */
-export const CHUNK_GRID_TANGENTIAL = 48;
-export const CHUNK_GRID_RADIAL = 16;
+/** Default grid resolution: fine tangentially, modest radially (a thin shell). [T]
+ *  Sized for streaming throughput (Step 3) — a leaf must mesh fast on a worker. */
+export const CHUNK_GRID_TANGENTIAL = 32;
+export const CHUNK_GRID_RADIAL = 12;
 
 /** Stable string key for a chunk (cache key, slice spec §4 "key by coordinate"). */
 export function chunkKey(req: ChunkRequest): string {
@@ -93,7 +94,15 @@ export function meshChunk(
   const rMin = radius - margin;
   const rMax = radius + margin;
 
-  const nx = tan, ny = tan, nz = rad;
+  // 1-cell apron on the tangential axes: two adjacent SAME-LOD leaves then sample
+  // the shared edge at the same (u,v) points, so their surfaces coincide/overlap
+  // and there's no crack between them (slice spec §5 "1-voxel overlap"). The
+  // radial axis is a closed shell and needs no apron.
+  const du = (rect.u1 - rect.u0) / tan;
+  const dv = (rect.v1 - rect.v0) / tan;
+  const u0 = rect.u0 - du;
+  const v0 = rect.v0 - dv;
+  const nx = tan + 2, ny = tan + 2, nz = rad;
   const cnx = nx + 1, cny = ny + 1, cnz = nz + 1;
   const density = new Float64Array(cnx * cny * cnz);
   const cornerPos = new Float64Array(cnx * cny * cnz * 3);
@@ -103,9 +112,9 @@ export function meshChunk(
   for (let k = 0; k < cnz; k++) {
     const radial = rMin + (rMax - rMin) * (k / nz);
     for (let j = 0; j < cny; j++) {
-      const v = rect.v0 + (rect.v1 - rect.v0) * (j / ny);
+      const v = v0 + dv * j;
       for (let i = 0; i < cnx; i++) {
-        const u = rect.u0 + (rect.u1 - rect.u0) * (i / nx);
+        const u = u0 + du * i;
         const dir = faceDirection(req.face, u, v);
         const wx = dir[0] * radial;
         const wy = dir[1] * radial;

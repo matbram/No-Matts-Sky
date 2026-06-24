@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { densityAt, sliceTerrainRecipe, type TerrainRecipe } from '../core/density.ts';
 import { meshChunk, uvRectFromPath, chunkKey, type ChunkRequest } from '../core/chunk.ts';
+import { faceDirection } from '../core/cubesphere.ts';
 import { EARTH_RADIUS_M } from '../core/constants.ts';
 import { fnv1a } from './digest.ts';
 
@@ -63,6 +64,27 @@ describe('uvRectFromPath', () => {
   });
 });
 
+describe('chunk apron (seamless same-LOD neighbors)', () => {
+  it('adjacent same-LOD leaves sample the shared edge at coincident points', () => {
+    // Leaf [0] (u[-1,0]) and leaf [1] (u[0,1]) share the u=0 edge over v[-1,0].
+    // With the 1-cell apron, [0]'s edge column and [1]'s edge column must land on
+    // the same sphere directions — otherwise their surfaces gap.
+    const face = 2;
+    const tan = 8;
+    const A = uvRectFromPath([0]);
+    const B = uvRectFromPath([1]);
+    const duA = (A.u1 - A.u0) / tan, dvA = (A.v1 - A.v0) / tan;
+    const duB = (B.u1 - B.u0) / tan, dvB = (B.v1 - B.v0) / tan;
+    const u0A = A.u0 - duA, v0A = A.v0 - dvA;
+    const u0B = B.u0 - duB, v0B = B.v0 - dvB;
+    for (let j = 0; j <= tan + 2; j++) {
+      const a = faceDirection(face, u0A + duA * (tan + 1), v0A + dvA * j); // [0] edge col
+      const b = faceDirection(face, u0B + duB * 1, v0B + dvB * j); // [1] edge col
+      expect(Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2])).toBeLessThan(1e-9);
+    }
+  });
+});
+
 describe('meshChunk', () => {
   const req: ChunkRequest = { face: 2, path: [2, 1], lod: 2 };
 
@@ -121,11 +143,11 @@ describe('meshChunk', () => {
       triangleCount: m.triangleCount,
     }).toMatchInlineSnapshot(`
       {
-        "indices": "602e89e0",
-        "normals": "15c40a9a",
-        "positions": "39fc27a5",
-        "triangleCount": 968,
-        "vertexCount": 483,
+        "indices": "a5d37b49",
+        "normals": "b82d0b09",
+        "positions": "173c1918",
+        "triangleCount": 1258,
+        "vertexCount": 616,
       }
     `);
   });

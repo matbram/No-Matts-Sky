@@ -28,6 +28,7 @@ async function main(): Promise<void> {
 
   scene.renderer.setAnimationLoop(() => {
     scene.render();
+    stats.setInfo(scene.streamInfo());
     stats.frame();
   });
 }

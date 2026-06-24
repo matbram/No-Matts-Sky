@@ -16,7 +16,7 @@
 // to avoid per-sample allocation in the hot meshing loop.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { pcg4d, toUnit } from './hash.ts';
+import { pcg4dInto, toUnit } from './hash.ts';
 
 // Reused scratch for the 8 cube-corner gradients/values (single-threaded, and
 // gradNoise3 is never reentrant: nothing it calls reads these back).
@@ -24,6 +24,7 @@ const _gx = new Float64Array(8);
 const _gy = new Float64Array(8);
 const _gz = new Float64Array(8);
 const _vv = new Float64Array(8);
+const _h4 = new Uint32Array(4); // scratch for the non-allocating corner hash
 
 // Local corner offsets, indexed L = a | b<<1 | c<<2  (a,b,c ∈ {0,1} along x,y,z).
 const COFF_A = [0, 1, 0, 1, 0, 1, 0, 1];
@@ -66,10 +67,10 @@ export function gradNoise3(
     const a = COFF_A[L]!;
     const b = COFF_B[L]!;
     const c = COFF_C[L]!;
-    const h = pcg4d(ix + a, iy + b, iz + c, seed);
-    let gx = toUnit(h[0]) * 2 - 1;
-    let gy = toUnit(h[1]) * 2 - 1;
-    let gz = toUnit(h[2]) * 2 - 1;
+    pcg4dInto(ix + a, iy + b, iz + c, seed, _h4);
+    let gx = toUnit(_h4[0]!) * 2 - 1;
+    let gy = toUnit(_h4[1]!) * 2 - 1;
+    let gz = toUnit(_h4[2]!) * 2 - 1;
     const inv = 1 / Math.sqrt(gx * gx + gy * gy + gz * gz + 1e-30);
     gx *= inv;
     gy *= inv;

@@ -10,6 +10,7 @@ export class Stats {
   private acc = 0;
   private frames = 0;
   private smoothedMs = FRAME_BUDGET_MS;
+  private info = '';
 
   constructor() {
     this.el = document.createElement('div');
@@ -30,6 +31,11 @@ export class Stats {
     this.last = performance.now();
   }
 
+  /** Set an extra status line (e.g. streaming health). Shown at the readout cadence. */
+  setInfo(text: string): void {
+    this.info = text;
+  }
+
   /** Call once per rendered frame. */
   frame(): void {
     const now = performance.now();
@@ -44,7 +50,8 @@ export class Stats {
       this.el.style.color = overBudget ? '#ff6b6b' : '#7cfc8a';
       this.el.textContent =
         `${fps.toFixed(0)} fps   ${this.smoothedMs.toFixed(2)} ms` +
-        `\nbudget ${FRAME_BUDGET_MS.toFixed(2)} ms (60 fps)`;
+        `\nbudget ${FRAME_BUDGET_MS.toFixed(2)} ms (60 fps)` +
+        (this.info ? `\n${this.info}` : '');
       this.acc = 0;
       this.frames = 0;
     }

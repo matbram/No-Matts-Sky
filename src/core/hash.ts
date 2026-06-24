@@ -80,6 +80,34 @@ export function pcg4d(
   return [x >>> 0, y >>> 0, z >>> 0, w >>> 0];
 }
 
+/**
+ * Non-allocating pcg4d: writes the 4 u32 outputs into `out` (length ≥ 4).
+ * BIT-IDENTICAL to `pcg4d` — same ops, same order — but avoids the per-call array
+ * allocation, which matters on the noise hot path (8 corner hashes per sample).
+ */
+export function pcg4dInto(x: number, y: number, z: number, w: number, out: Uint32Array): void {
+  x = (Math.imul(x >>> 0, 1664525) + 1013904223) >>> 0;
+  y = (Math.imul(y >>> 0, 1664525) + 1013904223) >>> 0;
+  z = (Math.imul(z >>> 0, 1664525) + 1013904223) >>> 0;
+  w = (Math.imul(w >>> 0, 1664525) + 1013904223) >>> 0;
+  x = (x + Math.imul(y, w)) >>> 0;
+  y = (y + Math.imul(z, x)) >>> 0;
+  z = (z + Math.imul(x, y)) >>> 0;
+  w = (w + Math.imul(y, z)) >>> 0;
+  x = (x ^ (x >>> 16)) >>> 0;
+  y = (y ^ (y >>> 16)) >>> 0;
+  z = (z ^ (z >>> 16)) >>> 0;
+  w = (w ^ (w >>> 16)) >>> 0;
+  x = (x + Math.imul(y, w)) >>> 0;
+  y = (y + Math.imul(z, x)) >>> 0;
+  z = (z + Math.imul(x, y)) >>> 0;
+  w = (w + Math.imul(y, z)) >>> 0;
+  out[0] = x >>> 0;
+  out[1] = y >>> 0;
+  out[2] = z >>> 0;
+  out[3] = w >>> 0;
+}
+
 // ── Canonical helpers (pipeline §1.3) ────────────────────────────────────────
 
 /** u32 -> float in [0,1). Exact division by 2^32. Cosmetic/sampling use. */

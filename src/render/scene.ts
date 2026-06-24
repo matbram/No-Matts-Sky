@@ -34,12 +34,19 @@ import { QuadtreeManager } from './quadtreeManager.ts';
 export interface SliceScene {
   readonly renderer: WebGPURenderer;
   render(): void;
+  streamInfo(): string;
   resize(width: number, height: number): void;
   dispose(): void;
 }
 
 // A fixed surface look-at direction for the close presets (some arbitrary spot).
 const SURFACE_DIR = new Vector3(0.2, 1, 0.15).normalize();
+
+// Finished meshes uploaded to the GPU per frame (slice spec §7 — the only
+// generation cost allowed in the frame). The rest queue and drain over frames.
+const UPLOAD_PER_FRAME = 4;
+// How far ahead of the camera (in per-frame velocity units) to prioritize work.
+const LOOKAHEAD_FRAMES = 30;
 
 interface Preset {
   target: Vector3; // world-space look-at
@@ -134,6 +141,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   let targetWorld = new Vector3(0, 0, 0);
   let forceCut = true;
   const lastCutPos = new Vector3();
+  const prevWorldCam = new Vector3();
 
   function applyPreset(p: Preset): void {
     renderOrigin = p.target.clone();
@@ -147,6 +155,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     controls.minDistance = p.minD;
     controls.maxDistance = p.maxD;
     controls.update();
+    prevWorldCam.copy(p.cam);
     forceCut = true;
   }
   applyPreset(presets.orbit!);
@@ -162,12 +171,17 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   let aspect = 1;
   const worldCam = new Vector3();
   const forward = new Vector3();
+  const vel = new Vector3();
+  const lookahead = new Vector3();
 
   return {
     renderer,
     render(): void {
       controls.update();
       worldCam.copy(camera.position).add(renderOrigin);
+      vel.copy(worldCam).sub(prevWorldCam); // world units / frame
+      prevWorldCam.copy(worldCam);
+
       const distToTarget = worldCam.distanceTo(targetWorld);
       // Re-cut when the camera has moved enough (adaptive: tighter near surface).
       const moved = worldCam.distanceTo(lastCutPos);
@@ -175,17 +189,28 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
         forward.copy(targetWorld).sub(worldCam).normalize(); // orbit controls always look at target
         // Cone half-angle covering the frustum corners (+margin), for view culling.
         const halfFov = Math.atan(Math.tan(fovY / 2) * Math.sqrt(1 + aspect * aspect)) * 1.15;
-        manager.update({
-          position: [worldCam.x, worldCam.y, worldCam.z],
-          viewportHeight: vpHeight,
-          fovY,
-          forward: [forward.x, forward.y, forward.z],
-          halfFov,
-        });
+        lookahead.copy(worldCam).addScaledVector(vel, LOOKAHEAD_FRAMES); // generate ahead of motion
+        manager.update(
+          {
+            position: [worldCam.x, worldCam.y, worldCam.z],
+            viewportHeight: vpHeight,
+            fovY,
+            forward: [forward.x, forward.y, forward.z],
+            halfFov,
+          },
+          [lookahead.x, lookahead.y, lookahead.z],
+        );
         lastCutPos.copy(worldCam);
         forceCut = false;
       }
+      // Drain finished meshes onto the GPU under the per-frame budget (the only
+      // generation cost in-frame; generation itself ran on the worker pool).
+      manager.uploadReady(UPLOAD_PER_FRAME);
       renderer.render(scene, camera);
+    },
+    streamInfo(): string {
+      const s = manager.stats();
+      return `leaves ${s.live}  queue ${s.pending + s.ready}  busy ${s.inflight}  ${s.msPerLeaf.toFixed(0)} ms/leaf`;
     },
     resize(width: number, height: number): void {
       vpHeight = height;
