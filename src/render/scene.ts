@@ -16,6 +16,9 @@
 import {
   Scene,
   PerspectiveCamera,
+  Mesh,
+  BufferGeometry,
+  BufferAttribute,
   DirectionalLight,
   HemisphereLight,
   Color,
@@ -26,6 +29,7 @@ import {
 import { WebGPURenderer, MeshStandardNodeMaterial } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { EARTH_RADIUS_M } from '../core/constants.ts';
+import { buildCubeSphere } from '../core/cubesphere.ts';
 import { sliceTerrainRecipe } from '../core/density.ts';
 import { sliceFacts } from '../core/facts.ts';
 import { childSeed, SALT } from '../core/seedchain.ts';
@@ -94,10 +98,24 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     metalness: 0.0,
     side: DoubleSide,
   });
-  // maxDepth 10 caps the leaf count (~50 orbit / ~230 mid / ~185 surface with
-  // frustum + horizon culling) for the single Step-1 worker; Step 3's worker pool
-  // lifts the cap for walking-scale detail. splitPx 400 per slice spec §5.
-  const manager = new QuadtreeManager(scene, material, recipe, R, { splitPx: 400, maxDepth: 10 });
+  // splitPx 300 (smaller, gentler LOD steps — affordable after the ~13× meshing
+  // speedup); maxDepth 10 caps leaf counts.
+  const manager = new QuadtreeManager(scene, material, recipe, R, { splitPx: 300, maxDepth: 10 });
+
+  // No-black backdrop: a single smooth sphere INSET below the deepest terrain
+  // (radius − height·1.05), always present, so any not-yet-streamed gap shows
+  // coarse terrain-colored shell instead of the black background. 1 draw call,
+  // built once; repositioned with the render origin in applyPreset.
+  const backdropGeo = (() => {
+    const s = buildCubeSphere(48, R - recipe.height * 1.05);
+    const g = new BufferGeometry();
+    g.setAttribute('position', new BufferAttribute(s.positions, 3));
+    g.setAttribute('normal', new BufferAttribute(s.normals, 3));
+    g.setIndex(new BufferAttribute(s.indices, 1));
+    return g;
+  })();
+  const backdrop = new Mesh(backdropGeo, material);
+  scene.add(backdrop);
 
   // ── Camera presets (the gate's "static camera positions") ──────────────────
   const surf = SURFACE_DIR.clone().multiplyScalar(R);
@@ -147,6 +165,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     renderOrigin = p.target.clone();
     targetWorld = p.target.clone();
     manager.setRenderOrigin([renderOrigin.x, renderOrigin.y, renderOrigin.z]);
+    backdrop.position.set(-renderOrigin.x, -renderOrigin.y, -renderOrigin.z);
     camera.near = p.near;
     camera.far = p.far;
     camera.position.copy(p.cam).sub(renderOrigin);
@@ -234,6 +253,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       window.removeEventListener('keydown', onKey);
       manager.dispose();
       controls.dispose();
+      backdropGeo.dispose();
       material.dispose();
       renderer.dispose();
     },

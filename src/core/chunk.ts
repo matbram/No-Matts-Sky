@@ -14,7 +14,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { faceDirection } from './cubesphere.ts';
-import { densityAt, type TerrainRecipe } from './density.ts';
+import { terrainAt, assembleDensity, type TerrainRecipe } from './density.ts';
 import { surfaceNets, type AABB, type SampledField } from './surfacenets.ts';
 
 /** A chunk address: a cube face + a quadtree path of quadrants (0..3). */
@@ -50,6 +50,20 @@ export interface MeshJob {
  *  Sized for streaming throughput (Step 3) — a leaf must mesh fast on a worker. */
 export const CHUNK_GRID_TANGENTIAL = 32;
 export const CHUNK_GRID_RADIAL = 12;
+
+// Reused intermediate scratch. `meshChunk` is sequential and non-reentrant (one
+// leaf at a time per worker — and each worker has its own module instance), so
+// sharing these across leaves is safe and avoids ~1 MB of transient allocation per
+// leaf (GC spikes show up as frame hitches). Output buffers are still fresh per
+// call (surfaceNets allocates them) so they can be transferred and kept.
+let _sColDir: Float64Array = new Float64Array(0);
+let _sColT: Float64Array = new Float64Array(0);
+let _sDensity: Float64Array = new Float64Array(0);
+let _sCornerPos: Float64Array = new Float64Array(0);
+let _sCornerNormal: Float64Array = new Float64Array(0);
+const _t = new Float64Array(4);
+const _d = new Float64Array(4);
+const fit = (a: Float64Array, n: number): Float64Array => (a.length >= n ? a : new Float64Array(n));
 
 /** Stable string key for a chunk (cache key, slice spec §4 "key by coordinate"). */
 export function chunkKey(req: ChunkRequest): string {
@@ -104,44 +118,62 @@ export function meshChunk(
   const v0 = rect.v0 - dv;
   const nx = tan + 2, ny = tan + 2, nz = rad;
   const cnx = nx + 1, cny = ny + 1, cnz = nz + 1;
-  const density = new Float64Array(cnx * cny * cnz);
-  const cornerPos = new Float64Array(cnx * cny * cnz * 3);
-  const _d = new Float64Array(4);
+  const scale = recipe.noiseScale;
+  const height = recipe.height;
 
-  let p = 0;
-  for (let k = 0; k < cnz; k++) {
-    const radial = rMin + (rMax - rMin) * (k / nz);
-    for (let j = 0; j < cny; j++) {
-      const v = v0 + dv * j;
-      for (let i = 0; i < cnx; i++) {
-        const u = u0 + du * i;
-        const dir = faceDirection(req.face, u, v);
-        const wx = dir[0] * radial;
-        const wy = dir[1] * radial;
-        const wz = dir[2] * radial;
-        densityAt(recipe, radius, wx, wy, wz, _d);
-        density[p] = _d[0]!;
-        cornerPos[p * 3] = wx;
-        cornerPos[p * 3 + 1] = wy;
-        cornerPos[p * 3 + 2] = wz;
-        p++;
-      }
+  // Pass 1 — per COLUMN (i,j): the terrain noise depends only on direction, so
+  // evaluate it ONCE per column and reuse for every radial layer. (Recomputing it
+  // per 3D corner was ~13× redundant work across the radial axis — the bottleneck.)
+  const colCount = cnx * cny;
+  const colDir = (_sColDir = fit(_sColDir, colCount * 3));
+  const colT = (_sColT = fit(_sColT, colCount * 4)); // [tv, tdx, tdy, tdz] per column
+  for (let j = 0; j < cny; j++) {
+    const v = v0 + dv * j;
+    for (let i = 0; i < cnx; i++) {
+      const ci = j * cnx + i;
+      const dir = faceDirection(req.face, u0 + du * i, v);
+      colDir[ci * 3] = dir[0];
+      colDir[ci * 3 + 1] = dir[1];
+      colDir[ci * 3 + 2] = dir[2];
+      terrainAt(recipe, dir[0] * scale, dir[1] * scale, dir[2] * scale, _t);
+      colT[ci * 4] = _t[0]!;
+      colT[ci * 4 + 1] = _t[1]!;
+      colT[ci * 4 + 2] = _t[2]!;
+      colT[ci * 4 + 3] = _t[3]!;
     }
   }
 
-  const _g = new Float64Array(4);
-  const normalAt = (x: number, y: number, z: number, out: Float64Array): void => {
-    densityAt(recipe, radius, x, y, z, _g);
-    // Outward normal points toward AIR (decreasing D): n = normalize(-∇D).
-    const gx = -_g[1]!, gy = -_g[2]!, gz = -_g[3]!;
-    const inv = 1 / Math.sqrt(gx * gx + gy * gy + gz * gz + 1e-30);
-    out[0] = gx * inv;
-    out[1] = gy * inv;
-    out[2] = gz * inv;
-  };
+  // Pass 2 — per CORNER: cheap density + outward normal from the cached column,
+  // no noise. Corner index matches surfacenets: i + cnx*(j + cny*k).
+  const cc = cnx * cny * cnz;
+  const density = (_sDensity = fit(_sDensity, cc));
+  const cornerPos = (_sCornerPos = fit(_sCornerPos, cc * 3));
+  const cornerNormal = (_sCornerNormal = fit(_sCornerNormal, cc * 3));
+  let p = 0;
+  for (let k = 0; k < cnz; k++) {
+    const r = rMin + (rMax - rMin) * (k / nz);
+    for (let ci = 0; ci < colCount; ci++) {
+      const dx = colDir[ci * 3]!, dy = colDir[ci * 3 + 1]!, dz = colDir[ci * 3 + 2]!;
+      assembleDensity(
+        radius, r, dx, dy, dz,
+        colT[ci * 4]!, colT[ci * 4 + 1]!, colT[ci * 4 + 2]!, colT[ci * 4 + 3]!,
+        height, scale, _d,
+      );
+      density[p] = _d[0]!;
+      cornerPos[p * 3] = dx * r;
+      cornerPos[p * 3 + 1] = dy * r;
+      cornerPos[p * 3 + 2] = dz * r;
+      const gx = -_d[1]!, gy = -_d[2]!, gz = -_d[3]!; // outward normal = normalize(−∇D)
+      const ln = 1 / Math.sqrt(gx * gx + gy * gy + gz * gz + 1e-30);
+      cornerNormal[p * 3] = gx * ln;
+      cornerNormal[p * 3 + 1] = gy * ln;
+      cornerNormal[p * 3 + 2] = gz * ln;
+      p++;
+    }
+  }
 
-  const field: SampledField = { nx, ny, nz, density, cornerPos };
-  const m = surfaceNets(field, origin, normalAt, skirtDepth);
+  const field: SampledField = { nx, ny, nz, density, cornerPos, cornerNormal };
+  const m = surfaceNets(field, origin, skirtDepth);
 
   return {
     positions: m.positions,

@@ -55,14 +55,22 @@ const _n = new Float64Array(4);
 const _t = new Float64Array(4);
 
 /**
- * Warped fBm: `terrain(p) = fbm(p + A·w(p))` with `w` a 3-channel fBm vector.
- * Writes `[value, ∂/∂x, ∂/∂y, ∂/∂z]` (gradient w.r.t. the INPUT p) into `out`.
+ * Warped fBm sampled at a point on the (scaled) unit sphere — the direction-only
+ * terrain field. Writes `[value, ∂/∂x, ∂/∂y, ∂/∂z]` (gradient w.r.t. the INPUT p)
+ * into `out`. EXPORTED so the chunk mesher can evaluate it ONCE per column (the
+ * noise depends only on direction, so all radial layers share it).
  *
  * Gradient: ∇ₚ fbm(q(p)) = Jᵀ ∇fbm(q), where the warp Jacobian J = I + A·Jw and
  * Jw's rows are the gradients of the three warp channels. (Jᵀg)_i =
  * g_i + A·Σⱼ wⱼ.d[i]·gⱼ.
  */
-function terrain(recipe: TerrainRecipe, px: number, py: number, pz: number, out: Float64Array): void {
+export function terrainAt(
+  recipe: TerrainRecipe,
+  px: number,
+  py: number,
+  pz: number,
+  out: Float64Array,
+): void {
   const A = recipe.warpStrength;
   const s = recipe.seed;
   const o = recipe.octaves;
@@ -89,12 +97,41 @@ function terrain(recipe: TerrainRecipe, px: number, py: number, pz: number, out:
 }
 
 /**
- * Evaluate the density field at world point (x,y,z).
- * Writes `[D, ∂D/∂x, ∂D/∂y, ∂D/∂z]` into `out` (length ≥ 4).
+ * Assemble the density value + gradient from a precomputed terrain sample.
+ * `dir` is the UNIT direction, `r` the radius, `tv`/`td*` the terrain value and
+ * its gradient w.r.t. the scaled sample point (from `terrainAt`). Writes
+ * `[D, ∂D/∂x, ∂D/∂y, ∂D/∂z]`. Shared by `densityAt` (per point) and the chunk
+ * mesher (per corner, reusing one `terrainAt` per column).
  *
- * D = radius − r + height·t(dir·scale), where dir = p/r. The gradient combines:
- *   ∇(radius − r) = −dir
- *   ∇ t(dir·scale) = (scale/r)·(t.d − dir·(t.d·dir))   [through normalize(p)]
+ *   D = radius − r + height·tv
+ *   ∇(radius − r) = −dir;  ∇(height·tv) = (scale/r)·(td − dir·(td·dir))
+ */
+export function assembleDensity(
+  radius: number,
+  r: number,
+  rx: number,
+  ry: number,
+  rz: number,
+  tv: number,
+  tdx: number,
+  tdy: number,
+  tdz: number,
+  height: number,
+  scale: number,
+  out: Float64Array,
+): void {
+  out[0] = radius - r + height * tv;
+  const dot = tdx * rx + tdy * ry + tdz * rz;
+  const k = (scale * height) / r;
+  out[1] = -rx + k * (tdx - rx * dot);
+  out[2] = -ry + k * (tdy - ry * dot);
+  out[3] = -rz + k * (tdz - rz * dot);
+}
+
+/**
+ * Evaluate the density field at world point (x,y,z) — the canonical per-point
+ * path (kept for the finite-difference correctness test and any direct use).
+ * Writes `[D, ∂D/∂x, ∂D/∂y, ∂D/∂z]`.
  */
 export function densityAt(
   recipe: TerrainRecipe,
@@ -110,18 +147,6 @@ export function densityAt(
   const ry = y * inv;
   const rz = z * inv;
   const scale = recipe.noiseScale;
-
-  terrain(recipe, rx * scale, ry * scale, rz * scale, _t);
-  const tv = _t[0]!;
-  const tdx = _t[1]!;
-  const tdy = _t[2]!;
-  const tdz = _t[3]!;
-
-  out[0] = radius - r + recipe.height * tv;
-
-  const dot = tdx * rx + tdy * ry + tdz * rz;
-  const k = scale * inv * recipe.height;
-  out[1] = -rx + k * (tdx - rx * dot);
-  out[2] = -ry + k * (tdy - ry * dot);
-  out[3] = -rz + k * (tdz - rz * dot);
+  terrainAt(recipe, rx * scale, ry * scale, rz * scale, _t);
+  assembleDensity(radius, r, rx, ry, rz, _t[0]!, _t[1]!, _t[2]!, _t[3]!, recipe.height, scale, out);
 }

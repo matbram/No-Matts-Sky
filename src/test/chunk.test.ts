@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { densityAt, sliceTerrainRecipe, type TerrainRecipe } from '../core/density.ts';
+import {
+  densityAt,
+  terrainAt,
+  assembleDensity,
+  sliceTerrainRecipe,
+  type TerrainRecipe,
+} from '../core/density.ts';
 import { meshChunk, uvRectFromPath, chunkKey, type ChunkRequest } from '../core/chunk.ts';
 import { faceDirection } from '../core/cubesphere.ts';
 import { EARTH_RADIUS_M } from '../core/constants.ts';
@@ -53,6 +59,33 @@ describe('densityAt — analytic gradient (the normals)', () => {
     expect(o[0]!).toBeGreaterThan(0); // deep inside → solid
     densityAt(RECIPE, R, 0, R + 50_000, 0, o);
     expect(o[0]!).toBeLessThan(0); // well above peaks → air
+  });
+});
+
+describe('column-cache equivalence (the optimization is exact)', () => {
+  it('per-column terrainAt + assembleDensity matches densityAt up to float roundoff', () => {
+    const scale = RECIPE.noiseScale;
+    const height = RECIPE.height;
+    const _t = new Float64Array(4);
+    const a = new Float64Array(4);
+    const b = new Float64Array(4);
+    for (let s = 1; s <= 30; s++) {
+      const th = (s * 2.399963) % (Math.PI * 2);
+      const ph = Math.acos(1 - (2 * (s - 0.5)) / 30);
+      const dx = Math.sin(ph) * Math.cos(th);
+      const dy = Math.sin(ph) * Math.sin(th);
+      const dz = Math.cos(ph);
+      const r = R + ((s % 9) - 4) * 2000;
+      // Canonical per-point path:
+      densityAt(RECIPE, R, dx * r, dy * r, dz * r, a);
+      // Column-cache path (one terrainAt per direction, cheap assemble per radius):
+      terrainAt(RECIPE, dx * scale, dy * scale, dz * scale, _t);
+      assembleDensity(R, r, dx, dy, dz, _t[0]!, _t[1]!, _t[2]!, _t[3]!, height, scale, b);
+      expect(Math.abs(a[0]! - b[0]!)).toBeLessThan(1e-2); // D within ~cm
+      expect(Math.abs(a[1]! - b[1]!)).toBeLessThan(1e-5); // gradient components
+      expect(Math.abs(a[2]! - b[2]!)).toBeLessThan(1e-5);
+      expect(Math.abs(a[3]! - b[3]!)).toBeLessThan(1e-5);
+    }
   });
 });
 
@@ -143,8 +176,8 @@ describe('meshChunk', () => {
       triangleCount: m.triangleCount,
     }).toMatchInlineSnapshot(`
       {
-        "indices": "a5d37b49",
-        "normals": "b82d0b09",
+        "indices": "8fe148c9",
+        "normals": "474ec1c1",
         "positions": "173c1918",
         "triangleCount": 1258,
         "vertexCount": 616,

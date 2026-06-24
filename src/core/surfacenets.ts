@@ -39,6 +39,8 @@ export interface SampledField {
   density: Float64Array;
   /** Absolute world position (double) per corner; 3 floats per corner, same index. */
   cornerPos: Float64Array;
+  /** Unit outward normal per corner (= normalize(−∇D)); 3 per corner, same index. */
+  cornerNormal: Float64Array;
 }
 
 // The 12 cube edges as pairs of local corner indices (L = a | b<<1 | c<<2).
@@ -53,16 +55,17 @@ const OFF_C = [0, 0, 0, 0, 1, 1, 1, 1];
 
 /**
  * Extract the D=0 surface. `origin` is subtracted from every world vertex so the
- * GPU receives small floats (previews the floating origin, Step 4). `normalAt`
- * writes the unit outward normal at a world point into its `out` (length 3).
+ * GPU receives small floats (previews the floating origin, Step 4). Vertex normals
+ * are the normalized average of the cell's 8 corner normals (`field.cornerNormal`,
+ * the analytic outward normals computed during sampling) — no per-vertex field
+ * re-evaluation.
  */
 export function surfaceNets(
   field: SampledField,
   origin: readonly [number, number, number],
-  normalAt: (x: number, y: number, z: number, out: Float64Array) => void,
   skirtDepth = 0,
 ): ExtractedMesh {
-  const { nx, ny, nz, density, cornerPos } = field;
+  const { nx, ny, nz, density, cornerPos, cornerNormal } = field;
   const cnx = nx + 1;
   const cny = ny + 1;
   const cIdx = (i: number, j: number, k: number): number => i + cnx * (j + cny * k);
@@ -72,7 +75,6 @@ export function surfaceNets(
   const pos: number[] = []; // local x,y,z triples
   const nrm: number[] = [];
   const d = new Float64Array(8);
-  const _nb = new Float64Array(3);
 
   let minx = Infinity, miny = Infinity, minz = Infinity;
   let maxx = -Infinity, maxy = -Infinity, maxz = -Infinity;
@@ -82,10 +84,15 @@ export function surfaceNets(
     for (let j = 0; j < ny; j++) {
       for (let i = 0; i < nx; i++) {
         let mask = 0;
+        let nax = 0, nay = 0, naz = 0; // accumulate the cell's corner normals
         for (let L = 0; L < 8; L++) {
-          const dv = density[cIdx(i + OFF_A[L]!, j + OFF_B[L]!, k + OFF_C[L]!)]!;
+          const cc = cIdx(i + OFF_A[L]!, j + OFF_B[L]!, k + OFF_C[L]!);
+          const dv = density[cc]!;
           d[L] = dv;
           if (dv >= 0) mask |= 1 << L;
+          nax += cornerNormal[cc * 3]!;
+          nay += cornerNormal[cc * 3 + 1]!;
+          naz += cornerNormal[cc * 3 + 2]!;
         }
         if (mask === 0 || mask === 0xff) continue;
 
@@ -106,14 +113,14 @@ export function surfaceNets(
         const wx = sx * invc;
         const wy = sy * invc;
         const wz = sz * invc;
-        normalAt(wx, wy, wz, _nb);
+        const nl = 1 / Math.sqrt(nax * nax + nay * nay + naz * naz + 1e-30);
 
         const lx = wx - origin[0];
         const ly = wy - origin[1];
         const lz = wz - origin[2];
         cellVert[cellIdx(i, j, k)] = pos.length / 3;
         pos.push(lx, ly, lz);
-        nrm.push(_nb[0]!, _nb[1]!, _nb[2]!);
+        nrm.push(nax * nl, nay * nl, naz * nl);
 
         if (lx < minx) minx = lx;
         if (ly < miny) miny = ly;

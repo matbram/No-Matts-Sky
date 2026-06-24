@@ -94,6 +94,25 @@ export function retainedShouldRemove(
   return descCount > 0 && descCount === descLive; // all split children live → remove
 }
 
+// Conservative bounding-radius factor per quadtree depth. A depth-d face quadrant
+// is largest (least cube-sphere distortion) at the face CENTER, where a uv
+// half-size h=1/2^d maps to a corner at distance |normalize(h,h,1) − (0,0,1)| from
+// the center. Using this per-depth max for every node is conservative (LOD splits
+// slightly early, never late) and lets nodeBounds skip the 4 corner faceDirection
+// calls. Precomputed once.
+const MAX_DEPTH_TABLE = 26;
+const BOUND_FACTOR: Float64Array = (() => {
+  const t = new Float64Array(MAX_DEPTH_TABLE + 1);
+  for (let d = 0; d <= MAX_DEPTH_TABLE; d++) {
+    const h = 1 / 2 ** d;
+    const inv = 1 / Math.sqrt(h * h + h * h + 1);
+    const nz = inv;
+    const nxy = h * inv;
+    t[d] = Math.sqrt(2 * nxy * nxy + (nz - 1) * (nz - 1));
+  }
+  return t;
+})();
+
 /** World-space bounding sphere of a node: its surface patch ± the terrain margin. */
 export function nodeBounds(
   face: number,
@@ -103,25 +122,11 @@ export function nodeBounds(
 ): NodeBounds {
   const r = uvRectFromPath(path);
   const c = faceDirection(face, (r.u0 + r.u1) / 2, (r.v0 + r.v1) / 2);
-  const cx = c[0] * radius;
-  const cy = c[1] * radius;
-  const cz = c[2] * radius;
-  let maxd2 = 0;
-  const corners: Array<[number, number]> = [
-    [r.u0, r.v0],
-    [r.u1, r.v0],
-    [r.u0, r.v1],
-    [r.u1, r.v1],
-  ];
-  for (const [u, v] of corners) {
-    const d = faceDirection(face, u, v);
-    const dx = d[0] * radius - cx;
-    const dy = d[1] * radius - cy;
-    const dz = d[2] * radius - cz;
-    const d2 = dx * dx + dy * dy + dz * dz;
-    if (d2 > maxd2) maxd2 = d2;
-  }
-  return { center: [cx, cy, cz], radius: Math.sqrt(maxd2) + heightMargin };
+  const d = path.length <= MAX_DEPTH_TABLE ? path.length : MAX_DEPTH_TABLE;
+  return {
+    center: [c[0] * radius, c[1] * radius, c[2] * radius],
+    radius: BOUND_FACTOR[d]! * radius + heightMargin,
+  };
 }
 
 /** Screen-space diameter (px) of a bounding sphere of `boundsRadius` at `distance`. */
@@ -135,26 +140,34 @@ export function projectedSize(
   return ((2 * boundsRadius) / distance) * (viewportHeight / (2 * Math.tan(fovY / 2)));
 }
 
-/** True if the node sits past the planet's horizon from the camera (fully occluded). */
-function overHorizon(b: NodeBounds, camPos: [number, number, number], radius: number): boolean {
-  const pc = Math.hypot(camPos[0], camPos[1], camPos[2]);
-  if (pc <= radius) return false; // camera at/below surface → cull nothing
+// Horizon cull via cosines (no acos/asin). Cull iff the angle from the camera
+// direction to the node exceeds horizon + node angular radius, i.e.
+// cosA < cos(θ_h + θ_node) = cosθh·cosθn − sinθh·sinθn. `cosThetaH`/`sinThetaH`
+// are camera-constant (precomputed once per cut).
+function overHorizonCos(
+  b: NodeBounds,
+  camPos: [number, number, number],
+  pc: number,
+  cosThetaH: number,
+  sinThetaH: number,
+): boolean {
   const cc = Math.hypot(b.center[0], b.center[1], b.center[2]);
   if (cc < 1e-6) return false;
-  const thetaH = Math.acos(radius / pc); // camera→horizon half-angle
   const cosA =
     (camPos[0] * b.center[0] + camPos[1] * b.center[1] + camPos[2] * b.center[2]) / (pc * cc);
-  const angle = Math.acos(Math.max(-1, Math.min(1, cosA)));
-  const nodeAngular = Math.asin(Math.min(1, b.radius / cc));
-  return angle - nodeAngular > thetaH;
+  const sinNode = Math.min(1, b.radius / cc);
+  const cosNode = Math.sqrt(Math.max(0, 1 - sinNode * sinNode));
+  return cosA < cosThetaH * cosNode - sinThetaH * sinNode;
 }
 
-/** True if the node lies outside the camera's view cone (approximate frustum cull). */
-function outsideCone(
+// View-cone cull via cosines. `cosHalf`/`sinHalf` are the cone half-angle's
+// cosine/sine (precomputed once per cut).
+function outsideConeCos(
   b: NodeBounds,
   camPos: [number, number, number],
   forward: [number, number, number],
-  halfFov: number,
+  cosHalf: number,
+  sinHalf: number,
 ): boolean {
   const vx = b.center[0] - camPos[0];
   const vy = b.center[1] - camPos[1];
@@ -162,9 +175,9 @@ function outsideCone(
   const vlen = Math.hypot(vx, vy, vz);
   if (vlen < 1e-6 || vlen <= b.radius) return false; // on top of / inside the node
   const cosA = (vx * forward[0] + vy * forward[1] + vz * forward[2]) / vlen;
-  const angle = Math.acos(Math.max(-1, Math.min(1, cosA)));
-  const nodeAngular = Math.asin(Math.min(1, b.radius / vlen));
-  return angle - nodeAngular > halfFov;
+  const sinNode = Math.min(1, b.radius / vlen);
+  const cosNode = Math.sqrt(Math.max(0, 1 - sinNode * sinNode));
+  return cosA < cosHalf * cosNode - sinHalf * sinNode;
 }
 
 /**
@@ -182,13 +195,20 @@ export function selectCut(camera: CameraView, opts: SelectOpts): QuadNode[] {
   const forward = camera.forward;
   const halfFov = camera.halfFov;
 
+  // Camera-constant culling terms, computed once per cut (no per-node trig).
+  const pc = Math.hypot(camera.position[0], camera.position[1], camera.position[2]);
+  const cullH = cull && pc > opts.radius; // no horizon when at/below the surface
+  const cosThetaH = cullH ? opts.radius / pc : 0;
+  const sinThetaH = cullH ? Math.sqrt(Math.max(0, 1 - cosThetaH * cosThetaH)) : 0;
+  const useCone = forward !== undefined && halfFov !== undefined;
+  const cosHalf = useCone ? Math.cos(halfFov!) : 0;
+  const sinHalf = useCone ? Math.sin(halfFov!) : 0;
+
   while (stack.length > 0) {
     const node = stack.pop()!;
     const b = nodeBounds(node.face, node.path, opts.radius, opts.heightMargin);
-    if (cull && overHorizon(b, camera.position, opts.radius)) continue;
-    if (forward && halfFov !== undefined && outsideCone(b, camera.position, forward, halfFov)) {
-      continue;
-    }
+    if (cullH && overHorizonCos(b, camera.position, pc, cosThetaH, sinThetaH)) continue;
+    if (useCone && outsideConeCos(b, camera.position, forward!, cosHalf, sinHalf)) continue;
 
     const dx = camera.position[0] - b.center[0];
     const dy = camera.position[1] - b.center[1];
