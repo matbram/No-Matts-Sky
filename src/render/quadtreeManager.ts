@@ -34,8 +34,8 @@ import {
   type QuadNode,
 } from '../core/quadtree.ts';
 import { chunkKey, uvRectFromPath, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
-import { faceDirection, CUBE_FACES } from '../core/cubesphere.ts';
-import { lodOctaves, type TerrainRecipe } from '../core/density.ts';
+import { faceDirection, wrapFaceUV, CUBE_FACES } from '../core/cubesphere.ts';
+import { lodOctaves, terrainAt, type TerrainRecipe } from '../core/density.ts';
 
 /** Node materials expose positionNode/normalNode; the base is typed as plain Material here. */
 interface NodeMaterialLike {
@@ -114,6 +114,7 @@ export interface ManagerOpts {
   // holes at LOD transitions, and the skirts were the visible boundary grid; ?skirt re-enables)
   debugColor?: 'lod' | 'skirt' | 'morph'; // debug tint: LOD level / skirted leaves / morph progress
   debugLodMorph?: boolean; // ?lodmorphdebug: throttled [NMS morph] console line + balance metric
+  debugAudit?: boolean; // ?lodaudit: SUPERSET — also [NMS audit] (seam/coverage/cadence/health)
 }
 
 export interface StreamStats {
@@ -171,6 +172,16 @@ export class QuadtreeManager {
   private camX = 0;
   private camY = 0;
   private camZ = 0;
+  // ?lodaudit state: the last cut's view-cone half-angle (caps the coverage probe), recut cadence,
+  // a one-time wiring sanity check, the HUD mirror, and reused terrain-eval scratch (gap metric).
+  private dbgHalfFov = Math.PI;
+  private dbgLastCutMs = 0;
+  private dbgCutIntervalMs = 0; // EMA of ms between recuts (the "wave" cadence)
+  private dbgLeavesAdded = 0; // new leaves requested this cut
+  private wiringLogged = false; // one-time morphTargetNormal/normalNode sanity
+  private auditSummary = ''; // HUD mirror of the [NMS audit] line
+  private readonly _tA = new Float64Array(4);
+  private readonly _tB = new Float64Array(4);
 
   constructor(
     private readonly scene: Scene,
@@ -244,6 +255,14 @@ export class QuadtreeManager {
     this.bornMMin = 1;
     this.bornMN = 0;
     this.prefetchM = prefetchM; // for ?lodmorphdebug readout
+    if (this.opts.debugAudit) {
+      // Recut cadence (the "detail arrives in waves" signal) + the view cone for the coverage/seam probes.
+      const since = this.clockMs - this.dbgLastCutMs;
+      this.dbgCutIntervalMs = this.dbgCutIntervalMs === 0 ? since : this.dbgCutIntervalMs * 0.8 + since * 0.2;
+      this.dbgLastCutMs = this.clockMs;
+      if (camera.halfFov !== undefined) this.dbgHalfFov = camera.halfFov;
+    }
+    let leavesAdded = 0;
     const cut = selectCut(camera, {
       radius: this.radius,
       heightMargin: this.heightMargin,
@@ -259,6 +278,7 @@ export class QuadtreeManager {
       const key = chunkKey({ face: node.face, path: node.path, lod: node.path.length });
       wanted.add(key);
       if (!this.entries.has(key)) {
+        leavesAdded++;
         const b = nodeBounds(node.face, node.path, this.radius, 0);
         this.entries.set(key, {
           node,
@@ -274,6 +294,7 @@ export class QuadtreeManager {
         });
       }
     }
+    this.dbgLeavesAdded = leavesAdded;
     this.wanted = wanted;
 
     // Per-leaf skirt conditioning — only when skirts are ENABLED (default OFF). The
@@ -375,6 +396,9 @@ export class QuadtreeManager {
     const tintMorph = this.opts.debugColor === 'morph';
     if (!dbg && !tintMorph) return; // CDLOD morph is in-shader; nothing else to do
     let live = 0, mid = 0, sum = 0, mn = 1, mx = 0, newestLive = -1;
+    // ?lodaudit morph histogram buckets: [m<.1, .1–.3, .3–.7, .7–.9, >.9]. Bimodal (full pile at
+    // <.1 and >.9, few between) ⇒ steps at the transition ring; a smooth spread ⇒ graded morph.
+    let h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0;
     for (const e of this.entries.values()) {
       if (e.status !== 'live') continue;
       live++;
@@ -390,6 +414,7 @@ export class QuadtreeManager {
           if (m < mn) mn = m;
           if (m > mx) mx = m;
         }
+        if (m < 0.1) h0++; else if (m < 0.3) h1++; else if (m < 0.7) h2++; else if (m < 0.9) h3++; else h4++;
       }
     }
     if (dbg) {
@@ -412,6 +437,26 @@ export class QuadtreeManager {
             `reqLat[avg=${latAvg} max=${this.reqLatMax | 0}]ms ` +
             `uploads/cut=${this.uploadedThisCut} maxNbrΔ=${this.maxNbrDelta} ${this.nearLeafStr()}`,
         );
+        // ?lodaudit: the comprehensive pipeline line (same 10-tick throttle). seam = the cross-LOD
+        // boundary continuity (Δeff≈0 + gap≈0 = seamless = no squares); cov/holes = backdrop
+        // show-through; histM = morph distribution; cut[Δt,+N] = recut wave cadence; stream/busy =
+        // worker health; pf/band = whether prefetch is meaningful at this altitude.
+        if (this.opts.debugAudit) {
+          const seam = this.seamScan();
+          const cov = this.coverageScan();
+          const s = this.stats();
+          const busy = this.workers.length - this.idle.length;
+          const band = this.nearLeafBandKm();
+          const pfKm = this.prefetchM / 1000;
+          this.auditSummary =
+            `seam[Δeff max=${seam.dEffMax.toFixed(2)} avg=${seam.dEffAvg.toFixed(2)} gap=${seam.gapMax.toFixed(1)}m @${seam.worst}] ` +
+            `cov=${cov.covered}/${cov.total} holes=${cov.holes} ` +
+            `histM[${h0}/${h1}/${h2}/${h3}/${h4}] ` +
+            `cut[Δt=${this.dbgCutIntervalMs | 0}ms +${this.dbgLeavesAdded}] ` +
+            `stream[p${s.pending} i${s.inflight} r${s.ready} L${s.live} busy${busy}/${this.workers.length} ${s.msPerLeaf.toFixed(0)}ms] ` +
+            `pf=${pfKm.toFixed(1)}km band=${band.toFixed(1)}km pf/band=${band > 0 ? (pfKm / band).toFixed(3) : '-'}`;
+          console.log('[NMS audit]', this.auditSummary);
+        }
       }
     }
   }
@@ -462,6 +507,138 @@ export class QuadtreeManager {
     const dChild = 2 * lodBoundRadius(depth, this.radius) * this.kDist;
     const dParent = 2 * lodBoundRadius(depth > 0 ? depth - 1 : 0, this.radius) * (depth > 0 ? this.kDist : 2 * this.kDist);
     return `near[d=${depth} m=${this.centerMorph(best).toFixed(2)} dist=${(dist / 1000).toFixed(1)}km band=${(dChild / 1000).toFixed(1)}..${(dParent / 1000).toFixed(1)}km]`;
+  }
+
+  // ───────────────────────── ?lodaudit helpers (debug-only, throttled) ─────────────────────────
+
+  /** Width (km) of the sub-camera leaf's CDLOD morph band — to gauge prefetch significance. */
+  private nearLeafBandKm(): number {
+    const { face, u, v } = this.faceUVOf(this.camX, this.camY, this.camZ);
+    let depth = -1;
+    for (const e of this.entries.values()) {
+      if (e.status !== 'live' || e.node.face !== face) continue;
+      const r = uvRectFromPath(e.node.path);
+      if (u < r.u0 || u > r.u1 || v < r.v0 || v > r.v1) continue;
+      if (e.node.path.length > depth) depth = e.node.path.length;
+    }
+    if (depth < 0) return 0;
+    const dChild = 2 * lodBoundRadius(depth, this.radius) * this.kDist;
+    const dParent = 2 * lodBoundRadius(depth > 0 ? depth - 1 : 0, this.radius) * (depth > 0 ? this.kDist : 2 * this.kDist);
+    return (dParent - dChild) / 1000;
+  }
+
+  /** Deepest LIVE leaf whose face-(u,v) rect contains a world direction, or null (= backdrop). */
+  private liveLeafUnderDir(wx: number, wy: number, wz: number): Entry | null {
+    const { face, u, v } = this.faceUVOf(wx, wy, wz);
+    let best: Entry | null = null;
+    for (const e of this.entries.values()) {
+      if (e.status !== 'live' || e.node.face !== face) continue;
+      const r = uvRectFromPath(e.node.path);
+      if (u < r.u0 || u > r.u1 || v < r.v0 || v > r.v1) continue;
+      if (!best || e.node.path.length > best.node.path.length) best = e;
+    }
+    return best;
+  }
+
+  /** Rendered CDLOD morph (0..1, incl birth-ease) for leaf `e` at world point P — the SAME
+   *  formula the TSL shader applies per-vertex, evaluated on the CPU at an arbitrary point. */
+  private effMorphAt(e: Entry, px: number, py: number, pz: number): number {
+    const dx = px - this.camX, dy = py - this.camY, dz = pz - this.camZ;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const depth = e.node.path.length;
+    const lodR = lodBoundRadius(depth, this.radius);
+    const parentR = depth > 0 ? lodBoundRadius(depth - 1, this.radius) : lodR * 2;
+    const dChild = 2 * lodR * this.kDist;
+    const dParent = 2 * parentR * this.kDist;
+    const e0 = dChild + (dParent - dChild) * MORPH_START_FRAC;
+    let m = 0;
+    if (dParent > e0) {
+      let t = (dist - e0) / (dParent - e0);
+      if (t < 0) t = 0; else if (t > 1) t = 1;
+      m = t * t * (3 - 2 * t);
+    }
+    let birth = 1 - (this.clockMs - e.liveAtMs) / BIRTH_MS;
+    if (birth < 0) birth = 0;
+    return m > birth ? m : birth;
+  }
+
+  /** Rendered radius (m) of leaf `e` at unit dir (dx,dy,dz): lerp(full-octave, parent-octave) by
+   *  its morph `m` — what the geomorph actually draws there, for the cross-LOD gap metric. */
+  private renderedRadiusAt(e: Entry, dx: number, dy: number, dz: number, m: number): number {
+    const octFull = lodOctaves(this.recipe, e.node.path.length);
+    const scale = this.recipe.noiseScale;
+    terrainAt(this.recipe, dx * scale, dy * scale, dz * scale, this._tA, undefined, octFull);
+    terrainAt(this.recipe, dx * scale, dy * scale, dz * scale, this._tB, undefined, Math.max(1, octFull - 1));
+    const tv = (1 - m) * this._tA[0]! + m * this._tB[0]!;
+    return this.radius + this.recipe.height * tv;
+  }
+
+  /** Scan shared edges between live leaves; report the worst effective-LOD step (Δeff) and the
+   *  rendered radial gap (m) there. Δeff≈0 & gap≈0 = truly seamless (no squares). O(live²·4),
+   *  debug-only + throttled (same cost class as maxNeighborDelta). */
+  private seamScan(): { dEffMax: number; dEffAvg: number; gapMax: number; worst: string } {
+    let dEffMax = 0, dEffSum = 0, n = 0, gapMax = 0, worst = '-';
+    let wA: Entry | null = null, wB: Entry | null = null, wx = 0, wy = 0, wz = 0;
+    for (const e of this.entries.values()) {
+      if (e.status !== 'live') continue;
+      const r = uvRectFromPath(e.node.path);
+      const um = (r.u0 + r.u1) / 2, vm = (r.v0 + r.v1) / 2;
+      const hw = (r.u1 - r.u0) * 0.25, hh = (r.v1 - r.v0) * 0.25;
+      const depthA = e.node.path.length;
+      const probes: [number, number][] = [[r.u1 + hw, vm], [r.u0 - hw, vm], [um, r.v1 + hh], [um, r.v0 - hh]];
+      for (const [pu, pv] of probes) {
+        const w = wrapFaceUV(e.node.face, pu, pv);
+        const d = faceDirection(w.face, w.u, w.v);
+        const px = d[0] * this.radius, py = d[1] * this.radius, pz = d[2] * this.radius;
+        const nb = this.liveLeafUnderDir(px, py, pz);
+        if (!nb || nb === e) continue;
+        const mA = this.effMorphAt(e, px, py, pz);
+        const mB = this.effMorphAt(nb, px, py, pz);
+        const dEff = Math.abs((depthA - mA) - (nb.node.path.length - mB));
+        dEffSum += dEff; n++;
+        if (dEff > dEffMax) {
+          dEffMax = dEff; wA = e; wB = nb; wx = d[0]; wy = d[1]; wz = d[2];
+          worst = `f${e.node.face}d${depthA}·d${nb.node.path.length}`;
+        }
+      }
+    }
+    if (wA && wB) {
+      const px = wx * this.radius, py = wy * this.radius, pz = wz * this.radius;
+      const mA = this.effMorphAt(wA, px, py, pz);
+      const mB = this.effMorphAt(wB, px, py, pz);
+      gapMax = Math.abs(this.renderedRadiusAt(wA, wx, wy, wz, mA) - this.renderedRadiusAt(wB, wx, wy, wz, mB));
+    }
+    return { dEffMax, dEffAvg: n > 0 ? dEffSum / n : 0, gapMax, worst };
+  }
+
+  /** Sample SURFACE directions over the visible cap (around the sub-camera point, out to the
+   *  horizon, soft-capped by the view cone); count those covered by a LIVE leaf vs the backdrop
+   *  (= "unloaded" holes). NB: directions are ORIGIN→surface (what faceUVOf/leaf rects use), NOT
+   *  view rays. In walk/creative the forward-cone cut leaves the rest of the cap uncovered, so
+   *  holes outside the look direction there are expected; the metric is decisive for orbit/fly. */
+  private coverageScan(): { total: number; covered: number; holes: number } {
+    const pc = Math.hypot(this.camX, this.camY, this.camZ) || 1;
+    const cx = this.camX / pc, cy = this.camY / pc, cz = this.camZ / pc; // sub-camera surface dir
+    let ax = 0, ay = 1, az = 0;
+    if (Math.abs(cy) > 0.99) { ax = 1; ay = 0; az = 0; }
+    let rx = cy * az - cz * ay, ry = cz * ax - cx * az, rz = cx * ay - cy * ax;
+    const rl = Math.hypot(rx, ry, rz) || 1; rx /= rl; ry /= rl; rz /= rl;
+    const ux = cy * rz - cz * ry, uy = cz * rx - cx * rz, uz = cx * ry - cy * rx;
+    const horizon = Math.acos(Math.min(1, this.radius / pc)); // angular radius of the visible cap
+    const maxT = Math.min(horizon * 0.98, this.dbgHalfFov); // visible cap ∩ (approx) view cone
+    const N = 96;
+    let covered = 0;
+    for (let i = 0; i < N; i++) {
+      const theta = maxT * Math.sqrt((i + 0.5) / N); // area-uniform within the cap
+      const phi = i * 2.399963; // golden-angle spiral
+      const st = Math.sin(theta), ct = Math.cos(theta);
+      const cp = Math.cos(phi), sp = Math.sin(phi);
+      const dx = ct * cx + st * (cp * rx + sp * ux);
+      const dy = ct * cy + st * (cp * ry + sp * uy);
+      const dz = ct * cz + st * (cp * rz + sp * uz);
+      if (this.liveLeafUnderDir(dx, dy, dz)) covered++;
+    }
+    return { total: N, covered, holes: N - covered };
   }
 
   /** Upload up to `budget` finished meshes to the GPU this frame; returns how many. */
@@ -580,6 +757,16 @@ export class QuadtreeManager {
         this.bornMN++;
         if (bm < this.bornMMin) this.bornMMin = bm;
       }
+      if (this.opts.debugAudit && !this.wiringLogged) {
+        // One-time sanity: confirm the geomorph SHADING (Part 6) is actually wired on this build —
+        // geometry carries morphTargetNormal AND the material overrides both position & normal nodes.
+        this.wiringLogged = true;
+        const ml = mat as unknown as NodeMaterialLike;
+        console.log(
+          `[NMS audit] wiring: morphTargetNormal=${!!geometry.getAttribute('morphTargetNormal')} ` +
+            `positionNode=${!!ml.positionNode} normalNode=${!!ml.normalNode}`,
+        );
+      }
       this.uploadedThisCut++;
       this.scene.add(mesh);
       n++;
@@ -658,9 +845,12 @@ export class QuadtreeManager {
     return out;
   }
 
-  /** HUD line for ?lodmorphdebug (mid-morph count, avg progress, newest age, imbalance). */
+  /** HUD line for ?lodmorphdebug (mid-morph count, avg progress, newest age, imbalance); under
+   *  ?lodaudit also mirrors the [NMS audit] seam/coverage/cadence/health line. */
   morphInfo(): string {
-    return this.morphSummary;
+    return this.opts.debugAudit && this.auditSummary
+      ? `${this.morphSummary}\n${this.auditSummary}`
+      : this.morphSummary;
   }
 
   /**

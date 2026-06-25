@@ -133,8 +133,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // depth/morph underfoot — so the user's console paste shows the clip mechanism.
   const clipDebug = params.has('clipdebug');
   // ?lodmorphdebug: throttled [NMS morph] console line (geomorph staggering + cut imbalance).
+  // ?lodaudit: SUPERSET — also emits [NMS audit] (per-edge seam Δeff+gap, screen coverage/holes,
+  //   morph histogram, recut cadence, stream/worker health, prefetch-vs-band, wiring sanity). The
+  //   comprehensive pipeline view: confirms WHERE/WHY detail isn't gradual before we change anything.
   // ?morphcolor: tint leaves red→green by geomorph progress so LOD pop-in is visible to screenshot.
-  const lodMorphDebug = params.has('lodmorphdebug');
+  const lodAudit = params.has('lodaudit');
+  const lodMorphDebug = params.has('lodmorphdebug') || lodAudit; // audit implies the morph line too
   const morphColor = params.has('morphcolor');
   const renderer = new WebGPURenderer({
     canvas,
@@ -169,6 +173,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     skirt: params.has('skirt'), // skirts default OFF now; ?skirt re-enables for A/B
     clipdebug: clipDebug, // ?clipdebug: walk collision-vs-rendered-mesh logging
     lodmorphdebug: lodMorphDebug, // ?lodmorphdebug: geomorph staggering/imbalance logging
+    lodaudit: lodAudit, // ?lodaudit: full pipeline diagnostics ([NMS audit] seam/coverage/cadence/…)
     morphcolor: morphColor, // ?morphcolor: tint leaves by geomorph progress (LOD pop-in visible)
     dark: params.has('dark'),
   });
@@ -229,6 +234,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
           ? 'skirt'
           : undefined,
     debugLodMorph: lodMorphDebug,
+    debugAudit: lodAudit,
   });
 
   // No-black backdrop: a single smooth sphere INSET below the deepest terrain
