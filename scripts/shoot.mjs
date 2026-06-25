@@ -143,24 +143,82 @@ async function main() {
       note(`shot ${name} -> ${file}  (leaves=${await leaves()}, centerLuma=${await centerLuma()})`);
     };
 
-    for (const [key, name] of presets) {
-      await page.keyboard.press(key);
-      await settle(name);
-      await shoot(name);
-    }
-
-    // FAR=<n> wheel-out steps from orbit to reproduce the far/coarse state (e.g. leaves≈9).
-    const far = Number(process.env.FAR ?? 0);
-    if (far > 0) {
+    // WALK=1: Step 4 verification — enter walk mode, hold W, and assert the player
+    // stays grounded (alt ≈ eye height), finite (no NaN/tunnel/launch), moves, and
+    // renders (not black). Frame-time is NOT asserted here — headless software WebGL
+    // is inherently slow (~hundreds of ms/frame); the 60fps gate is the user's real-GPU
+    // check. dt is clamped (50 ms) so few software frames cover little distance — that's
+    // fine; this proves the collision/controller math, not long-distance re-centering.
+    if (process.env.WALK) {
+      const read = () => page.evaluate(() => (window.__nms_player ? window.__nms_player() : null));
+      const frameMs = () =>
+        page.evaluate(() => {
+          const m = /(\d+)\s*fps\s+([\d.]+)\s*ms/.exec(document.body.innerText);
+          return m ? Number(m[2]) : -1;
+        });
       await page.keyboard.press('1');
       await settle('orbit');
-      await page.mouse.move(W / 2, H / 2);
-      for (let i = 0; i < far; i++) {
-        await page.mouse.wheel(0, 600); // scroll down = dolly out
-        await new Promise((r) => setTimeout(r, 120));
+      await page.keyboard.press('f'); // enter walk (code KeyF)
+      await page
+        .waitForFunction(() => /WALK/.test(document.body.innerText), { timeout: 15000 })
+        .catch(() => note('[warn] did not enter WALK mode'));
+      await settle('walk');
+      await shoot('walk-start');
+      const s0 = await read();
+      note(`walk start: ${JSON.stringify(s0)}`);
+
+      await page.keyboard.down('w'); // hold forward (code KeyW)
+      let bad = 0;
+      let samples = 0;
+      let minAlt = Infinity;
+      let maxAlt = -Infinity;
+      let maxMs = 0;
+      const t0 = Date.now();
+      while (Date.now() - t0 < 10000) {
+        await new Promise((r) => setTimeout(r, 250));
+        const st = await read();
+        samples++;
+        if (!st) { bad++; note('[bad] no player state'); continue; }
+        const finite = ['x', 'y', 'z', 'alt'].every((k) => Number.isFinite(st[k]));
+        if (!finite) { bad++; note(`[bad] non-finite: ${JSON.stringify(st)}`); }
+        if (st.alt < 1.0 || st.alt > 5.0) { bad++; note(`[bad] alt out of band: ${st.alt}`); }
+        minAlt = Math.min(minAlt, st.alt);
+        maxAlt = Math.max(maxAlt, st.alt);
+        maxMs = Math.max(maxMs, await frameMs());
       }
-      await settle('far');
-      await shoot('far');
+      await page.keyboard.up('w');
+      const s1 = await read();
+      const moved = s0 && s1 ? Math.hypot(s1.x - s0.x, s1.y - s0.y, s1.z - s0.z) : -1;
+      note(`walk end: ${JSON.stringify(s1)}`);
+      note(`walk: samples=${samples} bad=${bad} alt[${minAlt.toFixed(2)},${maxAlt.toFixed(2)}]m moved=${moved.toFixed(1)}m frameMs(sw)=${maxMs.toFixed(0)}`);
+      await shoot('walk-far');
+      const pageErrors = log.filter((l) => l.startsWith('[pageerror]')).length;
+      const nanLines = log.filter((l) => /\bNaN\b|Infinity/.test(l)).length;
+      // NB: in-page canvas readback (centerLuma) is unreliable — the WebGL drawing
+      // buffer isn't preserved, so it reads black even when terrain renders. The
+      // walk-*.png screenshots are the visual gate; this asserts the controller math.
+      const pass = bad === 0 && pageErrors === 0 && moved > 0.5 && samples > 5;
+      note(`WALK RESULT: ${pass ? 'PASS' : 'CHECK'} (bad=${bad} pageerrors=${pageErrors} nan=${nanLines} moved=${moved.toFixed(1)}m alt[${minAlt.toFixed(2)},${maxAlt.toFixed(2)}] — see walk-far.png)`);
+    } else {
+      for (const [key, name] of presets) {
+        await page.keyboard.press(key);
+        await settle(name);
+        await shoot(name);
+      }
+
+      // FAR=<n> wheel-out steps from orbit to reproduce the far/coarse state (e.g. leaves≈9).
+      const far = Number(process.env.FAR ?? 0);
+      if (far > 0) {
+        await page.keyboard.press('1');
+        await settle('orbit');
+        await page.mouse.move(W / 2, H / 2);
+        for (let i = 0; i < far; i++) {
+          await page.mouse.wheel(0, 600); // scroll down = dolly out
+          await new Promise((r) => setTimeout(r, 120));
+        }
+        await settle('far');
+        await shoot('far');
+      }
     }
   } finally {
     // Software WebGL can hang on close; don't let it wedge the run.

@@ -30,10 +30,11 @@ import { WebGPURenderer, MeshStandardNodeMaterial } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { EARTH_RADIUS_M } from '../core/constants.ts';
 import { buildCubeSphere } from '../core/cubesphere.ts';
-import { sliceTerrainRecipe } from '../core/density.ts';
+import { sliceTerrainRecipe, surfaceAt } from '../core/density.ts';
 import { sliceFacts } from '../core/facts.ts';
 import { childSeed, SALT } from '../core/seedchain.ts';
 import { QuadtreeManager } from './quadtreeManager.ts';
+import { PlayerController, type WalkInput } from './player.ts';
 
 // Injected by Vite at build time (git short hash + build time) — logged at startup
 // so we can tell a stale deploy from the latest fix during remote diagnosis.
@@ -249,13 +250,6 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   }
   applyPreset(presets.orbit!);
 
-  const onKey = (e: KeyboardEvent): void => {
-    if (e.key === '1') applyPreset(presets.orbit!);
-    else if (e.key === '2') applyPreset(presets.mid!);
-    else if (e.key === '3') applyPreset(presets.surface!);
-  };
-  window.addEventListener('keydown', onKey);
-
   let vpHeight = window.innerHeight;
   let aspect = 1;
   let lastFrame = performance.now();
@@ -264,37 +258,147 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const vel = new Vector3();
   const lookahead = new Vector3();
 
+  // ── Walking (Step 4): floating-origin + body-fixed player ────────────────────
+  let mode: 'fly' | 'walk' = 'fly';
+  let player: PlayerController | null = null;
+  const held: WalkInput = { forward: false, back: false, left: false, right: false, jump: false, sprint: false };
+  // Re-center the floating origin on the player past this drift, so GPU floats stay
+  // ~0.06 mm-precise near the player (512·2⁻²³) → no jitter, while big planet-scale
+  // doubles are differenced in JS and never reach the GPU (CLAUDE.md §4).
+  const RECENTER_THRESHOLD = 512;
+  const _spawn = new Vector3();
+  const _surf7 = new Float64Array(7);
+  const playerWorld = new Vector3();
+
+  function enterWalk(): void {
+    surfaceAt(recipe, R, SURFACE_DIR.x, SURFACE_DIR.y, SURFACE_DIR.z, _surf7);
+    _spawn.copy(SURFACE_DIR).multiplyScalar(_surf7[0]! + 1.7); // body-fixed spawn at eye height
+    player = player ?? new PlayerController(recipe, R);
+    player.reset(_spawn, 0, 0);
+    controls.enabled = false;
+    renderOrigin.copy(_spawn);
+    targetWorld.copy(_spawn);
+    manager.setRenderOrigin([renderOrigin.x, renderOrigin.y, renderOrigin.z]);
+    backdrop.position.set(-renderOrigin.x, -renderOrigin.y, -renderOrigin.z);
+    camera.position.set(0, 0, 0);
+    player.getQuaternion(camera.quaternion);
+    mode = 'walk';
+    forceCut = true;
+    canvas.requestPointerLock?.();
+  }
+  function exitToPreset(p: Preset): void {
+    if (mode === 'walk') {
+      mode = 'fly';
+      controls.enabled = true;
+      held.forward = held.back = held.left = held.right = held.jump = held.sprint = false;
+      document.exitPointerLock?.();
+    }
+    applyPreset(p);
+  }
+
+  const onKeyDown = (e: KeyboardEvent): void => {
+    switch (e.code) {
+      case 'KeyW': held.forward = true; break;
+      case 'KeyS': held.back = true; break;
+      case 'KeyA': held.left = true; break;
+      case 'KeyD': held.right = true; break;
+      case 'Space': held.jump = true; break;
+      case 'ShiftLeft': case 'ShiftRight': held.sprint = true; break;
+      case 'KeyF': if (mode === 'fly') enterWalk(); break;
+      case 'Digit1': exitToPreset(presets.orbit!); break;
+      case 'Digit2': exitToPreset(presets.mid!); break;
+      case 'Digit3': exitToPreset(presets.surface!); break;
+      case 'Escape': if (mode === 'walk') exitToPreset(presets.orbit!); break;
+    }
+  };
+  const onKeyUp = (e: KeyboardEvent): void => {
+    switch (e.code) {
+      case 'KeyW': held.forward = false; break;
+      case 'KeyS': held.back = false; break;
+      case 'KeyA': held.left = false; break;
+      case 'KeyD': held.right = false; break;
+      case 'Space': held.jump = false; break;
+      case 'ShiftLeft': case 'ShiftRight': held.sprint = false; break;
+    }
+  };
+  const onClick = (): void => { if (mode === 'walk') canvas.requestPointerLock?.(); };
+  const onMouseMove = (e: MouseEvent): void => {
+    if (mode === 'walk' && player && document.pointerLockElement === canvas) {
+      player.addMouse(e.movementX, e.movementY);
+    }
+  };
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  canvas.addEventListener('click', onClick);
+  window.addEventListener('mousemove', onMouseMove);
+
+  // Headless/debug hook: live player state for the walk verification harness.
+  (window as unknown as { __nms_player?: () => unknown }).__nms_player = () =>
+    mode === 'walk' && player
+      ? { alt: player.altitude(), spd: player.speed(), grounded: player.isGrounded(),
+          x: playerWorld.x, y: playerWorld.y, z: playerWorld.z, near: camera.near }
+      : null;
+
   return {
     renderer,
     render(): void {
       const now = performance.now();
       const dt = now - lastFrame;
       lastFrame = now;
-      controls.update();
+
+      if (mode === 'walk' && player) {
+        // Drive the camera from the player's body-fixed position; keep the floating
+        // origin near the player so GPU floats stay tiny (no jitter).
+        player.update(dt / 1000, held);
+        player.getWorldPos(playerWorld);
+        camera.position.copy(playerWorld).sub(renderOrigin);
+        if (camera.position.lengthSq() > RECENTER_THRESHOLD * RECENTER_THRESHOLD) {
+          renderOrigin.copy(playerWorld);
+          manager.setRenderOrigin([renderOrigin.x, renderOrigin.y, renderOrigin.z]);
+          backdrop.position.set(-renderOrigin.x, -renderOrigin.y, -renderOrigin.z);
+          camera.position.set(0, 0, 0);
+        }
+        player.getQuaternion(camera.quaternion);
+      } else {
+        controls.update();
+      }
+
       worldCam.copy(camera.position).add(renderOrigin);
       vel.copy(worldCam).sub(prevWorldCam); // world units / frame
       prevWorldCam.copy(worldCam);
 
-      // Dynamic near/far from altitude + horizon distance, every frame. Fixed
-      // per-preset planes blacked the planet out on zoom-out (far too small);
-      // this always reaches the visible limb and keeps a sane depth ratio.
+      // Dynamic near/far from altitude + horizon distance, every frame.
       const distCenter = worldCam.length();
-      const alt = Math.max(distCenter - R, 1);
       const horizon = Math.sqrt(Math.max(0, distCenter * distCenter - R * R));
-      camera.near = Math.max(1, alt * 0.05);
-      camera.far = horizon + recipe.height * 8 + alt * 0.1;
+      if (mode === 'walk') {
+        // Eye-height altitude above the mean radius is unreliable (mountains/basins),
+        // so use a fixed 10 cm near for close terrain; the 0.1 m : ~hundreds-of-km
+        // ratio is fine ONLY because logarithmic depth is on (?nolog z-fights here).
+        camera.near = 0.1;
+        camera.far = horizon + recipe.height * 8 + 5000;
+      } else {
+        const alt = Math.max(distCenter - R, 1);
+        camera.near = Math.max(1, alt * 0.05);
+        camera.far = horizon + recipe.height * 8 + alt * 0.1;
+      }
       camera.updateProjectionMatrix();
 
       const distToTarget = worldCam.distanceTo(targetWorld);
-      // Re-cut when the camera has moved enough (adaptive: tighter near surface).
+      // Re-cut when the camera has moved enough (fixed small step while walking;
+      // adaptive while flying).
       const moved = worldCam.distanceTo(lastCutPos);
-      if (forceCut || moved > Math.max(50, distToTarget * 0.02)) {
-        forward.copy(targetWorld).sub(worldCam).normalize(); // orbit controls always look at target
-        // Cone half-angle covering the frustum corners, with a small margin so
-        // leaves just off-screen are pre-meshed before rotating in. Tighter now
-        // (1.2) than before — the geomorph hides reveals, so we mesh a smaller
-        // ring and keep the queue shallow on fast rotation.
-        const halfFov = Math.atan(Math.tan(fovY / 2) * Math.sqrt(1 + aspect * aspect)) * 1.2;
+      const recutDist = mode === 'walk' ? 8 : Math.max(50, distToTarget * 0.02);
+      if (forceCut || moved > recutDist) {
+        let halfFov: number;
+        if (mode === 'walk' && player) {
+          player.getForward(forward); // look direction (Step 4: render space == world)
+          halfFov = Math.PI; // no cone cull while walking → smooth look-around (horizon cull still applies)
+        } else {
+          forward.copy(targetWorld).sub(worldCam).normalize(); // orbit controls always look at target
+          // Cone half-angle covering the frustum corners, with a small margin so
+          // leaves just off-screen are pre-meshed before rotating in.
+          halfFov = Math.atan(Math.tan(fovY / 2) * Math.sqrt(1 + aspect * aspect)) * 1.2;
+        }
         lookahead.copy(worldCam).addScaledVector(vel, LOOKAHEAD_FRAMES); // generate ahead of motion
         manager.update(
           {
@@ -317,7 +421,11 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     },
     streamInfo(): string {
       const s = manager.stats();
-      return `leaves ${s.live}  queue ${s.pending + s.ready}  busy ${s.inflight}  ${s.msPerLeaf.toFixed(0)} ms/leaf`;
+      const base = `leaves ${s.live}  queue ${s.pending + s.ready}  busy ${s.inflight}  ${s.msPerLeaf.toFixed(0)} ms/leaf`;
+      if (mode === 'walk' && player) {
+        return `WALK  alt ${player.altitude().toFixed(1)} m  spd ${player.speed().toFixed(1)} m/s  (Esc/1-2-3 exit)\n${base}`;
+      }
+      return `FLY  (F: walk)\n${base}`;
     },
     resize(width: number, height: number): void {
       vpHeight = height;
@@ -327,7 +435,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       renderer.setSize(width, height, false);
     },
     dispose(): void {
-      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('mousemove', onMouseMove);
+      canvas.removeEventListener('click', onClick);
       manager.dispose();
       controls.dispose();
       backdropGeo.dispose();

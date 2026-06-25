@@ -157,3 +157,63 @@ export function densityAt(
   terrainAt(recipe, rx * scale, ry * scale, rz * scale, _t);
   assembleDensity(radius, r, rx, ry, rz, _t[0]!, _t[1]!, _t[2]!, _t[3]!, recipe.height, scale, out);
 }
+
+// surfaceAt scratch (separate from _t so the player's per-frame surface query on
+// the main thread never aliases densityAt's buffer mid-read).
+const _sT = new Float64Array(4);
+const _sD = new Float64Array(4);
+
+/**
+ * Surface query along a direction — the character controller's collision &
+ * orientation probe (Step 4). Returns the SAME surface the mesher builds: the
+ * field's zero crossing D = radius − r + height·tv = 0 ⇒ r = radius + height·tv,
+ * with the analytic outward normal `normalize(−∇D)` (identical to chunk.ts L188).
+ * `(dx,dy,dz)` need NOT be unit (normalized inside). Pure, deterministic, no alloc.
+ *
+ * Writes into `out` (length ≥ 7):
+ *   out[0]   = surfaceRadius  (meters from planet center)
+ *   out[1..3]= outward unit surface normal
+ *   out[4..6]= the unit radial direction (normalized input)
+ */
+export function surfaceAt(
+  recipe: TerrainRecipe,
+  planetRadius: number,
+  dx: number,
+  dy: number,
+  dz: number,
+  out: Float64Array,
+): void {
+  const inv = 1 / Math.sqrt(dx * dx + dy * dy + dz * dz);
+  const rx = dx * inv;
+  const ry = dy * inv;
+  const rz = dz * inv;
+  const scale = recipe.noiseScale;
+  terrainAt(recipe, rx * scale, ry * scale, rz * scale, _sT);
+  const surfaceRadius = planetRadius + recipe.height * _sT[0]!;
+  // ∇D at the surface point → outward normal = normalize(−∇D), matching the mesh.
+  assembleDensity(
+    planetRadius,
+    surfaceRadius,
+    rx,
+    ry,
+    rz,
+    _sT[0]!,
+    _sT[1]!,
+    _sT[2]!,
+    _sT[3]!,
+    recipe.height,
+    scale,
+    _sD,
+  );
+  const gx = -_sD[1]!;
+  const gy = -_sD[2]!;
+  const gz = -_sD[3]!;
+  const gl = 1 / Math.sqrt(gx * gx + gy * gy + gz * gz + 1e-30);
+  out[0] = surfaceRadius;
+  out[1] = gx * gl;
+  out[2] = gy * gl;
+  out[3] = gz * gl;
+  out[4] = rx;
+  out[5] = ry;
+  out[6] = rz;
+}
