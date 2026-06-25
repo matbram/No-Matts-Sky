@@ -45,6 +45,7 @@ interface Entry {
   ready: ChunkMesh | null;
   morph: number; // 0..1 geomorph-in progress (drives morphUniform)
   needsSkirt: boolean; // does any edge lack a same-LOD neighbour in the cut?
+  liveAtMs: number; // manager clock when this leaf went live (for ?lodmorphdebug age)
 }
 interface MeshResult {
   id: number;
@@ -88,7 +89,8 @@ export interface ManagerOpts {
   workers?: number; // pool size (default: min(6, cores-1))
   skirts?: boolean; // enable LOD-transition skirts (default OFF — the apron already covers
   // holes at LOD transitions, and the skirts were the visible boundary grid; ?skirt re-enables)
-  debugColor?: 'lod' | 'skirt'; // debug: tint leaves by LOD level, or highlight skirted leaves
+  debugColor?: 'lod' | 'skirt' | 'morph'; // debug tint: LOD level / skirted leaves / morph progress
+  debugLodMorph?: boolean; // ?lodmorphdebug: throttled [NMS morph] console line + balance metric
 }
 
 export interface StreamStats {
@@ -112,6 +114,13 @@ export class QuadtreeManager {
   private renderOrigin: [number, number, number] = [0, 0, 0];
   private avgMs = 0;
   private lastStatLog = ''; // throttles the per-cut diagnostic log
+  // ?lodmorphdebug state: a resume-safe clock (accumulated dtMs, no Date.now), upload
+  // counter per cut, log throttle, last-measured cut imbalance, and the HUD summary.
+  private clockMs = 0;
+  private uploadedThisCut = 0;
+  private lodMorphLogN = 0;
+  private maxNbrDelta = 0;
+  private morphSummary = '';
 
   constructor(
     private readonly scene: Scene,
@@ -147,6 +156,7 @@ export class QuadtreeManager {
    * mesh first.
    */
   update(camera: CameraView, lookahead: [number, number, number], splitPx?: number): void {
+    this.uploadedThisCut = 0; // count leaves streamed in for THIS cut (?lodmorphdebug)
     const cut = selectCut(camera, {
       radius: this.radius,
       heightMargin: this.heightMargin,
@@ -170,6 +180,7 @@ export class QuadtreeManager {
           ready: null,
           morph: 0,
           needsSkirt: true, // set below from the full cut, before dispatch
+          liveAtMs: 0,
         });
       }
     }
@@ -202,7 +213,13 @@ export class QuadtreeManager {
     // Verbose per-cut diagnostic (throttled to when the summary changes), so the
     // user's console shows the cut shape and how many leaves skirt — confirming the
     // state on their actual machine.
-    const summary = `leaves=${wanted.size} skirted=${skirted} interior=${wanted.size - skirted} skirtsOpt=${!!this.opts.skirts} lod=${JSON.stringify(lodHist)}`;
+    let summary = `leaves=${wanted.size} skirted=${skirted} interior=${wanted.size - skirted} skirtsOpt=${!!this.opts.skirts} lod=${JSON.stringify(lodHist)}`;
+    if (this.opts.debugLodMorph) {
+      // Cut imbalance: max LOD-level difference across any shared edge. >1 means a deep
+      // block abuts a much coarser leaf (a hard step) → CDLOD will need balanceCut.
+      this.maxNbrDelta = this.maxNeighborDelta();
+      summary += ` maxNbrΔ=${this.maxNbrDelta}`;
+    }
     if (summary !== this.lastStatLog) {
       this.lastStatLog = summary;
       console.log('[NMS] cut:', summary);
@@ -259,18 +276,50 @@ export class QuadtreeManager {
    */
   tick(dtMs: number): void {
     if (this.entries.size === 0) return;
+    this.clockMs += dtMs; // resume-safe clock (no Date.now) + the ?lodmorphdebug age base
     const step = dtMs / MORPH_MS;
+    const dbg = !!this.opts.debugLodMorph;
+    const tintMorph = this.opts.debugColor === 'morph';
     let anyCompleted = false;
+    let live = 0, mid = 0, sum = 0, mn = 1, mx = 0, newestLive = -1, slowestMidAge = 0;
     for (const e of this.entries.values()) {
-      if (e.status !== 'live' || e.morph >= 1 || !e.morphUniform) continue;
-      e.morph = Math.min(1, e.morph + step);
-      e.morphUniform.value = e.morph;
-      if (e.morph >= 1) {
-        if (e.mat) e.mat.polygonOffset = false; // settle depth once fully resolved
-        anyCompleted = true;
+      if (e.status !== 'live') continue;
+      live++;
+      if (e.morph < 1 && e.morphUniform) {
+        e.morph = Math.min(1, e.morph + step);
+        e.morphUniform.value = e.morph;
+        // ?morphcolor: red (just-appeared) → green (settled), so the pop is visible.
+        if (tintMorph && e.mat) (e.mat as unknown as { color: Color }).color.setHSL(0.33 * e.morph, 0.85, 0.5);
+        if (e.morph >= 1) {
+          if (e.mat) e.mat.polygonOffset = false; // settle depth once fully resolved
+          anyCompleted = true;
+        }
+      }
+      if (dbg) {
+        if (e.liveAtMs > newestLive) newestLive = e.liveAtMs;
+        if (e.morph < 1) {
+          mid++; sum += e.morph;
+          if (e.morph < mn) mn = e.morph;
+          if (e.morph > mx) mx = e.morph;
+          const age = this.clockMs - e.liveAtMs;
+          if (age > slowestMidAge) slowestMidAge = age;
+        }
       }
     }
     if (anyCompleted) this.purgeRetained();
+    if (dbg) {
+      const avg = mid > 0 ? sum / mid : 0;
+      const newestAge = newestLive >= 0 ? (this.clockMs - newestLive) | 0 : 0;
+      this.morphSummary = `morph mid=${mid} avg=${avg.toFixed(2)} new=${newestAge}ms maxNbrΔ=${this.maxNbrDelta}`;
+      if (++this.lodMorphLogN % 10 === 0) {
+        console.log(
+          `[NMS morph] live=${live} mid=${mid} morph[min=${mid ? mn.toFixed(2) : '-'} ` +
+            `avg=${avg.toFixed(2)} max=${mid ? mx.toFixed(2) : '-'}] ` +
+            `newest=${newestAge}ms slowestMid=${slowestMidAge | 0}ms ` +
+            `uploads/cut=${this.uploadedThisCut} maxNbrΔ=${this.maxNbrDelta}`,
+        );
+      }
+    }
   }
 
   /** Upload up to `budget` finished meshes to the GPU this frame; returns how many. */
@@ -294,6 +343,7 @@ export class QuadtreeManager {
       if (this.opts.debugColor) {
         const c = (mat as unknown as { color: Color }).color;
         if (this.opts.debugColor === 'lod') c.setHSL((e.node.path.length * 0.13) % 1, 0.75, 0.5);
+        else if (this.opts.debugColor === 'morph') c.setHSL(0, 0.85, 0.5); // red at morph 0 (tick recolors)
         else c.copy(e.needsSkirt ? new Color(1, 0.15, 0.15) : new Color(0.16, 0.16, 0.2));
       }
       const mu = uniform(0);
@@ -318,6 +368,8 @@ export class QuadtreeManager {
       e.ready = null;
       e.status = 'live';
       e.morph = 0;
+      e.liveAtMs = this.clockMs; // for ?lodmorphdebug age/staggering
+      this.uploadedThisCut++;
       this.scene.add(mesh);
       n++;
     }
@@ -385,6 +437,53 @@ export class QuadtreeManager {
       out.push(e.mesh);
     }
     return out;
+  }
+
+  /** HUD line for ?lodmorphdebug (mid-morph count, avg progress, newest age, imbalance). */
+  morphInfo(): string {
+    return this.morphSummary;
+  }
+
+  /**
+   * Max LOD-level difference across any shared edge of the WANTED cut (?lodmorphdebug).
+   * For each wanted leaf, step a quarter-cell past each of its 4 edge midpoints and find
+   * the wanted leaf covering that direction; the largest |depthΔ| is the worst step. 0/1
+   * = balanced; >1 means CDLOD needs a balanceCut to avoid a visible boundary. Debug-only
+   * (O(leaves²) containment scan, run only on a cut while the flag is on).
+   */
+  private maxNeighborDelta(): number {
+    let maxD = 0;
+    for (const key of this.wanted) {
+      const e = this.entries.get(key)!;
+      const r = uvRectFromPath(e.node.path);
+      const um = (r.u0 + r.u1) / 2, vm = (r.v0 + r.v1) / 2;
+      const hw = (r.u1 - r.u0) * 0.25, hh = (r.v1 - r.v0) * 0.25;
+      const depth = e.node.path.length;
+      const probes: [number, number][] = [
+        [r.u1 + hw, vm], [r.u0 - hw, vm], [um, r.v1 + hh], [um, r.v0 - hh],
+      ];
+      for (const [pu, pv] of probes) {
+        const d = faceDirection(e.node.face, pu, pv);
+        const nd = this.depthUnderWanted(d[0], d[1], d[2]);
+        if (nd >= 0) { const diff = Math.abs(depth - nd); if (diff > maxD) maxD = diff; }
+      }
+    }
+    return maxD;
+  }
+
+  /** Depth of the wanted leaf covering a world direction (the cut tiles the sphere), or -1. */
+  private depthUnderWanted(wx: number, wy: number, wz: number): number {
+    const { face, u, v } = this.faceUVOf(wx, wy, wz);
+    let best = -1;
+    for (const key of this.wanted) {
+      const e = this.entries.get(key)!;
+      if (e.node.face !== face) continue;
+      const r = uvRectFromPath(e.node.path);
+      if (u < r.u0 || u > r.u1 || v < r.v0 || v > r.v1) continue;
+      const d = e.node.path.length;
+      if (d > best) best = d;
+    }
+    return best;
   }
 
   stats(): StreamStats {

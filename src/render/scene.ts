@@ -117,6 +117,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // floor to the RENDERED mesh height under the player (downward raycast) + the leaf
   // depth/morph underfoot — so the user's console paste shows the clip mechanism.
   const clipDebug = params.has('clipdebug');
+  // ?lodmorphdebug: throttled [NMS morph] console line (geomorph staggering + cut imbalance).
+  // ?morphcolor: tint leaves red→green by geomorph progress so LOD pop-in is visible to screenshot.
+  const lodMorphDebug = params.has('lodmorphdebug');
+  const morphColor = params.has('morphcolor');
   const renderer = new WebGPURenderer({
     canvas,
     antialias: true,
@@ -149,6 +153,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     skirtcolor: params.has('skirtcolor'),
     skirt: params.has('skirt'), // skirts default OFF now; ?skirt re-enables for A/B
     clipdebug: clipDebug, // ?clipdebug: walk collision-vs-rendered-mesh logging
+    lodmorphdebug: lodMorphDebug, // ?lodmorphdebug: geomorph staggering/imbalance logging
+    morphcolor: morphColor, // ?morphcolor: tint leaves by geomorph progress (LOD pop-in visible)
     dark: params.has('dark'),
   });
 
@@ -199,8 +205,15 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     // reopen are to be fixed at the SOURCE (balanced cut + edge-locked morph), not hidden
     // behind a visible curtain. ?skirt re-enables the old conditioned skirts for A/B.
     skirts: params.has('skirt'),
-    // debug tint: 'lod' colors leaves by LOD level, 'skirt' highlights skirted leaves
-    debugColor: params.has('lodcolor') ? 'lod' : params.has('skirtcolor') ? 'skirt' : undefined,
+    // debug tint: 'morph' = geomorph progress (red→green), 'lod' = LOD level, 'skirt' = skirted leaves
+    debugColor: morphColor
+      ? 'morph'
+      : params.has('lodcolor')
+        ? 'lod'
+        : params.has('skirtcolor')
+          ? 'skirt'
+          : undefined,
+    debugLodMorph: lodMorphDebug,
   });
 
   // No-black backdrop: a single smooth sphere INSET below the deepest terrain
@@ -614,7 +627,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     },
     streamInfo(): string {
       const s = manager.stats();
-      const base = `leaves ${s.live}  queue ${s.pending + s.ready}  busy ${s.inflight}  ${s.msPerLeaf.toFixed(0)} ms/leaf`;
+      const morph = lodMorphDebug ? `\n${manager.morphInfo()}` : ''; // ?lodmorphdebug HUD line (all modes)
+      const base = `leaves ${s.live}  queue ${s.pending + s.ready}  busy ${s.inflight}  ${s.msPerLeaf.toFixed(0)} ms/leaf${morph}`;
       if (mode === 'walk' && player) {
         const dbg = clipDebug ? `  [${lastClip}]` : '';
         return `WALK  alt ${player.altitude().toFixed(1)} m  spd ${player.speed().toFixed(1)} m/s  (G: fly · click: look · 1/2/3: exit)${dbg}\n${base}`;
