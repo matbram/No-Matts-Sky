@@ -78,6 +78,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // for A/B; ?revz tries reversed-Z instead; ?webgl forces the WebGL2 backend (stable
   // in headless CI, where software WebGPU drops its device).
   const params = new URLSearchParams(typeof location !== 'undefined' ? location.search : '');
+  // Make the canvas keyboard-focusable so walk-mode WASD reaches the page even with
+  // DevTools open (pointer-lock routes the mouse to the page, but keyboard needs focus).
+  canvas.tabIndex = 0;
+  canvas.style.outline = 'none';
   const useLog = !params.has('nolog');
   const useRevz = params.has('revz');
   const useWebGL = params.has('webgl');
@@ -284,7 +288,17 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     player.getQuaternion(camera.quaternion);
     mode = 'walk';
     forceCut = true;
-    canvas.requestPointerLock?.();
+    canvas.focus(); // keyboard focus → WASD works immediately (no click needed)
+  }
+  // Request pointer lock, swallowing the promise rejection browsers throw if it's
+  // called too soon after an Esc-exit ("cannot be acquired immediately after exit").
+  function lockPointer(): void {
+    try {
+      const p = canvas.requestPointerLock?.() as unknown as Promise<void> | undefined;
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    } catch {
+      /* older browsers: requestPointerLock returns void / may throw — ignore */
+    }
   }
   function exitToPreset(p: Preset): void {
     if (mode === 'walk') {
@@ -308,7 +322,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       case 'Digit1': exitToPreset(presets.orbit!); break;
       case 'Digit2': exitToPreset(presets.mid!); break;
       case 'Digit3': exitToPreset(presets.surface!); break;
-      case 'Escape': if (mode === 'walk') exitToPreset(presets.orbit!); break;
+      // Esc is NOT handled: the browser auto-frees the mouse; we stay in walk mode
+      // (click to re-lock). Exit walk via 1/2/3.
     }
   };
   const onKeyUp = (e: KeyboardEvent): void => {
@@ -321,7 +336,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       case 'ShiftLeft': case 'ShiftRight': held.sprint = false; break;
     }
   };
-  const onClick = (): void => { if (mode === 'walk') canvas.requestPointerLock?.(); };
+  const onClick = (): void => {
+    if (mode === 'walk') {
+      canvas.focus();
+      lockPointer();
+    }
+  };
   const onMouseMove = (e: MouseEvent): void => {
     if (mode === 'walk' && player && document.pointerLockElement === canvas) {
       player.addMouse(e.movementX, e.movementY);
@@ -423,7 +443,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       const s = manager.stats();
       const base = `leaves ${s.live}  queue ${s.pending + s.ready}  busy ${s.inflight}  ${s.msPerLeaf.toFixed(0)} ms/leaf`;
       if (mode === 'walk' && player) {
-        return `WALK  alt ${player.altitude().toFixed(1)} m  spd ${player.speed().toFixed(1)} m/s  (Esc/1-2-3 exit)\n${base}`;
+        return `WALK  alt ${player.altitude().toFixed(1)} m  spd ${player.speed().toFixed(1)} m/s  (click: look · 1/2/3: exit)\n${base}`;
       }
       return `FLY  (F: walk)\n${base}`;
     },

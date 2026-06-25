@@ -101,8 +101,8 @@ export class PlayerController {
 
   /** Accumulate mouse-look (pointer-lock movementX/Y, pixels). */
   addMouse(dx: number, dy: number): void {
-    this.yaw -= dx * MOUSE_SENS;
-    this.pitch -= dy * MOUSE_SENS;
+    this.yaw += dx * MOUSE_SENS; // mouse-right turns right
+    this.pitch -= dy * MOUSE_SENS; // mouse-up looks up
     if (this.pitch > PITCH_LIMIT) this.pitch = PITCH_LIMIT;
     else if (this.pitch < -PITCH_LIMIT) this.pitch = -PITCH_LIMIT;
     if (this.yaw > Math.PI) this.yaw -= 2 * Math.PI;
