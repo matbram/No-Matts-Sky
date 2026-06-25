@@ -23,6 +23,7 @@ import {
   HemisphereLight,
   Color,
   Vector3,
+  Raycaster,
   DoubleSide,
   ACESFilmicToneMapping,
 } from 'three';
@@ -68,6 +69,9 @@ const RECUT_ROT_COS = Math.cos((20 * Math.PI) / 180);
 // nearest ground is still meshed to MAX_DEPTH (it projects far over this), only the
 // mid-distance transition bands coarsen. Fly/orbit keep the manager's 300. [T] dial.
 const WALK_SPLIT_PX = 420;
+// Creative-flight split threshold (px) — coarser than walk: you fly fast and usually at
+// altitude, so a leaner cut keeps the leaf count/budget sane while still detailed near you.
+const CREATIVE_SPLIT_PX = 520;
 
 // Finished meshes uploaded to the GPU per frame (slice spec §7 — the only
 // generation cost allowed in the frame). The rest queue and drain over frames.
@@ -109,6 +113,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const useLog = !params.has('nolog');
   const useRevz = params.has('revz');
   const useWebGL = params.has('webgl');
+  // ?clipdebug: per-walk-frame console line (throttled) comparing the analytic collision
+  // floor to the RENDERED mesh height under the player (downward raycast) + the leaf
+  // depth/morph underfoot — so the user's console paste shows the clip mechanism.
+  const clipDebug = params.has('clipdebug');
   const renderer = new WebGPURenderer({
     canvas,
     antialias: true,
@@ -140,6 +148,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     lodcolor: params.has('lodcolor'),
     skirtcolor: params.has('skirtcolor'),
     skirt: params.has('skirt'), // skirts default OFF now; ?skirt re-enables for A/B
+    clipdebug: clipDebug, // ?clipdebug: walk collision-vs-rendered-mesh logging
     dark: params.has('dark'),
   });
 
@@ -297,10 +306,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const vel = new Vector3();
   const lookahead = new Vector3();
 
-  // ── Walking (Step 4): floating-origin + body-fixed player ────────────────────
-  let mode: 'fly' | 'walk' = 'fly';
+  // ── Walking (Step 4) + creative flight: floating-origin + body-fixed player ──
+  let mode: 'fly' | 'walk' | 'creative' = 'fly';
   let player: PlayerController | null = null;
-  const held: WalkInput = { forward: false, back: false, left: false, right: false, jump: false, sprint: false };
+  const held: WalkInput = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, down: false };
   // Re-center the floating origin on the player past this drift, so GPU floats stay
   // ~0.06 mm-precise near the player (512·2⁻²³) → no jitter, while big planet-scale
   // doubles are differenced in JS and never reach the GPU (CLAUDE.md §4).
@@ -308,11 +317,22 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const _spawn = new Vector3();
   const _surf7 = new Float64Array(7);
   const playerWorld = new Vector3();
+  // ?clipdebug scratch (debug-only): a downward raycast measures the RENDERED mesh height
+  // under the player so the console can compare it to the analytic collision floor.
+  const _ray = new Raycaster();
+  const _rayUp = new Vector3();
+  const _rayOrigin = new Vector3();
+  const _rayDir = new Vector3();
+  const _hitWorld = new Vector3();
+  const _clip = new Float64Array(11);
+  let clipLogN = 0;
+  let lastClip = ''; // last clip-debug summary, mirrored to the HUD
 
   function enterWalk(): void {
     surfaceAt(recipe, R, SURFACE_DIR.x, SURFACE_DIR.y, SURFACE_DIR.z, _surf7, groundOct);
     _spawn.copy(SURFACE_DIR).multiplyScalar(_surf7[0]! + 1.7); // body-fixed spawn at eye height
     player = player ?? new PlayerController(recipe, R, groundOct);
+    player.setFly(false); // walk: gravity + ground collision (reset() snaps to ground)
     player.reset(_spawn, 0, 0);
     controls.enabled = false;
     renderOrigin.copy(_spawn);
@@ -326,6 +346,25 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     firstFillDone = false; // burst-fill the spawn area, then settle to UPLOAD_PER_FRAME
     canvas.focus(); // keyboard focus → WASD works immediately (no click needed)
   }
+  // Creative free-fly: spawn where the camera is now, no gravity/collision. Reuses the
+  // PlayerController (setFly) so the sphere-stable look basis + floating origin are shared.
+  function enterCreative(): void {
+    _spawn.copy(camera.position).add(renderOrigin); // current camera world position
+    player = player ?? new PlayerController(recipe, R, groundOct);
+    player.setFly(true);
+    player.reset(_spawn, 0, 0);
+    controls.enabled = false;
+    renderOrigin.copy(_spawn);
+    targetWorld.copy(_spawn);
+    manager.setRenderOrigin([renderOrigin.x, renderOrigin.y, renderOrigin.z]);
+    backdrop.position.set(-renderOrigin.x, -renderOrigin.y, -renderOrigin.z);
+    camera.position.set(0, 0, 0);
+    player.getQuaternion(camera.quaternion);
+    mode = 'creative';
+    forceCut = true;
+    firstFillDone = false;
+    canvas.focus();
+  }
   // Request pointer lock, swallowing the promise rejection browsers throw if it's
   // called too soon after an Esc-exit ("cannot be acquired immediately after exit").
   function lockPointer(): void {
@@ -337,10 +376,11 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     }
   }
   function exitToPreset(p: Preset): void {
-    if (mode === 'walk') {
+    if (mode === 'walk' || mode === 'creative') {
       mode = 'fly';
       controls.enabled = true;
-      held.forward = held.back = held.left = held.right = held.jump = held.sprint = false;
+      player?.setFly(false);
+      held.forward = held.back = held.left = held.right = held.jump = held.sprint = held.down = false;
       document.exitPointerLock?.();
     }
     applyPreset(p);
@@ -354,7 +394,11 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       case 'KeyD': held.right = true; break;
       case 'Space': held.jump = true; break;
       case 'ShiftLeft': case 'ShiftRight': held.sprint = true; break;
-      case 'KeyF': if (mode === 'fly') enterWalk(); break;
+      case 'ControlLeft': case 'ControlRight': held.down = true; break; // creative: descend
+      case 'KeyF': if (mode !== 'walk') enterWalk(); break;
+      case 'KeyG': if (mode !== 'creative') enterCreative(); else exitToPreset(presets.orbit!); break;
+      case 'BracketRight': player?.cycleSpeed(1); break; // creative: faster
+      case 'BracketLeft': player?.cycleSpeed(-1); break; // creative: slower
       case 'Digit1': exitToPreset(presets.orbit!); break;
       case 'Digit2': exitToPreset(presets.mid!); break;
       case 'Digit3': exitToPreset(presets.surface!); break;
@@ -370,16 +414,17 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       case 'KeyD': held.right = false; break;
       case 'Space': held.jump = false; break;
       case 'ShiftLeft': case 'ShiftRight': held.sprint = false; break;
+      case 'ControlLeft': case 'ControlRight': held.down = false; break;
     }
   };
   const onClick = (): void => {
-    if (mode === 'walk') {
+    if (mode === 'walk' || mode === 'creative') {
       canvas.focus();
       lockPointer();
     }
   };
   const onMouseMove = (e: MouseEvent): void => {
-    if (mode === 'walk' && player && document.pointerLockElement === canvas) {
+    if ((mode === 'walk' || mode === 'creative') && player && document.pointerLockElement === canvas) {
       player.addMouse(e.movementX, e.movementY);
     }
   };
@@ -394,8 +439,9 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
 
   // Headless/debug hook: live player state for the walk verification harness.
   (window as unknown as { __nms_player?: () => unknown }).__nms_player = () =>
-    mode === 'walk' && player
-      ? { alt: player.altitude(), spd: player.speed(), grounded: player.isGrounded(),
+    (mode === 'walk' || mode === 'creative') && player
+      ? { mode, fly: player.isFlying(), alt: player.altitude(), spd: player.speed(),
+          grounded: player.isGrounded(),
           x: playerWorld.x, y: playerWorld.y, z: playerWorld.z, near: camera.near }
       : null;
 
@@ -406,10 +452,11 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       const dt = now - lastFrame;
       lastFrame = now;
 
-      if (mode === 'walk' && player) {
-        // Drive the camera from the player's body-fixed position; keep the floating
-        // origin near the player so GPU floats stay tiny (no jitter).
-        player.update(dt / 1000, held);
+      if ((mode === 'walk' || mode === 'creative') && player) {
+        // Drive the camera from the player's body-fixed position (walk = gravity+collision,
+        // creative = free-fly); keep the floating origin near it so GPU floats stay tiny.
+        if (mode === 'creative') player.updateFly(dt / 1000, held);
+        else player.update(dt / 1000, held);
         player.getWorldPos(playerWorld);
         camera.position.copy(playerWorld).sub(renderOrigin);
         if (camera.position.lengthSq() > RECENTER_THRESHOLD * RECENTER_THRESHOLD) {
@@ -452,21 +499,23 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // the forward cone needs to swing to follow it. Translation alone would leave
       // tiles behind you live and tiles ahead unmeshed after a turn.
       const moved = worldCam.distanceTo(lastCutPos);
-      const recutDist = mode === 'walk' ? 8 : Math.max(50, distToTarget * 0.02);
+      const ctrlMode = (mode === 'walk' || mode === 'creative') && player;
+      const recutDist =
+        mode === 'walk' ? 8 : mode === 'creative' ? 64 : Math.max(50, distToTarget * 0.02);
       let turned = false;
-      if (mode === 'walk' && player) {
-        player.getForward(forward); // look direction (Step 4: render space == world)
+      if (ctrlMode) {
+        player!.getForward(forward); // look direction (render space == world)
         turned = forward.dot(lastCutForward) < RECUT_ROT_COS;
       }
       if (forceCut || moved > recutDist || turned) {
         let halfFov: number;
         let splitPxOverride: number | undefined;
-        if (mode === 'walk' && player) {
-          // `forward` already set above. Use a forward cone (NOT the full hemisphere)
-          // so the finer MAX_DEPTH near-field doesn't blow up the leaf count; the
-          // recut-on-rotation above keeps it pointed where you look.
+        if (ctrlMode) {
+          // `forward` already set above. Forward cone (NOT the full hemisphere) so the
+          // near-field doesn't blow up the leaf count; recut-on-rotation keeps it pointed
+          // where you look. Creative flies fast/high → coarser cut (CREATIVE_SPLIT_PX).
           halfFov = Math.atan(Math.tan(fovY / 2) * Math.sqrt(1 + aspect * aspect)) * WALK_CONE_MARGIN;
-          splitPxOverride = WALK_SPLIT_PX; // leaner cut at the finer walk MAX_DEPTH
+          splitPxOverride = mode === 'creative' ? CREATIVE_SPLIT_PX : WALK_SPLIT_PX;
           lastCutForward.copy(forward);
         } else {
           forward.copy(targetWorld).sub(worldCam).normalize(); // orbit controls always look at target
@@ -499,15 +548,54 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
         if (s.live > 0 && s.pending === 0 && s.inflight === 0 && s.ready === 0) firstFillDone = true;
       }
       manager.tick(dt); // advance LOD geomorphs
+
+      // ?clipdebug (throttled): compare the analytic collision floor to the RENDERED mesh
+      // height under the player (downward raycast against live leaf meshes) + log the leaf
+      // depth/morph underfoot. The raycast reads the static `position` attribute (TSL morph
+      // not applied), so eye-mesh<0 ⇒ eye below even the settled/retained geometry = a hard
+      // clip; the surfΔ octave spread + leaf morph reveal the transient case the floor misses.
+      if (clipDebug && mode === 'walk' && player && ++clipLogN % 20 === 0) {
+        player.debugSample(_clip);
+        const eyeR = _clip[0]!;
+        const surf1 = _clip[1]!; // analytic surface at the collision octave count
+        _rayUp.copy(playerWorld).normalize();
+        _rayOrigin.copy(camera.position).addScaledVector(_rayUp, 10); // 10 m above the eye
+        _rayDir.copy(_rayUp).multiplyScalar(-1);
+        _ray.set(_rayOrigin, _rayDir);
+        const hits = _ray.intersectObjects(manager.terrainMeshes(), false);
+        let meshStr = 'none';
+        let eyeMeshStr = 'none';
+        if (hits.length > 0) {
+          _hitWorld.copy(hits[0]!.point).add(renderOrigin);
+          const hitR = _hitWorld.length();
+          meshStr = (hitR - surf1).toFixed(2);
+          eyeMeshStr = (eyeR - hitR).toFixed(2);
+        }
+        const leaf = manager.leafInfoUnder(playerWorld.x, playerWorld.y, playerWorld.z);
+        const leafStr = leaf ? `d${leaf.depth} morph${leaf.morph.toFixed(2)}` : 'none';
+        lastClip = `eye-mesh ${eyeMeshStr}m ${leafStr}`;
+        console.log(
+          `[NMS clip] spd=${player.speed().toFixed(1)} eyeAlt=${(eyeR - surf1).toFixed(2)} grnd=${_clip[8]} | ` +
+            `surfΔ o14=${(_clip[2]! - surf1).toFixed(2)} o12=${(_clip[3]! - surf1).toFixed(2)} ` +
+            `o10=${(_clip[4]! - surf1).toFixed(2)} o4=${(_clip[5]! - surf1).toFixed(2)} | ` +
+            `fpMax=${(_clip[6]! - surf1).toFixed(2)} floorAlt=${(_clip[7]! - surf1).toFixed(2)} | ` +
+            `meshHit=${meshStr} eye-mesh=${eyeMeshStr} | leaf ${leafStr}`,
+        );
+      }
+
       renderer.render(scene, camera);
     },
     streamInfo(): string {
       const s = manager.stats();
       const base = `leaves ${s.live}  queue ${s.pending + s.ready}  busy ${s.inflight}  ${s.msPerLeaf.toFixed(0)} ms/leaf`;
       if (mode === 'walk' && player) {
-        return `WALK  alt ${player.altitude().toFixed(1)} m  spd ${player.speed().toFixed(1)} m/s  (click: look · 1/2/3: exit)\n${base}`;
+        const dbg = clipDebug ? `  [${lastClip}]` : '';
+        return `WALK  alt ${player.altitude().toFixed(1)} m  spd ${player.speed().toFixed(1)} m/s  (G: fly · click: look · 1/2/3: exit)${dbg}\n${base}`;
       }
-      return `FLY  (F: walk)\n${base}`;
+      if (mode === 'creative' && player) {
+        return `CREATIVE  alt ${player.altitude().toFixed(0)} m  spd ${player.flySpeed()} m/s  (WASD+Space/Ctrl · Shift boost · [ ]: speed · F walk · 1/2/3 exit)\n${base}`;
+      }
+      return `FLY  (F: walk · G: creative fly)\n${base}`;
     },
     resize(width: number, height: number): void {
       vpHeight = height;

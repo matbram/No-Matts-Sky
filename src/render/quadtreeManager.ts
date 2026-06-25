@@ -24,7 +24,7 @@ import {
   type QuadNode,
 } from '../core/quadtree.ts';
 import { chunkKey, uvRectFromPath, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
-import { faceDirection } from '../core/cubesphere.ts';
+import { faceDirection, CUBE_FACES } from '../core/cubesphere.ts';
 import { lodOctaves, type TerrainRecipe } from '../core/density.ts';
 
 /** A TSL uniform node carrying a single float (the per-leaf morph factor). */
@@ -322,6 +322,44 @@ export class QuadtreeManager {
       n++;
     }
     return n; // purge happens in tick() when morphs complete, and in update()
+  }
+
+  /** Live leaf meshes (for the ?clipdebug downward raycast). Debug-only. */
+  terrainMeshes(): Mesh[] {
+    const out: Mesh[] = [];
+    for (const e of this.entries.values()) if (e.status === 'live' && e.mesh) out.push(e.mesh);
+    return out;
+  }
+
+  /**
+   * The deepest LIVE leaf whose face-(u,v) rect contains the world direction (wx,wy,wz),
+   * with its quadtree depth + geomorph value — for ?clipdebug, to see whether the mesh
+   * underfoot reached MAX_DEPTH and whether it's mid-morph. Debug-only (linear scan).
+   * Direction→(u,v): face = argmax(dir·normal); cube = dir/(dir·normal); u=cube·uDir, v=cube·vDir.
+   */
+  leafInfoUnder(wx: number, wy: number, wz: number): { depth: number; morph: number } | null {
+    const inv = 1 / Math.sqrt(wx * wx + wy * wy + wz * wz);
+    const dx = wx * inv, dy = wy * inv, dz = wz * inv;
+    let face = 0, best = -Infinity;
+    for (let f = 0; f < CUBE_FACES.length; f++) {
+      const n = CUBE_FACES[f]!.normal;
+      const d = dx * n[0] + dy * n[1] + dz * n[2];
+      if (d > best) { best = d; face = f; }
+    }
+    const fb = CUBE_FACES[face]!;
+    const nc = dx * fb.normal[0] + dy * fb.normal[1] + dz * fb.normal[2];
+    const cx = dx / nc, cy = dy / nc, cz = dz / nc;
+    const u = cx * fb.uDir[0] + cy * fb.uDir[1] + cz * fb.uDir[2];
+    const v = cx * fb.vDir[0] + cy * fb.vDir[1] + cz * fb.vDir[2];
+    let result: { depth: number; morph: number } | null = null;
+    for (const e of this.entries.values()) {
+      if (e.status !== 'live' || e.node.face !== face) continue;
+      const r = uvRectFromPath(e.node.path);
+      if (u < r.u0 || u > r.u1 || v < r.v0 || v > r.v1) continue;
+      const depth = e.node.path.length;
+      if (!result || depth > result.depth) result = { depth, morph: e.morph };
+    }
+    return result;
   }
 
   stats(): StreamStats {

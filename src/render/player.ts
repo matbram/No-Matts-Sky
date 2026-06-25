@@ -26,8 +26,9 @@ export interface WalkInput {
   back: boolean;
   left: boolean;
   right: boolean;
-  jump: boolean;
-  sprint: boolean;
+  jump: boolean; // walk: jump · fly: ascend (Space)
+  sprint: boolean; // walk: run · fly: boost (Shift)
+  down: boolean; // fly: descend (Ctrl); ignored in walk
 }
 
 const NO_INPUT: WalkInput = {
@@ -37,6 +38,7 @@ const NO_INPUT: WalkInput = {
   right: false,
   jump: false,
   sprint: false,
+  down: false,
 };
 
 // Tunables [T].
@@ -55,6 +57,15 @@ const MAX_DT = 0.05; // clamp dt (s) so an alt-tab hitch can't fling/tunnel
 // into instead of the single radial probe punching the camera through the uphill face.
 const BODY_R = 0.4; // m — footprint half-width (player body radius)
 const STEP_AHEAD = 0.5; // m — forward look-ahead probe along the move direction
+
+// Creative-flight [T]: free-fly, no gravity/collision. A speed LADDER (m/s) cycled by
+// keys so flight scales from terrain detail up to crossing the planet; Shift boosts.
+const FLY_SPEEDS = [30, 100, 500, 2000, 10_000] as const;
+const FLY_SPEED_DEFAULT = 1; // index into FLY_SPEEDS (→ 100 m/s)
+const FLY_BOOST = 4; // Shift multiplier in fly
+// Octave counts the clip-debug probe samples alongside the collision count, to
+// quantify how far the surface moves per LOD level (the geomorph/streaming transient).
+const DEBUG_OCTAVES = [14, 12, 10, 4] as const;
 
 /** Spin angle of the planet at the current time. Step 4: identity. Step 5 seam. */
 function spinAngle(): number {
@@ -92,6 +103,9 @@ export class PlayerController {
   private _centerSurfR = 0; // surface radius directly under the eye (for altitude())
   private _fpMaxR = 0; // max surface radius over the footprint (the collision floor)
   private _minGap = Infinity; // min radial eye→surface gap over the footprint (near clamp)
+  private flyMode = false; // creative free-fly (no gravity/collision)
+  private flySpeedIdx = FLY_SPEED_DEFAULT; // index into FLY_SPEEDS
+  private readonly _dbg = new Float64Array(7); // clip-debug probe scratch (debug-only)
 
   constructor(
     private readonly recipe: TerrainRecipe,
@@ -112,7 +126,21 @@ export class PlayerController {
     this.radialVel = 0;
     this.grounded = true;
     this.speedEst = 0;
-    this.update(0, NO_INPUT); // populate _surf + camera quaternion, snap to ground
+    // Populate _surf/_centerSurfR + camera quaternion. Walk snaps to ground; fly stays put.
+    if (this.flyMode) this.updateFly(0, NO_INPUT);
+    else this.update(0, NO_INPUT);
+  }
+
+  /** Enter/leave creative free-fly (no gravity, no terrain collision). */
+  setFly(on: boolean): void {
+    this.flyMode = on;
+  }
+  /** Cycle the fly speed ladder (dir +1/−1). No-op while walking. */
+  cycleSpeed(dir: number): void {
+    this.flySpeedIdx = Math.max(0, Math.min(FLY_SPEEDS.length - 1, this.flySpeedIdx + Math.sign(dir)));
+  }
+  isFlying(): boolean {
+    return this.flyMode;
   }
 
   /** Accumulate mouse-look (pointer-lock movementX/Y, pixels). */
@@ -221,9 +249,18 @@ export class PlayerController {
     // 7. Write the radius back along up.
     this.worldPos.copy(this._up).multiplyScalar(newR);
 
-    // 8. Camera orientation at the final position. Rebuild the basis (up moved), add
-    //    pitch to the heading, then an EXPLICIT basis → quaternion. Not camera.lookAt
-    //    (it recomputes its own up and reintroduces roll); xAxis ⟂ up pins the horizon.
+    // 8. Camera orientation at the final position.
+    this.orient();
+    void spinAngle(); // Step 5 seam (identity now) — keep referenced for clarity.
+  }
+
+  /**
+   * Rebuild the basis at the current position and set _look + the camera quaternion
+   * from yaw/pitch. An EXPLICIT basis → quaternion (NOT camera.lookAt, which recomputes
+   * its own up and reintroduces roll); xAxis ⟂ up pins the horizon level. Shared by
+   * the walk and fly update paths.
+   */
+  private orient(): void {
     this.basis();
     this._look
       .copy(this._fwd)
@@ -235,8 +272,49 @@ export class PlayerController {
     this._yAxis.crossVectors(this._zAxis, this._xAxis).normalize();
     this._m.makeBasis(this._xAxis, this._yAxis, this._zAxis);
     this._quat.setFromRotationMatrix(this._m);
+  }
 
-    void spinAngle(); // Step 5 seam (identity now) — keep referenced for clarity.
+  /**
+   * Creative free-fly update: move in the LOOK direction (W/S) + right (A/D) + radial
+   * (Space up, Ctrl down), at the current speed ladder × Shift boost. NO gravity, NO
+   * surfaceAt floor, NO collision — you pass through terrain (that's the point). We
+   * still sample the surface once for the altitude() HUD readout. Zero per-frame alloc.
+   */
+  updateFly(dtRaw: number, input: WalkInput): void {
+    const dt = Math.min(Math.max(dtRaw, 0), MAX_DT);
+    this.basis();
+    // Look direction (yaw heading tilted by pitch) — fly moves along the full 3-D look.
+    this._look
+      .copy(this._fwd)
+      .multiplyScalar(Math.cos(this.pitch))
+      .addScaledVector(this._up, Math.sin(this.pitch))
+      .normalize();
+    const speed = FLY_SPEEDS[this.flySpeedIdx]! * (input.sprint ? FLY_BOOST : 1);
+    this._move.set(0, 0, 0);
+    if (input.forward) this._move.add(this._look);
+    if (input.back) this._move.sub(this._look);
+    if (input.right) this._move.add(this._right);
+    if (input.left) this._move.sub(this._right);
+    if (input.jump) this._move.add(this._up); // ascend
+    if (input.down) this._move.sub(this._up); // descend
+    if (this._move.lengthSq() > 0) {
+      this._move.normalize().multiplyScalar(speed * dt);
+      this.worldPos.add(this._move);
+      this.speedEst = speed;
+    } else {
+      this.speedEst = 0;
+    }
+    this.radialVel = 0; // no gravity in fly; reset so re-entering walk doesn't inherit a fall
+    this.grounded = false;
+    // Surface under the eye, for the altitude() HUD only (does not affect movement).
+    surfaceAt(
+      this.recipe, this.planetRadius,
+      this.worldPos.x, this.worldPos.y, this.worldPos.z,
+      this._surf, this.groundOctaves,
+    );
+    this._centerSurfR = this._surf[0]!;
+    this.orient();
+    void spinAngle(); // Step 5 seam (identity now)
   }
 
   /**
@@ -294,5 +372,31 @@ export class PlayerController {
   /** Smallest radial eye→surface gap across the footprint this frame, meters. */
   nearestSurfaceGap(): number {
     return this._minGap;
+  }
+  /** Current fly speed (m/s), before Shift boost — for the HUD. */
+  flySpeed(): number {
+    return FLY_SPEEDS[this.flySpeedIdx]!;
+  }
+  /**
+   * Clip-debug snapshot for the `?clipdebug` console line (debug path only). Writes,
+   * into `out` (length ≥ 11):
+   *   0 eyeR · 1 surfR@collisionOct · 2..5 surfR@[14,12,10,4] · 6 fpMaxR ·
+   *   7 groundR(=fpMax+EYE) · 8 grounded · 9 radialVel · 10 minGap
+   * The 2..5 spread vs. 1 quantifies how far the surface moves per LOD level (the
+   * geomorph/streaming transient the collision floor doesn't track). Uses _dbg scratch.
+   */
+  debugSample(out: Float64Array): void {
+    const x = this.worldPos.x, y = this.worldPos.y, z = this.worldPos.z;
+    out[0] = Math.sqrt(x * x + y * y + z * z);
+    out[1] = this._centerSurfR;
+    for (let i = 0; i < DEBUG_OCTAVES.length; i++) {
+      surfaceAt(this.recipe, this.planetRadius, x, y, z, this._dbg, DEBUG_OCTAVES[i]!);
+      out[2 + i] = this._dbg[0]!;
+    }
+    out[6] = this._fpMaxR;
+    out[7] = this._fpMaxR + EYE;
+    out[8] = this.grounded ? 1 : 0;
+    out[9] = this.radialVel;
+    out[10] = this._minGap;
   }
 }
