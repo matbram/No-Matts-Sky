@@ -35,6 +35,10 @@ import { sliceFacts } from '../core/facts.ts';
 import { childSeed, SALT } from '../core/seedchain.ts';
 import { QuadtreeManager } from './quadtreeManager.ts';
 
+// Injected by Vite at build time (git short hash + build time) — logged at startup
+// so we can tell a stale deploy from the latest fix during remote diagnosis.
+declare const __BUILD_ID__: string;
+
 export interface SliceScene {
   readonly renderer: WebGPURenderer;
   render(): void;
@@ -73,18 +77,42 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // for A/B; ?revz tries reversed-Z instead; ?webgl forces the WebGL2 backend (stable
   // in headless CI, where software WebGPU drops its device).
   const params = new URLSearchParams(typeof location !== 'undefined' ? location.search : '');
+  const useLog = !params.has('nolog');
+  const useRevz = params.has('revz');
+  const useWebGL = params.has('webgl');
   const renderer = new WebGPURenderer({
     canvas,
     antialias: true,
-    forceWebGL: params.has('webgl'),
-    logarithmicDepthBuffer: !params.has('nolog'),
-    reversedDepthBuffer: params.has('revz'),
+    forceWebGL: useWebGL,
+    logarithmicDepthBuffer: useLog,
+    reversedDepthBuffer: useRevz,
   });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.toneMapping = ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
   // CRITICAL (CLAUDE.md §2): WebGPURenderer init is async — await before render.
   await renderer.init();
+
+  // ── Verbose diagnostic logging (browser console) ───────────────────────────
+  // Tells us, on the USER's machine: which build is live (stale-deploy check), the
+  // ACTUAL graphics backend (real WebGPU vs WebGL2 fallback), and the depth mode.
+  const be = (renderer as unknown as {
+    backend?: { constructor?: { name?: string }; isWebGPUBackend?: boolean };
+  }).backend;
+  console.log(
+    `%c[NMS] build ${__BUILD_ID__}`,
+    'color:#7cfc8a;font-weight:bold',
+  );
+  console.log('[NMS] renderer backend:', be?.constructor?.name, '| isWebGPUBackend:', be?.isWebGPUBackend);
+  console.log('[NMS] depth:', { logarithmicDepthBuffer: useLog, reversedDepthBuffer: useRevz, forceWebGL: useWebGL });
+  console.log('[NMS] debug toggles:', {
+    noback: params.has('noback'),
+    wire: params.has('wire'),
+    lodcolor: params.has('lodcolor'),
+    skirtcolor: params.has('skirtcolor'),
+    noskirt: params.has('noskirt'),
+    dark: params.has('dark'),
+  });
 
   const R = EARTH_RADIUS_M;
 
@@ -118,12 +146,15 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     metalness: 0.0,
     side: DoubleSide,
   });
+  material.wireframe = params.has('wire'); // debug: see the tessellation / where lines fall
   // splitPx 300 (smaller, gentler LOD steps — affordable after the ~13× meshing
   // speedup); maxDepth 10 caps leaf counts.
   const manager = new QuadtreeManager(scene, material, recipe, R, {
     splitPx: 300,
     maxDepth: 10,
     noskirt: params.has('noskirt'), // debug: A/B the dark-side boundary lines
+    // debug tint: 'lod' colors leaves by LOD level, 'skirt' highlights skirted leaves
+    debugColor: params.has('lodcolor') ? 'lod' : params.has('skirtcolor') ? 'skirt' : undefined,
   });
 
   // No-black backdrop: a single smooth sphere INSET below the deepest terrain
@@ -146,6 +177,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     side: DoubleSide,
   });
   const backdrop = new Mesh(backdropGeo, backdropMaterial);
+  backdrop.visible = !params.has('noback'); // debug: hide → do the lines become black gaps?
   scene.add(backdrop);
 
   // ── Camera presets (the gate's "static camera positions") ──────────────────

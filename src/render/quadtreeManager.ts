@@ -14,7 +14,7 @@
 // altitude (full per-frame floating origin is Step 4).
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { Scene, Mesh, BufferGeometry, BufferAttribute, type Material } from 'three';
+import { Scene, Mesh, BufferGeometry, BufferAttribute, Color, type Material } from 'three';
 import { uniform, mix, attribute, positionLocal } from 'three/tsl';
 import {
   selectCut,
@@ -77,6 +77,7 @@ export interface ManagerOpts {
   maxDepth: number;
   workers?: number; // pool size (default: min(6, cores-1))
   noskirt?: boolean; // debug: disable skirts (A/B the dark-side boundary lines)
+  debugColor?: 'lod' | 'skirt'; // debug: tint leaves by LOD level, or highlight skirted leaves
 }
 
 export interface StreamStats {
@@ -99,6 +100,7 @@ export class QuadtreeManager {
   private nextId = 1;
   private renderOrigin: [number, number, number] = [0, 0, 0];
   private avgMs = 0;
+  private lastStatLog = ''; // throttles the per-cut diagnostic log
 
   constructor(
     private readonly scene: Scene,
@@ -175,9 +177,22 @@ export class QuadtreeManager {
       const e = this.entries.get(key)!;
       for (const ek of edgeKeys(e.node)) edgeCount.set(ek, (edgeCount.get(ek) ?? 0) + 1);
     }
+    let skirted = 0;
+    const lodHist: Record<number, number> = {};
     for (const key of wanted) {
       const e = this.entries.get(key)!;
       e.needsSkirt = edgeKeys(e.node).some((ek) => (edgeCount.get(ek) ?? 0) < 2);
+      if (e.needsSkirt) skirted++;
+      const lod = e.node.path.length;
+      lodHist[lod] = (lodHist[lod] ?? 0) + 1;
+    }
+    // Verbose per-cut diagnostic (throttled to when the summary changes), so the
+    // user's console shows whether skirt-conditioning is live and how many leaves
+    // still skirt — confirming the fix on their actual machine.
+    const summary = `leaves=${wanted.size} skirted=${skirted} interior=${wanted.size - skirted} lod=${JSON.stringify(lodHist)}`;
+    if (summary !== this.lastStatLog) {
+      this.lastStatLog = summary;
+      console.log('[NMS] cut:', summary);
     }
     // Unwanted NON-LIVE entries are cancelled now (no point finishing work we no
     // longer want). Unwanted LIVE leaves are RETAINED — kept rendered until their
@@ -263,6 +278,11 @@ export class QuadtreeManager {
       // opaque surface. Biased toward the camera so it wins the depth test over the
       // retained leaf it's morphing in over (tick() settles the bias once done).
       const mat = this.material.clone();
+      if (this.opts.debugColor) {
+        const c = (mat as unknown as { color: Color }).color;
+        if (this.opts.debugColor === 'lod') c.setHSL((e.node.path.length * 0.13) % 1, 0.75, 0.5);
+        else c.copy(e.needsSkirt ? new Color(1, 0.15, 0.15) : new Color(0.16, 0.16, 0.2));
+      }
       const mu = uniform(0);
       (mat as unknown as NodeMaterialLike).positionNode = mix(
         attribute('morphTarget', 'vec3'),
