@@ -273,10 +273,13 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const _spawn = new Vector3();
   const _surf7 = new Float64Array(7);
   const playerWorld = new Vector3();
+  const _walkPrev = new Vector3(); // previous-frame player pos (for the movement log)
+  let _walkLogMs = 0; // throttle accumulator for the walk-movement log
 
   function enterWalk(): void {
     surfaceAt(recipe, R, SURFACE_DIR.x, SURFACE_DIR.y, SURFACE_DIR.z, _surf7);
     _spawn.copy(SURFACE_DIR).multiplyScalar(_surf7[0]! + 1.7); // body-fixed spawn at eye height
+    _walkPrev.copy(_spawn);
     player = player ?? new PlayerController(recipe, R);
     player.reset(_spawn, 0, 0);
     controls.enabled = false;
@@ -289,6 +292,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     mode = 'walk';
     forceCut = true;
     canvas.focus(); // keyboard focus → WASD works immediately (no click needed)
+    console.log(
+      '[NMS] enterWalk → active=',
+      (document.activeElement && (document.activeElement.id || document.activeElement.tagName)) ?? '?',
+    );
   }
   // Request pointer lock, swallowing the promise rejection browsers throw if it's
   // called too soon after an Esc-exit ("cannot be acquired immediately after exit").
@@ -311,6 +318,11 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   }
 
   const onKeyDown = (e: KeyboardEvent): void => {
+    console.log(
+      '[NMS key↓]', e.code, 'mode=', mode,
+      'active=', (document.activeElement && (document.activeElement.id || document.activeElement.tagName)) ?? '?',
+      'lock=', document.pointerLockElement === canvas,
+    );
     switch (e.code) {
       case 'KeyW': held.forward = true; break;
       case 'KeyS': held.back = true; break;
@@ -325,6 +337,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // Esc is NOT handled: the browser auto-frees the mouse; we stay in walk mode
       // (click to re-lock). Exit walk via 1/2/3.
     }
+    if (mode === 'walk') console.log('[NMS held]', JSON.stringify(held));
   };
   const onKeyUp = (e: KeyboardEvent): void => {
     switch (e.code) {
@@ -347,8 +360,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       player.addMouse(e.movementX, e.movementY);
     }
   };
-  window.addEventListener('keydown', onKeyDown);
-  window.addEventListener('keyup', onKeyUp);
+  // Capture phase: receive the event BEFORE any bubble-phase handler a browser
+  // extension may have installed (the "Gistant" content-script seen in the console
+  // is a prime suspect for swallowing keydowns). If a [NMS key↓] log STILL doesn't
+  // appear for W, the event is being blocked even earlier → escalate.
+  window.addEventListener('keydown', onKeyDown, { capture: true });
+  window.addEventListener('keyup', onKeyUp, { capture: true });
   canvas.addEventListener('click', onClick);
   window.addEventListener('mousemove', onMouseMove);
 
@@ -371,6 +388,19 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
         // origin near the player so GPU floats stay tiny (no jitter).
         player.update(dt / 1000, held);
         player.getWorldPos(playerWorld);
+        // Throttled movement log: distinguishes "held never set" vs "moving but
+        // invisible" vs "held set, not moving" while a move key is pressed.
+        _walkLogMs += dt;
+        if ((held.forward || held.back || held.left || held.right || held.jump) && _walkLogMs > 330) {
+          _walkLogMs = 0;
+          console.log(
+            '[NMS walk] held=', JSON.stringify(held),
+            'spd=', player.speed().toFixed(1),
+            'dmove=', playerWorld.distanceTo(_walkPrev).toFixed(3), 'm/frame',
+            'alt=', player.altitude().toFixed(2),
+          );
+        }
+        _walkPrev.copy(playerWorld);
         camera.position.copy(playerWorld).sub(renderOrigin);
         if (camera.position.lengthSq() > RECENTER_THRESHOLD * RECENTER_THRESHOLD) {
           renderOrigin.copy(playerWorld);
@@ -455,8 +485,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       renderer.setSize(width, height, false);
     },
     dispose(): void {
-      window.removeEventListener('keydown', onKeyDown);
-      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('keydown', onKeyDown, { capture: true });
+      window.removeEventListener('keyup', onKeyUp, { capture: true });
       window.removeEventListener('mousemove', onMouseMove);
       canvas.removeEventListener('click', onClick);
       manager.dispose();
