@@ -149,10 +149,13 @@ const _gn = new Float64Array(4);
  * the chain-rule frequency factor per octave. Octaves are decorrelated by a
  * deterministic per-octave seed offset.
  *
- * Optional `outLo` receives the normalized value using all but the FINEST octave
- * — the LOD geomorph target (a smoother, "parent-resolution" surface). It's
- * captured for free here (no extra noise evals) and is a pure function of
- * position, so neighbouring chunks agree on it exactly → no seams mid-morph.
+ * Optional `outLo` (length ≥ 4) receives the normalized VALUE AND GRADIENT using
+ * all but the FINEST octave — the LOD geomorph target (a smoother, "parent-
+ * resolution" surface, `[value, ∂/∂x, ∂/∂y, ∂/∂z]`). Both are captured for free
+ * here (no extra noise evals) and are pure functions of position, so neighbouring
+ * chunks agree on them exactly → no seams mid-morph. The gradient lets the mesher
+ * compute the morph-target's ANALYTIC normal (matching the base normal's source),
+ * so a fully-morphed leaf shades identically to its same-octave neighbour.
  * `out[0..3]` is bit-identical whether or not `outLo` is passed.
  */
 export function fbm3(
@@ -173,10 +176,10 @@ export function fbm3(
   let amp = 1;
   let freq = 1;
   let norm = 0;
-  let vLo = 0;
-  const loCount = octaves - 1; // value sum captured just before the finest octave
+  let vLo = 0, dxLo = 0, dyLo = 0, dzLo = 0; // value + gradient captured before the finest octave
+  const loCount = octaves - 1;
   for (let o = 0; o < octaves; o++) {
-    if (o === loCount) vLo = v;
+    if (o === loCount) { vLo = v; dxLo = dx; dyLo = dy; dzLo = dz; }
     const os = (seed + Math.imul(o, 0x9e3779b1)) >>> 0;
     gradNoise3(os, x * freq, y * freq, z * freq, _gn);
     v += amp * _gn[0]!;
@@ -192,7 +195,20 @@ export function fbm3(
   out[1] = dx * inv;
   out[2] = dy * inv;
   out[3] = dz * inv;
-  // Same normalization as out[0] → outLo is out[0] minus only the finest octave's
-  // contribution: a small, purely high-frequency displacement. Octaves<2: no-op.
-  if (outLo) outLo[0] = octaves > 1 ? vLo * inv : out[0];
+  // Same normalization as out → outLo is out minus only the finest octave's
+  // contribution: a small, purely high-frequency displacement (value AND gradient).
+  // Octaves<2: no finer octave to drop, so outLo == out.
+  if (outLo) {
+    if (octaves > 1) {
+      outLo[0] = vLo * inv;
+      outLo[1] = dxLo * inv;
+      outLo[2] = dyLo * inv;
+      outLo[3] = dzLo * inv;
+    } else {
+      outLo[0] = out[0];
+      outLo[1] = out[1];
+      outLo[2] = out[2];
+      outLo[3] = out[3];
+    }
+  }
 }

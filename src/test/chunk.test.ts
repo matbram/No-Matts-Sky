@@ -5,6 +5,7 @@ import {
   assembleDensity,
   sliceTerrainRecipe,
   lodOctaves,
+  surfaceAt,
   type TerrainRecipe,
 } from '../core/density.ts';
 import { meshChunk, uvRectFromPath, chunkKey, type ChunkRequest } from '../core/chunk.ts';
@@ -252,7 +253,7 @@ describe('meshChunk', () => {
     }).toMatchInlineSnapshot(`
       {
         "indices": "506acfe2",
-        "morphTargetNormals": "d1176b75",
+        "morphTargetNormals": "4cad36df",
         "normals": "00144975",
         "positions": "4b7b7717",
         "triangleCount": 1258,
@@ -368,6 +369,36 @@ describe('meshChunk morph targets (LOD geomorph)', () => {
         m.normals[v * 3 + 2]! * m.morphTargetNormals[v * 3 + 2]!;
     }
     expect(dotSum / m.vertexCount).toBeGreaterThan(0.9);
+  });
+
+  it('morph normal is the ANALYTIC coarser normal (not a geometric face-average)', () => {
+    // The fix: morphTargetNormals must come from normalize(−∇D) of the ONE-OCTAVE-COARSER
+    // field — the SAME source as the base normals — so a fully-morphed leaf shades exactly
+    // like its coarse neighbour (no bright square). Validate by comparing each vertex's morph
+    // normal to surfaceAt's analytic normal at the morph octave count, and confirm it tracks
+    // the COARSER normal more closely than the fine (base) normal does.
+    const m = meshChunk(req, RECIPE, R, 16, 10);
+    const morphOct = lodOctaves(RECIPE, req.lod) - 1; // mesher drops the finest octave for the target
+    const s = new Float64Array(7);
+    let dotMorph = 0, dotFineVsCoarse = 0;
+    for (let v = 0; v < m.vertexCount; v++) {
+      const wx = m.positions[v * 3]! + m.origin[0]!;
+      const wy = m.positions[v * 3 + 1]! + m.origin[1]!;
+      const wz = m.positions[v * 3 + 2]! + m.origin[2]!;
+      surfaceAt(RECIPE, R, wx, wy, wz, s, morphOct); // analytic coarser normal in s[1..3]
+      dotMorph +=
+        m.morphTargetNormals[v * 3]! * s[1]! +
+        m.morphTargetNormals[v * 3 + 1]! * s[2]! +
+        m.morphTargetNormals[v * 3 + 2]! * s[3]!;
+      dotFineVsCoarse +=
+        m.normals[v * 3]! * s[1]! + m.normals[v * 3 + 1]! * s[2]! + m.normals[v * 3 + 2]! * s[3]!;
+    }
+    const n = m.vertexCount;
+    // The morph normal closely matches the analytic coarser normal…
+    expect(dotMorph / n).toBeGreaterThan(0.95);
+    // …and matches it BETTER than the fine normal does (proves it genuinely morphed toward
+    // the parent, i.e. it isn't just a copy of the fine normal).
+    expect(dotMorph / n).toBeGreaterThan(dotFineVsCoarse / n);
   });
 
   it('differs from the base surface (the morph is actually active)', () => {

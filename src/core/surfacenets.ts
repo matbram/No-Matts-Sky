@@ -64,6 +64,14 @@ export interface SampledField {
    * at a smoother radius) — the geomorph source. Absent → morph target == base.
    */
   cornerMorphPos?: Float64Array;
+  /**
+   * Optional low-detail (parent) corner NORMAL — the ANALYTIC `normalize(−∇D)` of
+   * the one-octave-coarser field (3 per corner, same index). Averaged per vertex the
+   * SAME way as `cornerNormal`, so the morph-target normal comes from the same source
+   * as the base normal; a fully-morphed leaf then shades exactly like its coarse
+   * neighbour. Absent → morphTargetNormals == normals.
+   */
+  cornerMorphNormal?: Float64Array;
 }
 
 // The 12 cube edges as pairs of local corner indices (L = a | b<<1 | c<<2).
@@ -92,6 +100,9 @@ export function surfaceNets(
   // Morph target source. Absent → reuse cornerPos so morphTargets == positions
   // exactly (geomorph becomes a no-op).
   const mp = field.cornerMorphPos ?? cornerPos;
+  // Morph-target NORMAL source (analytic parent normal). Absent → reuse cornerNormal
+  // so morphTargetNormals == normals (no-op), parallel to mp.
+  const mn = field.cornerMorphNormal ?? cornerNormal;
   const cnx = nx + 1;
   const cny = ny + 1;
   const cIdx = (i: number, j: number, k: number): number => i + cnx * (j + cny * k);
@@ -101,6 +112,7 @@ export function surfaceNets(
   const pos: number[] = []; // local x,y,z triples
   const mpos: number[] = []; // local morph-target triples, parallel to pos
   const nrm: number[] = [];
+  const mnr: number[] = []; // morph-target (parent) vertex normals, parallel to nrm
   const d = new Float64Array(8);
 
   let minx = Infinity, miny = Infinity, minz = Infinity;
@@ -112,6 +124,7 @@ export function surfaceNets(
       for (let i = 0; i < nx; i++) {
         let mask = 0;
         let nax = 0, nay = 0, naz = 0; // accumulate the cell's corner normals
+        let max = 0, may = 0, maz = 0; // …and the morph-target (parent) corner normals
         for (let L = 0; L < 8; L++) {
           const cc = cIdx(i + OFF_A[L]!, j + OFF_B[L]!, k + OFF_C[L]!);
           const dv = density[cc]!;
@@ -120,6 +133,9 @@ export function surfaceNets(
           nax += cornerNormal[cc * 3]!;
           nay += cornerNormal[cc * 3 + 1]!;
           naz += cornerNormal[cc * 3 + 2]!;
+          max += mn[cc * 3]!;
+          may += mn[cc * 3 + 1]!;
+          maz += mn[cc * 3 + 2]!;
         }
         if (mask === 0 || mask === 0xff) continue;
 
@@ -156,6 +172,15 @@ export function surfaceNets(
         pos.push(lx, ly, lz);
         mpos.push(mlx, mly, mlz);
         nrm.push(nax * nl, nay * nl, naz * nl);
+        // Morph-target normal: averaged analytic parent corner normals (same as nrm).
+        // Degenerate (cancelling) → fall back to the base normal.
+        const msq = max * max + may * may + maz * maz;
+        if (msq > 1e-12) {
+          const ml = 1 / Math.sqrt(msq);
+          mnr.push(max * ml, may * ml, maz * ml);
+        } else {
+          mnr.push(nax * nl, nay * nl, naz * nl);
+        }
 
         // Bounds must enclose the mesh at ANY morph value, so include both ends.
         if (lx < minx) minx = lx;
@@ -214,8 +239,6 @@ export function surfaceNets(
     }
   }
 
-  const mainIdxLen = idx.length; // triangles 0..mainIdxLen are the main surface (pre-skirt)
-
   // Pass 3 — skirts. Extrude tangential-boundary vertices radially inward into
   // curtains; a neighbor patch at a different LOD drops its own overlapping
   // curtain, so the crack between them is hidden (slice spec §5). Rendered
@@ -244,6 +267,7 @@ export function surfaceNets(
       pos.push(sx, sy, sz);
       mpos.push(msx, msy, msz);
       nrm.push(nrm[v * 3]!, nrm[v * 3 + 1]!, nrm[v * 3 + 2]!);
+      mnr.push(mnr[v * 3]!, mnr[v * 3 + 1]!, mnr[v * 3 + 2]!); // skirt inherits its base vert's morph normal
       if (sx < minx) minx = sx;
       if (sy < miny) miny = sy;
       if (sz < minz) minz = sz;
@@ -302,39 +326,12 @@ export function surfaceNets(
 
   const vertexCount = pos.length / 3;
 
-  // Morph-target normals — the parent surface's per-vertex normals, so the shader can lerp
-  // the NORMAL with the geomorph (not just the position). Accumulate face normals from the
-  // MORPH positions over the MAIN surface triangles only (skirt curtains would corrupt base
-  // verts); each face is oriented outward against the fine normals (mirrors pushTri). Any
-  // vertex with no contribution (skirt verts / degenerate) falls back to its fine normal.
-  const mAcc = new Float64Array(vertexCount * 3);
-  for (let t = 0; t < mainIdxLen; t += 3) {
-    const a = idx[t]!, b = idx[t + 1]!, c = idx[t + 2]!;
-    const ax = mpos[a * 3]!, ay = mpos[a * 3 + 1]!, az = mpos[a * 3 + 2]!;
-    const e1x = mpos[b * 3]! - ax, e1y = mpos[b * 3 + 1]! - ay, e1z = mpos[b * 3 + 2]! - az;
-    const e2x = mpos[c * 3]! - ax, e2y = mpos[c * 3 + 1]! - ay, e2z = mpos[c * 3 + 2]! - az;
-    let fx = e1y * e2z - e1z * e2y;
-    let fy = e1z * e2x - e1x * e2z;
-    let fz = e1x * e2y - e1y * e2x;
-    const anx = nrm[a * 3]! + nrm[b * 3]! + nrm[c * 3]!;
-    const any = nrm[a * 3 + 1]! + nrm[b * 3 + 1]! + nrm[c * 3 + 1]!;
-    const anz = nrm[a * 3 + 2]! + nrm[b * 3 + 2]! + nrm[c * 3 + 2]!;
-    if (fx * anx + fy * any + fz * anz < 0) { fx = -fx; fy = -fy; fz = -fz; } // orient outward
-    mAcc[a * 3] = mAcc[a * 3]! + fx; mAcc[a * 3 + 1] = mAcc[a * 3 + 1]! + fy; mAcc[a * 3 + 2] = mAcc[a * 3 + 2]! + fz;
-    mAcc[b * 3] = mAcc[b * 3]! + fx; mAcc[b * 3 + 1] = mAcc[b * 3 + 1]! + fy; mAcc[b * 3 + 2] = mAcc[b * 3 + 2]! + fz;
-    mAcc[c * 3] = mAcc[c * 3]! + fx; mAcc[c * 3 + 1] = mAcc[c * 3 + 1]! + fy; mAcc[c * 3 + 2] = mAcc[c * 3 + 2]! + fz;
-  }
-  const mnrm = new Float32Array(vertexCount * 3);
-  for (let v = 0; v < vertexCount; v++) {
-    const x = mAcc[v * 3]!, y = mAcc[v * 3 + 1]!, z = mAcc[v * 3 + 2]!;
-    const len = Math.sqrt(x * x + y * y + z * z);
-    if (len > 1e-12) {
-      const inv = 1 / len;
-      mnrm[v * 3] = x * inv; mnrm[v * 3 + 1] = y * inv; mnrm[v * 3 + 2] = z * inv;
-    } else {
-      mnrm[v * 3] = nrm[v * 3]!; mnrm[v * 3 + 1] = nrm[v * 3 + 1]!; mnrm[v * 3 + 2] = nrm[v * 3 + 2]!;
-    }
-  }
+  // Morph-target normals come from `mnr` — the per-vertex average of the ANALYTIC
+  // parent corner normals (`cornerMorphNormal`), built in Pass 1 the SAME way as the
+  // base normals. Because the source matches the base normal exactly (analytic, not
+  // a geometric face-average), a fully-morphed leaf shades identically to its coarse
+  // neighbour → no bright "textured square" at LOD boundaries.
+  const mnrm = Float32Array.from(mnr);
 
   return {
     positions: Float32Array.from(pos),

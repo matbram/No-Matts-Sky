@@ -73,6 +73,7 @@ const _wx = new Float64Array(4);
 const _wy = new Float64Array(4);
 const _wz = new Float64Array(4);
 const _n = new Float64Array(4);
+const _nLo = new Float64Array(4); // coarser (one-octave-dropped) main fBm value+gradient
 const _t = new Float64Array(4);
 
 /**
@@ -85,9 +86,12 @@ const _t = new Float64Array(4);
  * Jw's rows are the gradients of the three warp channels. (Jᵀg)_i =
  * g_i + A·Σⱼ wⱼ.d[i]·gⱼ.
  *
- * Optional `outLo` receives the terrain VALUE one octave smoother (the main fBm's
- * "parent-resolution" value under the SAME domain warp) — the LOD geomorph target.
- * No gradient is produced for it (morph normals are snapped). `out` is unaffected.
+ * Optional `outLo` (length ≥ 4) receives the terrain VALUE AND GRADIENT one octave
+ * smoother (the main fBm's "parent-resolution" surface under the SAME domain warp)
+ * — the LOD geomorph target. The gradient runs through the SAME warp Jacobian as
+ * `out`, so the mesher can build the morph target's ANALYTIC normal (matching the
+ * base normal); a fully-morphed leaf then shades exactly like its coarse neighbour.
+ * `out` is unaffected, and `outLo[0]` is bit-identical to before.
  *
  * Optional `octaveCount` overrides the recipe's octave count for the MAIN terrain
  * fBm only (the LOD-adaptive detail — see `lodOctaves`). The domain warp keeps the
@@ -121,9 +125,10 @@ export function terrainAt(
   const qx = px + A * _wx[0]!;
   const qy = py + A * _wy[0]!;
   const qz = pz + A * _wz[0]!;
-  // Same warp for the morph target → its only difference from `out[0]` is the
-  // dropped finest octave, i.e. a purely radial detail-smoothing displacement.
-  fbm3(s, qx, qy, qz, oMain, lac, g, _n, outLo);
+  // Same warp for the morph target → its only difference from `out` is the dropped
+  // finest octave. fbm3 writes the coarser value+gradient into _nLo; we run that
+  // gradient through the SAME warp Jacobian below so the morph normal is analytic.
+  fbm3(s, qx, qy, qz, oMain, lac, g, _n, outLo ? _nLo : undefined);
 
   const nx = _n[1]!;
   const ny = _n[2]!;
@@ -132,6 +137,15 @@ export function terrainAt(
   out[1] = nx + A * (_wx[1]! * nx + _wy[1]! * ny + _wz[1]! * nz);
   out[2] = ny + A * (_wx[2]! * nx + _wy[2]! * ny + _wz[2]! * nz);
   out[3] = nz + A * (_wx[3]! * nx + _wy[3]! * ny + _wz[3]! * nz);
+  if (outLo) {
+    // Same Jacobian (Jᵀ) applied to the coarser gradient → the parent surface's
+    // analytic terrain gradient. outLo[0] (value) is identical to the old behaviour.
+    const lx = _nLo[1]!, ly = _nLo[2]!, lz = _nLo[3]!;
+    outLo[0] = _nLo[0]!;
+    outLo[1] = lx + A * (_wx[1]! * lx + _wy[1]! * ly + _wz[1]! * lz);
+    outLo[2] = ly + A * (_wx[2]! * lx + _wy[2]! * ly + _wz[2]! * lz);
+    outLo[3] = lz + A * (_wx[3]! * lx + _wy[3]! * ly + _wz[3]! * lz);
+  }
 }
 
 /**

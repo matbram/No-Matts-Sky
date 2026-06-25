@@ -60,14 +60,17 @@ export const CHUNK_GRID_RADIAL = 12;
 // call (surfaceNets allocates them) so they can be transferred and kept.
 let _sColDir: Float64Array = new Float64Array(0);
 let _sColT: Float64Array = new Float64Array(0);
+let _sColTLo: Float64Array = new Float64Array(0); // per-column coarser terrain value+grad (morph normal)
 let _sColDr: Float64Array = new Float64Array(0); // per-column radial morph offset (m)
 let _sDensity: Float64Array = new Float64Array(0);
 let _sCornerPos: Float64Array = new Float64Array(0);
 let _sCornerNormal: Float64Array = new Float64Array(0);
 let _sCornerMorphPos: Float64Array = new Float64Array(0);
+let _sCornerMorphNormal: Float64Array = new Float64Array(0);
 const _t = new Float64Array(4);
-const _tLo = new Float64Array(1); // terrainAt's one-octave-smoother value (morph target)
+const _tLo = new Float64Array(4); // terrainAt's one-octave-smoother value+gradient (morph target + normal)
 const _d = new Float64Array(4);
+const _dLo = new Float64Array(4); // morph-target density gradient → analytic morph normal
 const fit = (a: Float64Array, n: number): Float64Array => (a.length >= n ? a : new Float64Array(n));
 
 /** Stable string key for a chunk (cache key, slice spec §4 "key by coordinate"). */
@@ -138,6 +141,7 @@ export function meshChunk(
   const colCount = cnx * cny;
   const colDir = (_sColDir = fit(_sColDir, colCount * 3));
   const colT = (_sColT = fit(_sColT, colCount * 4)); // [tv, tdx, tdy, tdz] per column
+  const colTLo = (_sColTLo = fit(_sColTLo, colCount * 4)); // coarser [tv, td*] (morph normal)
   const colDr = (_sColDr = fit(_sColDr, colCount)); // radial morph offset per column
   for (let j = 0; j < cny; j++) {
     const v = v0 + dv * j;
@@ -157,6 +161,13 @@ export function meshChunk(
       colT[ci * 4 + 1] = _t[1]!;
       colT[ci * 4 + 2] = _t[2]!;
       colT[ci * 4 + 3] = _t[3]!;
+      // Coarser (one-octave-dropped) terrain value+gradient — the morph target's
+      // surface AND its analytic normal source (matching colT/cornerNormal), so a
+      // fully-morphed leaf shades exactly like its coarse neighbour (no bright square).
+      colTLo[ci * 4] = _tLo[0]!;
+      colTLo[ci * 4 + 1] = _tLo[1]!;
+      colTLo[ci * 4 + 2] = _tLo[2]!;
+      colTLo[ci * 4 + 3] = _tLo[3]!;
       // Morph target sits at the one-octave-smoother surface, so its radial offset
       // from the base surface is height·(tvLo − tv). Pure function of direction →
       // neighbours agree exactly → the geomorph opens no seams mid-transition.
@@ -171,6 +182,7 @@ export function meshChunk(
   const cornerPos = (_sCornerPos = fit(_sCornerPos, cc * 3));
   const cornerNormal = (_sCornerNormal = fit(_sCornerNormal, cc * 3));
   const cornerMorphPos = (_sCornerMorphPos = fit(_sCornerMorphPos, cc * 3));
+  const cornerMorphNormal = (_sCornerMorphNormal = fit(_sCornerMorphNormal, cc * 3));
   let p = 0;
   for (let k = 0; k < cnz; k++) {
     const r = rMin + (rMax - rMin) * (k / nz);
@@ -197,11 +209,25 @@ export function meshChunk(
       cornerNormal[p * 3] = gx * ln;
       cornerNormal[p * 3 + 1] = gy * ln;
       cornerNormal[p * 3 + 2] = gz * ln;
+      // Morph-target ANALYTIC normal: normalize(−∇D) of the COARSER field at the morph
+      // radius rm (same formula as the base normal, one octave dropped). This is what
+      // makes a morphed leaf shade identically to its coarse neighbour — the fix for the
+      // bright "textured square" (Δeff≈0 yet visible ⇒ it was a shading mismatch).
+      assembleDensity(
+        radius, rm, dx, dy, dz,
+        colTLo[ci * 4]!, colTLo[ci * 4 + 1]!, colTLo[ci * 4 + 2]!, colTLo[ci * 4 + 3]!,
+        height, scale, _dLo,
+      );
+      const mgx = -_dLo[1]!, mgy = -_dLo[2]!, mgz = -_dLo[3]!;
+      const mln = 1 / Math.sqrt(mgx * mgx + mgy * mgy + mgz * mgz + 1e-30);
+      cornerMorphNormal[p * 3] = mgx * mln;
+      cornerMorphNormal[p * 3 + 1] = mgy * mln;
+      cornerMorphNormal[p * 3 + 2] = mgz * mln;
       p++;
     }
   }
 
-  const field: SampledField = { nx, ny, nz, density, cornerPos, cornerNormal, cornerMorphPos };
+  const field: SampledField = { nx, ny, nz, density, cornerPos, cornerNormal, cornerMorphPos, cornerMorphNormal };
   const m = surfaceNets(field, origin, skirtDepth);
 
   return {
