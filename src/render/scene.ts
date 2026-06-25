@@ -120,7 +120,11 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   });
   // splitPx 300 (smaller, gentler LOD steps — affordable after the ~13× meshing
   // speedup); maxDepth 10 caps leaf counts.
-  const manager = new QuadtreeManager(scene, material, recipe, R, { splitPx: 300, maxDepth: 10 });
+  const manager = new QuadtreeManager(scene, material, recipe, R, {
+    splitPx: 300,
+    maxDepth: 10,
+    noskirt: params.has('noskirt'), // debug: A/B the dark-side boundary lines
+  });
 
   // No-black backdrop: a single smooth sphere INSET below the deepest terrain
   // (radius − height·1.05), always present, so any not-yet-streamed gap shows
@@ -151,10 +155,15 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     .normalize();
   const altMid = R * 0.12;
   const altSurf = 28_000;
+  // Debug: ?dark places the orbit camera anti-sun so the harness can see the NIGHT
+  // hemisphere (where the per-tile boundary grid is most visible).
+  const orbitDir = params.has('dark')
+    ? sun.position.clone().negate().normalize()
+    : SURFACE_DIR.clone();
   const presets: Record<string, Preset> = {
     orbit: {
       target: new Vector3(0, 0, 0),
-      cam: SURFACE_DIR.clone().multiplyScalar(R * 3),
+      cam: orbitDir.clone().multiplyScalar(R * 3),
       near: R * 0.4,
       far: R * 8,
       minD: R * 1.3,

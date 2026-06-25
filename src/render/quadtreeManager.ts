@@ -23,7 +23,8 @@ import {
   type CameraView,
   type QuadNode,
 } from '../core/quadtree.ts';
-import { chunkKey, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
+import { chunkKey, uvRectFromPath, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
+import { faceDirection } from '../core/cubesphere.ts';
 import type { TerrainRecipe } from '../core/density.ts';
 
 /** A TSL uniform node carrying a single float (the per-leaf morph factor). */
@@ -43,6 +44,7 @@ interface Entry {
   morphUniform: MorphUniform | null; // 0 = coarse/parent-like, 1 = full detail
   ready: ChunkMesh | null;
   morph: number; // 0..1 geomorph-in progress (drives morphUniform)
+  needsSkirt: boolean; // does any edge lack a same-LOD neighbour in the cut?
 }
 interface MeshResult {
   id: number;
@@ -53,10 +55,28 @@ interface MeshResult {
 /** LOD geomorph duration (ms): detail morphs in over this long instead of snapping. */
 const MORPH_MS = 350;
 
+/**
+ * Quantized world directions of a leaf's 4 edge MIDPOINTS. Two same-LOD neighbours
+ * (within a face OR across a cube edge) share an edge midpoint exactly (cube-sphere
+ * watertightness), so the same key appears for both; a coarser/finer neighbour's
+ * edge midpoint lands elsewhere. Used to detect which edges are interior (same-LOD).
+ */
+function edgeKeys(node: QuadNode): string[] {
+  const r = uvRectFromPath(node.path);
+  const um = (r.u0 + r.u1) / 2;
+  const vm = (r.v0 + r.v1) / 2;
+  const k = (u: number, v: number): string => {
+    const d = faceDirection(node.face, u, v);
+    return `${Math.round(d[0] * 1e6)},${Math.round(d[1] * 1e6)},${Math.round(d[2] * 1e6)}`;
+  };
+  return [k(r.u1, vm), k(r.u0, vm), k(um, r.v1), k(um, r.v0)];
+}
+
 export interface ManagerOpts {
   splitPx: number;
   maxDepth: number;
   workers?: number; // pool size (default: min(6, cores-1))
+  noskirt?: boolean; // debug: disable skirts (A/B the dark-side boundary lines)
 }
 
 export interface StreamStats {
@@ -136,10 +156,29 @@ export class QuadtreeManager {
           morphUniform: null,
           ready: null,
           morph: 0,
+          needsSkirt: true, // set below from the full cut, before dispatch
         });
       }
     }
     this.wanted = wanted;
+
+    // Per-leaf skirt conditioning. A leaf only needs skirts where an edge lacks a
+    // SAME-LOD neighbour in the cut (a LOD transition or an un-neighboured world
+    // boundary); same-LOD edges are already watertight via the apron, so skirts
+    // there are pure waste — their rims poke ~1 m through the neighbour (per-tile
+    // float32 origin) and draw the dark-side boundary grid. Same-LOD neighbours
+    // share an edge MIDPOINT direction, so a geometric key count (handles within-
+    // face AND cross-face uniformly) tells us which edges are interior. Computed
+    // from the COMPLETE wanted cut, so settled views mesh with the correct mask.
+    const edgeCount = new Map<string, number>();
+    for (const key of wanted) {
+      const e = this.entries.get(key)!;
+      for (const ek of edgeKeys(e.node)) edgeCount.set(ek, (edgeCount.get(ek) ?? 0) + 1);
+    }
+    for (const key of wanted) {
+      const e = this.entries.get(key)!;
+      e.needsSkirt = edgeKeys(e.node).some((ek) => (edgeCount.get(ek) ?? 0) < 2);
+    }
     // Unwanted NON-LIVE entries are cancelled now (no point finishing work we no
     // longer want). Unwanted LIVE leaves are RETAINED — kept rendered until their
     // replacement is live (purgeRetained), so no hole/black-flash appears during
@@ -292,10 +331,10 @@ export class QuadtreeManager {
       this.jobKey.set(id, key);
       const depth = e.node.path.length;
       const leafTangential = ((this.radius * Math.PI) / 2) / 2 ** depth;
-      const skirtDepth = Math.max(
-        this.recipe.height * 0.25,
-        Math.min(this.recipe.height * 2, leafTangential * 0.04),
-      );
+      const skirtDepth =
+        this.opts.noskirt || !e.needsSkirt
+          ? 0 // interior (all-same-LOD) leaves need no skirt — avoids the rim-poke grid
+          : Math.max(this.recipe.height * 0.25, Math.min(this.recipe.height * 2, leafTangential * 0.04));
       const job: MeshJob & { id: number } = {
         id,
         req: { face: e.node.face, path: e.node.path, lod: depth },
