@@ -110,7 +110,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     wire: params.has('wire'),
     lodcolor: params.has('lodcolor'),
     skirtcolor: params.has('skirtcolor'),
-    noskirt: params.has('noskirt'),
+    skirt: params.has('skirt'), // skirts are OFF by default now; ?skirt re-enables them
     dark: params.has('dark'),
   });
 
@@ -152,7 +152,9 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const manager = new QuadtreeManager(scene, material, recipe, R, {
     splitPx: 300,
     maxDepth: 10,
-    noskirt: params.has('noskirt'), // debug: A/B the dark-side boundary lines
+    // Skirts OFF by default — the apron covers LOD-transition holes and the skirts were
+    // the visible boundary grid (?noskirt confirmed clean). ?skirt re-enables for A/B.
+    skirts: params.has('skirt'),
     // debug tint: 'lod' colors leaves by LOD level, 'skirt' highlights skirted leaves
     debugColor: params.has('lodcolor') ? 'lod' : params.has('skirtcolor') ? 'skirt' : undefined,
   });

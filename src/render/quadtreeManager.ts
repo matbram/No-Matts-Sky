@@ -76,7 +76,8 @@ export interface ManagerOpts {
   splitPx: number;
   maxDepth: number;
   workers?: number; // pool size (default: min(6, cores-1))
-  noskirt?: boolean; // debug: disable skirts (A/B the dark-side boundary lines)
+  skirts?: boolean; // enable LOD-transition skirts (default OFF — the apron already covers
+  // holes at LOD transitions, and the skirts were the visible boundary grid; ?skirt re-enables)
   debugColor?: 'lod' | 'skirt'; // debug: tint leaves by LOD level, or highlight skirted leaves
 }
 
@@ -164,32 +165,34 @@ export class QuadtreeManager {
     }
     this.wanted = wanted;
 
-    // Per-leaf skirt conditioning. A leaf only needs skirts where an edge lacks a
-    // SAME-LOD neighbour in the cut (a LOD transition or an un-neighboured world
-    // boundary); same-LOD edges are already watertight via the apron, so skirts
-    // there are pure waste — their rims poke ~1 m through the neighbour (per-tile
-    // float32 origin) and draw the dark-side boundary grid. Same-LOD neighbours
-    // share an edge MIDPOINT direction, so a geometric key count (handles within-
-    // face AND cross-face uniformly) tells us which edges are interior. Computed
-    // from the COMPLETE wanted cut, so settled views mesh with the correct mask.
-    const edgeCount = new Map<string, number>();
-    for (const key of wanted) {
-      const e = this.entries.get(key)!;
-      for (const ek of edgeKeys(e.node)) edgeCount.set(ek, (edgeCount.get(ek) ?? 0) + 1);
-    }
+    // Per-leaf skirt conditioning — only when skirts are ENABLED (default OFF). The
+    // apron (each tile meshed 1 cell past its rect) already prevents holes at LOD
+    // transitions, and the skirts were the visible boundary grid, so skirts are off
+    // by default. When on (?skirt), a leaf skirts only where an edge lacks a same-LOD
+    // neighbour in the cut — detected by a shared edge-MIDPOINT key (handles within-
+    // face AND cross-face), computed from the COMPLETE wanted cut so settled views
+    // mesh with the correct mask.
     let skirted = 0;
     const lodHist: Record<number, number> = {};
+    const edgeCount = new Map<string, number>();
+    if (this.opts.skirts) {
+      for (const key of wanted)
+        for (const ek of edgeKeys(this.entries.get(key)!.node))
+          edgeCount.set(ek, (edgeCount.get(ek) ?? 0) + 1);
+    }
     for (const key of wanted) {
       const e = this.entries.get(key)!;
-      e.needsSkirt = edgeKeys(e.node).some((ek) => (edgeCount.get(ek) ?? 0) < 2);
+      e.needsSkirt = this.opts.skirts
+        ? edgeKeys(e.node).some((ek) => (edgeCount.get(ek) ?? 0) < 2)
+        : false;
       if (e.needsSkirt) skirted++;
       const lod = e.node.path.length;
       lodHist[lod] = (lodHist[lod] ?? 0) + 1;
     }
     // Verbose per-cut diagnostic (throttled to when the summary changes), so the
-    // user's console shows whether skirt-conditioning is live and how many leaves
-    // still skirt — confirming the fix on their actual machine.
-    const summary = `leaves=${wanted.size} skirted=${skirted} interior=${wanted.size - skirted} lod=${JSON.stringify(lodHist)}`;
+    // user's console shows the cut shape and how many leaves skirt — confirming the
+    // state on their actual machine.
+    const summary = `leaves=${wanted.size} skirted=${skirted} interior=${wanted.size - skirted} skirtsOpt=${!!this.opts.skirts} lod=${JSON.stringify(lodHist)}`;
     if (summary !== this.lastStatLog) {
       this.lastStatLog = summary;
       console.log('[NMS] cut:', summary);
@@ -351,10 +354,11 @@ export class QuadtreeManager {
       this.jobKey.set(id, key);
       const depth = e.node.path.length;
       const leafTangential = ((this.radius * Math.PI) / 2) / 2 ** depth;
-      const skirtDepth =
-        this.opts.noskirt || !e.needsSkirt
-          ? 0 // interior (all-same-LOD) leaves need no skirt — avoids the rim-poke grid
-          : Math.max(this.recipe.height * 0.25, Math.min(this.recipe.height * 2, leafTangential * 0.04));
+      // needsSkirt is false unless skirts are enabled AND this edge lacks a same-LOD
+      // neighbour, so by default skirtDepth is 0 (no skirts → no boundary grid).
+      const skirtDepth = e.needsSkirt
+        ? Math.max(this.recipe.height * 0.25, Math.min(this.recipe.height * 2, leafTangential * 0.04))
+        : 0;
       const job: MeshJob & { id: number } = {
         id,
         req: { face: e.node.face, path: e.node.path, lod: depth },
