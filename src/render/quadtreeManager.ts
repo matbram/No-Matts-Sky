@@ -562,14 +562,17 @@ export class QuadtreeManager {
     return m > birth ? m : birth;
   }
 
-  /** Rendered radius (m) of leaf `e` at unit dir (dx,dy,dz): lerp(full-octave, parent-octave) by
-   *  its morph `m` — what the geomorph actually draws there, for the cross-LOD gap metric. */
+  /** Rendered radius (m) of leaf `e` at unit dir (dx,dy,dz): lerp(full surface, morph-target
+   *  surface) by its morph `m` — what the geomorph actually draws there, for the cross-LOD gap
+   *  metric. The parent term is terrainAt's `outLo` (sum of the first oct-1 octaves but normalized
+   *  over ALL oct amplitudes) — BIT-IDENTICAL to the mesher's morphTarget (chunk.ts colDr), not a
+   *  fresh (oct-1)-octave fBm (whose different normalization overstates the gap by ~oct's amplitude,
+   *  maximal at m≈1 = exactly the boundary the seam scan probes). One eval returns both. */
   private renderedRadiusAt(e: Entry, dx: number, dy: number, dz: number, m: number): number {
     const octFull = lodOctaves(this.recipe, e.node.path.length);
     const scale = this.recipe.noiseScale;
-    terrainAt(this.recipe, dx * scale, dy * scale, dz * scale, this._tA, undefined, octFull);
-    terrainAt(this.recipe, dx * scale, dy * scale, dz * scale, this._tB, undefined, Math.max(1, octFull - 1));
-    const tv = (1 - m) * this._tA[0]! + m * this._tB[0]!;
+    terrainAt(this.recipe, dx * scale, dy * scale, dz * scale, this._tA, this._tB, octFull);
+    const tv = (1 - m) * this._tA[0]! + m * this._tB[0]!; // _tA = full detail, _tB = morph target (parent)
     return this.radius + this.recipe.height * tv;
   }
 
