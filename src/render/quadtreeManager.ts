@@ -15,6 +15,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Scene, Mesh, BufferGeometry, BufferAttribute, type Material } from 'three';
+import { uniform, mix, attribute, positionLocal } from 'three/tsl';
 import {
   selectCut,
   nodeBounds,
@@ -25,15 +26,23 @@ import {
 import { chunkKey, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
 import type { TerrainRecipe } from '../core/density.ts';
 
+/** A TSL uniform node carrying a single float (the per-leaf morph factor). */
+type MorphUniform = ReturnType<typeof uniform>;
+/** Node materials expose positionNode; the base is typed as plain Material here. */
+interface NodeMaterialLike {
+  positionNode: unknown;
+}
+
 type Status = 'pending' | 'inflight' | 'ready' | 'live';
 interface Entry {
   node: QuadNode;
   status: Status;
   center: [number, number, number];
   mesh: Mesh | null;
-  mat: Material | null; // per-leaf material clone (independent opacity for the fade)
+  mat: Material | null; // per-leaf material clone (carries the leaf's own morph uniform)
+  morphUniform: MorphUniform | null; // 0 = coarse/parent-like, 1 = full detail
   ready: ChunkMesh | null;
-  fade: number; // 0..1 dithered cross-fade-in progress
+  morph: number; // 0..1 geomorph-in progress (drives morphUniform)
 }
 interface MeshResult {
   id: number;
@@ -41,8 +50,8 @@ interface MeshResult {
   ms: number;
 }
 
-/** LOD cross-fade duration (ms): detail dithers in over this long instead of snapping. */
-const FADE_MS = 350;
+/** LOD geomorph duration (ms): detail morphs in over this long instead of snapping. */
+const MORPH_MS = 350;
 
 export interface ManagerOpts {
   splitPx: number;
@@ -124,8 +133,9 @@ export class QuadtreeManager {
           center: b.center,
           mesh: null,
           mat: null,
+          morphUniform: null,
           ready: null,
-          fade: 0,
+          morph: 0,
         });
       }
     }
@@ -151,7 +161,7 @@ export class QuadtreeManager {
 
   /**
    * Remove retained (live, no-longer-wanted) leaves whose replacement has fully
-   * FADED IN — so the old leaf stays opaque behind the new one until the cross-fade
+   * MORPHED IN — so the old leaf stays opaque behind the new one until the geomorph
    * completes, then disappears with nothing visible changing.
    */
   private purgeRetained(): void {
@@ -159,8 +169,8 @@ export class QuadtreeManager {
     const wantedArr: { node: QuadNode; live: boolean }[] = [];
     for (const key of this.wanted) {
       const e = this.entries.get(key);
-      // A replacement only "covers" once it's live AND has finished fading in.
-      if (e) wantedArr.push({ node: e.node, live: e.status === 'live' && e.fade >= 1 });
+      // A replacement only "covers" once it's live AND has finished morphing in.
+      if (e) wantedArr.push({ node: e.node, live: e.status === 'live' && e.morph >= 1 });
     }
     for (const [key, e] of this.entries) {
       if (e.status !== 'live' || this.wanted.has(key)) continue;
@@ -176,20 +186,20 @@ export class QuadtreeManager {
   }
 
   /**
-   * Advance LOD cross-fades — call once per frame. Newly-live leaves dither in
-   * (opacity 0→1 over FADE_MS); when one finishes, drop its polygon-offset bias and
+   * Advance LOD geomorphs — call once per frame. Newly-live leaves morph in
+   * (morph 0→1 over MORPH_MS); when one finishes, drop its polygon-offset bias and
    * purge any retained leaf it now fully covers.
    */
   tick(dtMs: number): void {
     if (this.entries.size === 0) return;
-    const step = dtMs / FADE_MS;
+    const step = dtMs / MORPH_MS;
     let anyCompleted = false;
     for (const e of this.entries.values()) {
-      if (e.status !== 'live' || e.fade >= 1 || !e.mat) continue;
-      e.fade = Math.min(1, e.fade + step);
-      e.mat.opacity = e.fade;
-      if (e.fade >= 1) {
-        e.mat.polygonOffset = false; // settle depth once fully resolved
+      if (e.status !== 'live' || e.morph >= 1 || !e.morphUniform) continue;
+      e.morph = Math.min(1, e.morph + step);
+      e.morphUniform.value = e.morph;
+      if (e.morph >= 1) {
+        if (e.mat) e.mat.polygonOffset = false; // settle depth once fully resolved
         anyCompleted = true;
       }
     }
@@ -207,12 +217,19 @@ export class QuadtreeManager {
       const geometry = new BufferGeometry();
       geometry.setAttribute('position', new BufferAttribute(m.positions, 3));
       geometry.setAttribute('normal', new BufferAttribute(m.normals, 3));
+      geometry.setAttribute('morphTarget', new BufferAttribute(m.morphTargets, 3));
       geometry.setIndex(new BufferAttribute(m.indices, 1));
-      // Per-leaf material clone so its opacity (the dither fade) is independent.
-      // Start invisible and biased toward the camera so it wins the depth test over
-      // the retained leaf it's fading in over (tick() settles both once faded).
+      // Per-leaf material clone carrying its OWN morph uniform: the vertex position
+      // lerps morphTarget→full as morph goes 0→1, so detail resolves in as a single
+      // opaque surface. Biased toward the camera so it wins the depth test over the
+      // retained leaf it's morphing in over (tick() settles the bias once done).
       const mat = this.material.clone();
-      mat.opacity = 0;
+      const mu = uniform(0);
+      (mat as unknown as NodeMaterialLike).positionNode = mix(
+        attribute('morphTarget', 'vec3'),
+        positionLocal,
+        mu,
+      );
       mat.polygonOffset = true;
       mat.polygonOffsetFactor = -1;
       mat.polygonOffsetUnits = -1;
@@ -224,14 +241,15 @@ export class QuadtreeManager {
       );
       e.mesh = mesh;
       e.mat = mat;
+      e.morphUniform = mu;
       e.center = m.origin;
       e.ready = null;
       e.status = 'live';
-      e.fade = 0;
+      e.morph = 0;
       this.scene.add(mesh);
       n++;
     }
-    return n; // purge happens in tick() when fades complete, and in update()
+    return n; // purge happens in tick() when morphs complete, and in update()
   }
 
   stats(): StreamStats {

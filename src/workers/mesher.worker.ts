@@ -34,6 +34,7 @@ ctx.onmessage = (e: MessageEvent<IncomingJob>): void => {
   ctx.postMessage({ id: job.id, mesh, ms }, [
     mesh.positions.buffer,
     mesh.normals.buffer,
+    mesh.morphTargets.buffer,
     mesh.indices.buffer,
   ]);
 };

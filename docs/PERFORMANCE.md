@@ -49,7 +49,7 @@ Good state: `ms/leaf` low single digits, `queue` near 0 while moving, fps green.
 | 6 | **Non-allocating hash.** `pcg4dInto` writes into a scratch array (no 4-tuple per sample). | `core/hash.ts`, `core/noise.ts` | fewer allocs on hot path |
 | 7 | **Worker pool + per-frame upload budget + nearest-first + generate-ahead.** | `render/quadtreeManager.ts`, `render/scene.ts` | parallel fill, no frame spikes |
 | 8 | **Deferred LOD removal + inset backdrop.** Old leaves kept until replacements are live; a single inset backdrop sphere fills any residual gap → no black/holes. | `core/quadtree.ts` `retainedShouldRemove`, `render/*` | invisible pop-in |
-| 9 | **Dithered LOD cross-fade.** New leaves dither in (`alphaHash` + per-leaf `opacity` 0→1 over ~0.35 s, verified r184 WebGPU) over the retained old leaf, kept until the fade *completes* — detail resolves in instead of snapping. Fading leaf gets a camera-ward `polygonOffset` to win depth. Cull margin tightened 1.35→1.2 (the fade hides reveals) and purge throttled to fade-completion/cut-change, keeping the queue shallow on rotate. | gradual detail, no snap; shallower queue |
+| 9 | **Geometry LOD morph (single opaque surface).** New leaves are born at a one-octave-smoother surface and morph to full detail over ~0.35 s — a per-vertex `morphTarget` attribute lerped to `position` by a per-leaf TSL morph uniform 0→1. Unlike a dithered/alpha cross-fade, only ONE opaque surface is ever on screen, so there is no stipple/terracing and no skirt see-through (the earlier `alphaHash` fade drew seams by blending two different surfaces). The morph target is `fbm3`'s value minus its finest octave — captured free in the same pass and a pure function of direction, so neighbours agree exactly and the morph opens no seams mid-transition. Retained leaf kept until the replacement's morph *completes*; morphing leaf gets a camera-ward `polygonOffset` to win depth over it. | gradual detail, no snap, no seams |
 
 > Determinism note: #1 changes leaf positions only at the sub-micron (float
 > roundoff) level — it uses the exact `faceDirection` rather than re-normalizing
@@ -93,7 +93,7 @@ live shared universe (master plan Part 1.3).
 | `splitPx` | `render/scene.ts` | 300 | LOD aggressiveness (smaller = finer/earlier) |
 | `maxDepth` | `render/scene.ts` | 10 | finest leaf / leaf-count cap |
 | Cull margin | `render/scene.ts` | 1.2 | pre-mesh ring width (smaller = shallower queue) |
-| LOD cross-fade duration (`FADE_MS`) | `render/quadtreeManager.ts` | 350 ms | how gradually detail resolves in |
+| LOD morph duration (`MORPH_MS`) | `render/quadtreeManager.ts` | 350 ms | how gradually detail resolves in |
 | Worker pool size | `render/quadtreeManager.ts` | `min(6, cores−1)` | parallel meshing throughput |
 | Upload budget / frame | `render/scene.ts` | 4 | meshes added to GPU per frame |
 | Generate-ahead | `render/scene.ts` | velocity × 30 frames | pre-mesh along motion |

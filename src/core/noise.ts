@@ -148,6 +148,12 @@ const _gn = new Float64Array(4);
  * Each octave: ×`lacunarity` frequency, ×`gain` amplitude. The derivative gets
  * the chain-rule frequency factor per octave. Octaves are decorrelated by a
  * deterministic per-octave seed offset.
+ *
+ * Optional `outLo` receives the normalized value using all but the FINEST octave
+ * — the LOD geomorph target (a smoother, "parent-resolution" surface). It's
+ * captured for free here (no extra noise evals) and is a pure function of
+ * position, so neighbouring chunks agree on it exactly → no seams mid-morph.
+ * `out[0..3]` is bit-identical whether or not `outLo` is passed.
  */
 export function fbm3(
   seed: number,
@@ -158,6 +164,7 @@ export function fbm3(
   lacunarity: number,
   gain: number,
   out: Float64Array,
+  outLo?: Float64Array,
 ): void {
   let v = 0;
   let dx = 0;
@@ -166,7 +173,10 @@ export function fbm3(
   let amp = 1;
   let freq = 1;
   let norm = 0;
+  let vLo = 0;
+  const loCount = octaves - 1; // value sum captured just before the finest octave
   for (let o = 0; o < octaves; o++) {
+    if (o === loCount) vLo = v;
     const os = (seed + Math.imul(o, 0x9e3779b1)) >>> 0;
     gradNoise3(os, x * freq, y * freq, z * freq, _gn);
     v += amp * _gn[0]!;
@@ -182,4 +192,7 @@ export function fbm3(
   out[1] = dx * inv;
   out[2] = dy * inv;
   out[3] = dz * inv;
+  // Same normalization as out[0] → outLo is out[0] minus only the finest octave's
+  // contribution: a small, purely high-frequency displacement. Octaves<2: no-op.
+  if (outLo) outLo[0] = octaves > 1 ? vLo * inv : out[0];
 }

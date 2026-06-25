@@ -63,6 +63,10 @@ const _t = new Float64Array(4);
  * Gradient: ∇ₚ fbm(q(p)) = Jᵀ ∇fbm(q), where the warp Jacobian J = I + A·Jw and
  * Jw's rows are the gradients of the three warp channels. (Jᵀg)_i =
  * g_i + A·Σⱼ wⱼ.d[i]·gⱼ.
+ *
+ * Optional `outLo` receives the terrain VALUE one octave smoother (the main fBm's
+ * "parent-resolution" value under the SAME domain warp) — the LOD geomorph target.
+ * No gradient is produced for it (morph normals are snapped). `out` is unaffected.
  */
 export function terrainAt(
   recipe: TerrainRecipe,
@@ -70,6 +74,7 @@ export function terrainAt(
   py: number,
   pz: number,
   out: Float64Array,
+  outLo?: Float64Array,
 ): void {
   const A = recipe.warpStrength;
   const s = recipe.seed;
@@ -85,7 +90,9 @@ export function terrainAt(
   const qx = px + A * _wx[0]!;
   const qy = py + A * _wy[0]!;
   const qz = pz + A * _wz[0]!;
-  fbm3(s, qx, qy, qz, o, lac, g, _n);
+  // Same warp for the morph target → its only difference from `out[0]` is the
+  // dropped finest octave, i.e. a purely radial detail-smoothing displacement.
+  fbm3(s, qx, qy, qz, o, lac, g, _n, outLo);
 
   const nx = _n[1]!;
   const ny = _n[2]!;

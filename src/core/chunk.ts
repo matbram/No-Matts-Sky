@@ -28,6 +28,7 @@ export interface ChunkRequest {
 export interface ChunkMesh {
   positions: Float32Array; // x,y,z per vertex, RELATIVE to `origin`
   normals: Float32Array;
+  morphTargets: Float32Array; // low-detail position per vertex (LOD geomorph source)
   indices: Uint32Array;
   origin: [number, number, number]; // double world offset to add back at render
   bounds: AABB; // local space (same frame as positions)
@@ -58,10 +59,13 @@ export const CHUNK_GRID_RADIAL = 12;
 // call (surfaceNets allocates them) so they can be transferred and kept.
 let _sColDir: Float64Array = new Float64Array(0);
 let _sColT: Float64Array = new Float64Array(0);
+let _sColDr: Float64Array = new Float64Array(0); // per-column radial morph offset (m)
 let _sDensity: Float64Array = new Float64Array(0);
 let _sCornerPos: Float64Array = new Float64Array(0);
 let _sCornerNormal: Float64Array = new Float64Array(0);
+let _sCornerMorphPos: Float64Array = new Float64Array(0);
 const _t = new Float64Array(4);
+const _tLo = new Float64Array(1); // terrainAt's one-octave-smoother value (morph target)
 const _d = new Float64Array(4);
 const fit = (a: Float64Array, n: number): Float64Array => (a.length >= n ? a : new Float64Array(n));
 
@@ -127,6 +131,7 @@ export function meshChunk(
   const colCount = cnx * cny;
   const colDir = (_sColDir = fit(_sColDir, colCount * 3));
   const colT = (_sColT = fit(_sColT, colCount * 4)); // [tv, tdx, tdy, tdz] per column
+  const colDr = (_sColDr = fit(_sColDr, colCount)); // radial morph offset per column
   for (let j = 0; j < cny; j++) {
     const v = v0 + dv * j;
     for (let i = 0; i < cnx; i++) {
@@ -135,11 +140,15 @@ export function meshChunk(
       colDir[ci * 3] = dir[0];
       colDir[ci * 3 + 1] = dir[1];
       colDir[ci * 3 + 2] = dir[2];
-      terrainAt(recipe, dir[0] * scale, dir[1] * scale, dir[2] * scale, _t);
+      terrainAt(recipe, dir[0] * scale, dir[1] * scale, dir[2] * scale, _t, _tLo);
       colT[ci * 4] = _t[0]!;
       colT[ci * 4 + 1] = _t[1]!;
       colT[ci * 4 + 2] = _t[2]!;
       colT[ci * 4 + 3] = _t[3]!;
+      // Morph target sits at the one-octave-smoother surface, so its radial offset
+      // from the base surface is height·(tvLo − tv). Pure function of direction →
+      // neighbours agree exactly → the geomorph opens no seams mid-transition.
+      colDr[ci] = height * (_tLo[0]! - _t[0]!);
     }
   }
 
@@ -149,6 +158,7 @@ export function meshChunk(
   const density = (_sDensity = fit(_sDensity, cc));
   const cornerPos = (_sCornerPos = fit(_sCornerPos, cc * 3));
   const cornerNormal = (_sCornerNormal = fit(_sCornerNormal, cc * 3));
+  const cornerMorphPos = (_sCornerMorphPos = fit(_sCornerMorphPos, cc * 3));
   let p = 0;
   for (let k = 0; k < cnz; k++) {
     const r = rMin + (rMax - rMin) * (k / nz);
@@ -163,6 +173,13 @@ export function meshChunk(
       cornerPos[p * 3] = dx * r;
       cornerPos[p * 3 + 1] = dy * r;
       cornerPos[p * 3 + 2] = dz * r;
+      // Same corner displaced radially to the smoother surface (per-column offset,
+      // constant over the radial axis). Surface Nets interpolates this with the
+      // SAME zero-crossings, so each morph vertex is its base vertex, smoothed.
+      const rm = r + colDr[ci]!;
+      cornerMorphPos[p * 3] = dx * rm;
+      cornerMorphPos[p * 3 + 1] = dy * rm;
+      cornerMorphPos[p * 3 + 2] = dz * rm;
       const gx = -_d[1]!, gy = -_d[2]!, gz = -_d[3]!; // outward normal = normalize(−∇D)
       const ln = 1 / Math.sqrt(gx * gx + gy * gy + gz * gz + 1e-30);
       cornerNormal[p * 3] = gx * ln;
@@ -172,12 +189,13 @@ export function meshChunk(
     }
   }
 
-  const field: SampledField = { nx, ny, nz, density, cornerPos, cornerNormal };
+  const field: SampledField = { nx, ny, nz, density, cornerPos, cornerNormal, cornerMorphPos };
   const m = surfaceNets(field, origin, skirtDepth);
 
   return {
     positions: m.positions,
     normals: m.normals,
+    morphTargets: m.morphTargets,
     indices: m.indices,
     origin,
     bounds: m.bounds,

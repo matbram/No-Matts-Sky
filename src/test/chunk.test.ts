@@ -7,6 +7,7 @@ import {
   type TerrainRecipe,
 } from '../core/density.ts';
 import { meshChunk, uvRectFromPath, chunkKey, type ChunkRequest } from '../core/chunk.ts';
+import { surfaceNets, type SampledField } from '../core/surfacenets.ts';
 import { faceDirection } from '../core/cubesphere.ts';
 import { EARTH_RADIUS_M } from '../core/constants.ts';
 import { fnv1a } from './digest.ts';
@@ -219,5 +220,103 @@ describe('meshChunk', () => {
     const bare = meshChunk(req, RECIPE, R, 16, 10, 0);
     const skirted = meshChunk(req, RECIPE, R, 16, 10, RECIPE.height * 3);
     expect(minRadius(skirted)).toBeLessThan(minRadius(bare));
+  });
+});
+
+describe('terrainAt low-octave morph value (geomorph source)', () => {
+  it('is a pure function of direction, smoother than the full value, and side-effect free', () => {
+    const s = RECIPE.noiseScale;
+    const a = new Float64Array(4);
+    const b = new Float64Array(4);
+    const lo1 = new Float64Array(1);
+    const lo2 = new Float64Array(1);
+    // Same direction twice → identical low value (so neighbours agree exactly at a
+    // shared edge → the geomorph opens no seam mid-transition).
+    terrainAt(RECIPE, 0.3 * s, 0.5 * s, 0.81 * s, a, lo1);
+    terrainAt(RECIPE, 0.3 * s, 0.5 * s, 0.81 * s, b, lo2);
+    expect(lo1[0]).toBe(lo2[0]);
+    // The morph value drops the finest octave, so it differs from the full value.
+    expect(lo1[0]).not.toBe(a[0]);
+    // Requesting the low value must NOT perturb the full value/gradient (frozen path).
+    const c = new Float64Array(4);
+    terrainAt(RECIPE, 0.3 * s, 0.5 * s, 0.81 * s, c);
+    expect(c[0]).toBe(a[0]);
+    expect(c[1]).toBe(a[1]);
+    expect(c[2]).toBe(a[2]);
+    expect(c[3]).toBe(a[3]);
+  });
+});
+
+describe('meshChunk morph targets (LOD geomorph)', () => {
+  const req: ChunkRequest = { face: 2, path: [2, 1], lod: 2 };
+
+  it('emits one morph target per vertex, deterministically', () => {
+    const a = meshChunk(req, RECIPE, R, 16, 10);
+    const b = meshChunk(req, RECIPE, R, 16, 10);
+    expect(a.morphTargets.length).toBe(a.vertexCount * 3);
+    expect(fnv1a(a.morphTargets)).toBe(fnv1a(b.morphTargets));
+  });
+
+  it('matches a recorded digest (FROZEN)', () => {
+    const m = meshChunk(req, RECIPE, R, 16, 10);
+    expect(fnv1a(m.morphTargets)).toMatchInlineSnapshot(`"add1ac50"`);
+  });
+
+  it('differs from the base surface (the morph is actually active)', () => {
+    const m = meshChunk(req, RECIPE, R, 16, 10);
+    expect(fnv1a(m.morphTargets)).not.toBe(fnv1a(m.positions));
+  });
+
+  it('is smoother than the base surface (lower radius variance)', () => {
+    const m = meshChunk(req, RECIPE, R, 16, 10);
+    const radiusVariance = (buf: Float32Array): number => {
+      const n = m.vertexCount;
+      const radii = new Float64Array(n);
+      let mean = 0;
+      for (let v = 0; v < n; v++) {
+        const x = buf[v * 3]! + m.origin[0]!;
+        const y = buf[v * 3 + 1]! + m.origin[1]!;
+        const z = buf[v * 3 + 2]! + m.origin[2]!;
+        const r = Math.hypot(x, y, z);
+        radii[v] = r;
+        mean += r;
+      }
+      mean /= n;
+      let s = 0;
+      for (let v = 0; v < n; v++) {
+        const d = radii[v]! - mean;
+        s += d * d;
+      }
+      return s / n;
+    };
+    expect(radiusVariance(m.morphTargets)).toBeLessThan(radiusVariance(m.positions));
+  });
+
+  it('is the identity (morphTargets == positions) when the field carries no cornerMorphPos', () => {
+    // Tiny planar field with a z sign-change so Surface Nets emits vertices.
+    const nx = 2, ny = 2, nz = 2;
+    const cnx = nx + 1, cny = ny + 1, cnz = nz + 1;
+    const cc = cnx * cny * cnz;
+    const density = new Float64Array(cc);
+    const cornerPos = new Float64Array(cc * 3);
+    const cornerNormal = new Float64Array(cc * 3);
+    for (let k = 0; k < cnz; k++)
+      for (let j = 0; j < cny; j++)
+        for (let i = 0; i < cnx; i++) {
+          const p = i + cnx * (j + cny * k);
+          cornerPos[p * 3] = i;
+          cornerPos[p * 3 + 1] = j;
+          cornerPos[p * 3 + 2] = k;
+          cornerNormal[p * 3 + 2] = 1; // +z
+          density[p] = 1 - k; // solid at k=0, air at k=2
+        }
+    const field: SampledField = { nx, ny, nz, density, cornerPos, cornerNormal };
+    const m = surfaceNets(field, [0, 0, 0]);
+    expect(m.vertexCount).toBeGreaterThan(0);
+    expect(fnv1a(m.morphTargets)).toBe(fnv1a(m.positions));
+    // An identical cornerMorphPos copy is still the identity.
+    field.cornerMorphPos = cornerPos.slice();
+    const m2 = surfaceNets(field, [0, 0, 0]);
+    expect(fnv1a(m2.morphTargets)).toBe(fnv1a(m2.positions));
   });
 });

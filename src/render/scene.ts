@@ -91,15 +91,15 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // Terrain recipe from the slice planet's coordinate-derived seed.
   const terrainSeed = childSeed(sliceFacts().seed, 0, SALT.terrain);
   const recipe = sliceTerrainRecipe(terrainSeed);
-  // Double-sided so skirt curtains show regardless of winding. alphaHash turns
-  // per-mesh `opacity` into a pixel-footprint dither, which the manager drives
-  // 0→1 per leaf for the LOD cross-fade (detail resolves in instead of snapping).
+  // Double-sided so skirt curtains show regardless of winding. Fully OPAQUE: the
+  // LOD transition is a GEOMETRY morph (the manager clones this per leaf and drives
+  // a per-leaf morph uniform that lerps each vertex morphTarget→position), so detail
+  // resolves in with a single opaque surface — no dither, no two surfaces at once.
   const material = new MeshStandardNodeMaterial({
     color: 0x9a8c7a,
     roughness: 0.92,
     metalness: 0.0,
     side: DoubleSide,
-    alphaHash: true,
   });
   // splitPx 300 (smaller, gentler LOD steps — affordable after the ~13× meshing
   // speedup); maxDepth 10 caps leaf counts.
@@ -117,7 +117,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     g.setIndex(new BufferAttribute(s.indices, 1));
     return g;
   })();
-  // The backdrop is always fully opaque (no alphaHash — it must never dither).
+  // The backdrop is a plain opaque shell (no morph attribute — it never geomorphs).
   const backdropMaterial = new MeshStandardNodeMaterial({
     color: 0x9a8c7a,
     roughness: 0.92,
@@ -232,7 +232,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
         forward.copy(targetWorld).sub(worldCam).normalize(); // orbit controls always look at target
         // Cone half-angle covering the frustum corners, with a small margin so
         // leaves just off-screen are pre-meshed before rotating in. Tighter now
-        // (1.2) than before — the cross-fade hides reveals, so we mesh a smaller
+        // (1.2) than before — the geomorph hides reveals, so we mesh a smaller
         // ring and keep the queue shallow on fast rotation.
         const halfFov = Math.atan(Math.tan(fovY / 2) * Math.sqrt(1 + aspect * aspect)) * 1.2;
         lookahead.copy(worldCam).addScaledVector(vel, LOOKAHEAD_FRAMES); // generate ahead of motion
@@ -252,7 +252,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // Drain finished meshes onto the GPU under the per-frame budget (the only
       // generation cost in-frame; generation itself ran on the worker pool).
       manager.uploadReady(UPLOAD_PER_FRAME);
-      manager.tick(dt); // advance LOD cross-fades
+      manager.tick(dt); // advance LOD geomorphs
       renderer.render(scene, camera);
     },
     streamInfo(): string {

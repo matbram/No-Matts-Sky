@@ -24,6 +24,13 @@ export interface AABB {
 export interface ExtractedMesh {
   positions: Float32Array; // x,y,z per vertex, RELATIVE to `origin`
   normals: Float32Array; // unit outward normal per vertex
+  /**
+   * Low-detail morph target per vertex (3 per vertex, same order/space as
+   * positions). The render shader lerps morphTarget→positions for a seamless LOD
+   * geomorph: a new leaf is born looking like its coarse parent and grows detail
+   * in. Equals `positions` exactly when the field carries no `cornerMorphPos`.
+   */
+  morphTargets: Float32Array;
   indices: Uint32Array;
   vertexCount: number;
   triangleCount: number;
@@ -41,6 +48,13 @@ export interface SampledField {
   cornerPos: Float64Array;
   /** Unit outward normal per corner (= normalize(−∇D)); 3 per corner, same index. */
   cornerNormal: Float64Array;
+  /**
+   * Optional low-detail corner position (3 per corner, same index as cornerPos).
+   * When present, each emitted vertex also gets a morph target interpolated from
+   * these with the SAME zero-crossings as the base vertex (so it's the same vertex
+   * at a smoother radius) — the geomorph source. Absent → morph target == base.
+   */
+  cornerMorphPos?: Float64Array;
 }
 
 // The 12 cube edges as pairs of local corner indices (L = a | b<<1 | c<<2).
@@ -66,6 +80,9 @@ export function surfaceNets(
   skirtDepth = 0,
 ): ExtractedMesh {
   const { nx, ny, nz, density, cornerPos, cornerNormal } = field;
+  // Morph target source. Absent → reuse cornerPos so morphTargets == positions
+  // exactly (geomorph becomes a no-op).
+  const mp = field.cornerMorphPos ?? cornerPos;
   const cnx = nx + 1;
   const cny = ny + 1;
   const cIdx = (i: number, j: number, k: number): number => i + cnx * (j + cny * k);
@@ -73,6 +90,7 @@ export function surfaceNets(
 
   const cellVert = new Int32Array(nx * ny * nz).fill(-1);
   const pos: number[] = []; // local x,y,z triples
+  const mpos: number[] = []; // local morph-target triples, parallel to pos
   const nrm: number[] = [];
   const d = new Float64Array(8);
 
@@ -97,6 +115,7 @@ export function surfaceNets(
         if (mask === 0 || mask === 0xff) continue;
 
         let sx = 0, sy = 0, sz = 0, cnt = 0;
+        let smx = 0, smy = 0, smz = 0; // morph target: same crossings, same t
         for (const [a, b] of EDGES) {
           const da = d[a]!;
           const db = d[b]!;
@@ -107,6 +126,9 @@ export function surfaceNets(
           sx += cornerPos[ca * 3]! + t * (cornerPos[cb * 3]! - cornerPos[ca * 3]!);
           sy += cornerPos[ca * 3 + 1]! + t * (cornerPos[cb * 3 + 1]! - cornerPos[ca * 3 + 1]!);
           sz += cornerPos[ca * 3 + 2]! + t * (cornerPos[cb * 3 + 2]! - cornerPos[ca * 3 + 2]!);
+          smx += mp[ca * 3]! + t * (mp[cb * 3]! - mp[ca * 3]!);
+          smy += mp[ca * 3 + 1]! + t * (mp[cb * 3 + 1]! - mp[ca * 3 + 1]!);
+          smz += mp[ca * 3 + 2]! + t * (mp[cb * 3 + 2]! - mp[ca * 3 + 2]!);
           cnt++;
         }
         const invc = 1 / cnt;
@@ -118,16 +140,27 @@ export function surfaceNets(
         const lx = wx - origin[0];
         const ly = wy - origin[1];
         const lz = wz - origin[2];
+        const mlx = smx * invc - origin[0];
+        const mly = smy * invc - origin[1];
+        const mlz = smz * invc - origin[2];
         cellVert[cellIdx(i, j, k)] = pos.length / 3;
         pos.push(lx, ly, lz);
+        mpos.push(mlx, mly, mlz);
         nrm.push(nax * nl, nay * nl, naz * nl);
 
+        // Bounds must enclose the mesh at ANY morph value, so include both ends.
         if (lx < minx) minx = lx;
         if (ly < miny) miny = ly;
         if (lz < minz) minz = lz;
         if (lx > maxx) maxx = lx;
         if (ly > maxy) maxy = ly;
         if (lz > maxz) maxz = lz;
+        if (mlx < minx) minx = mlx;
+        if (mly < miny) miny = mly;
+        if (mlz < minz) minz = mlz;
+        if (mlx > maxx) maxx = mlx;
+        if (mly > maxy) maxy = mly;
+        if (mlz > maxz) maxz = mlz;
       }
     }
   }
@@ -187,8 +220,18 @@ export function surfaceNets(
       const sx = lx - wx * iw * skirtDepth;
       const sy = ly - wy * iw * skirtDepth;
       const sz = lz - wz * iw * skirtDepth;
+      // Skirt's morph target: extrude the MORPH vertex inward the same way, so the
+      // curtain stays attached to the surface at every morph value (else the LOD
+      // crack reopens mid-morph).
+      const mlx = mpos[v * 3]!, mly = mpos[v * 3 + 1]!, mlz = mpos[v * 3 + 2]!;
+      const mwx = mlx + origin[0], mwy = mly + origin[1], mwz = mlz + origin[2];
+      const miw = 1 / Math.sqrt(mwx * mwx + mwy * mwy + mwz * mwz + 1e-30);
+      const msx = mlx - mwx * miw * skirtDepth;
+      const msy = mly - mwy * miw * skirtDepth;
+      const msz = mlz - mwz * miw * skirtDepth;
       const si = pos.length / 3;
       pos.push(sx, sy, sz);
+      mpos.push(msx, msy, msz);
       nrm.push(nrm[v * 3]!, nrm[v * 3 + 1]!, nrm[v * 3 + 2]!);
       if (sx < minx) minx = sx;
       if (sy < miny) miny = sy;
@@ -196,6 +239,12 @@ export function surfaceNets(
       if (sx > maxx) maxx = sx;
       if (sy > maxy) maxy = sy;
       if (sz > maxz) maxz = sz;
+      if (msx < minx) minx = msx;
+      if (msy < miny) miny = msy;
+      if (msz < minz) minz = msz;
+      if (msx > maxx) maxx = msx;
+      if (msy > maxy) maxy = msy;
+      if (msz > maxz) maxz = msz;
       skirtOf.set(v, si);
       return si;
     };
@@ -244,6 +293,7 @@ export function surfaceNets(
   return {
     positions: Float32Array.from(pos),
     normals: Float32Array.from(nrm),
+    morphTargets: Float32Array.from(mpos),
     indices: Uint32Array.from(idx),
     vertexCount,
     triangleCount: idx.length / 3,
