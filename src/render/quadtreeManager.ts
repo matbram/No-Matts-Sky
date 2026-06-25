@@ -70,6 +70,14 @@ interface MeshResult {
  */
 const MORPH_START_FRAC = 0.55;
 
+/**
+ * Birth-ease (ms): a newly-live leaf starts at morph=1 (= the parent surface it replaces, so its
+ * appearance is invisible) and eases to its true distance-morph over this long. Hides late-streaming
+ * refinements (which would otherwise snap in already-detailed past their morph-start distance) by
+ * fading them up from the parent. At normal speed distanceMorph≈1 at birth too, so it's a no-op.
+ */
+const BIRTH_MS = 300;
+
 // Skirt depth (m) at a LOD transition, sized to the cross-LOD SURFACE mismatch — NOT
 // the old km-scale "cover everything" curtain that was the visible boundary grid.
 // A coarser neighbour drops this leaf's finest octave, so the gap ≈ height·gain^(oct−1)
@@ -149,6 +157,7 @@ export class QuadtreeManager {
   // position (render space) is mirrored on the CPU only to compute the leaf-CENTRE morph
   // for ?lodmorphdebug/?morphcolor; the actual morph is per-vertex in TSL via cameraPosition.
   private readonly kDistUniform = uniform(0);
+  private readonly uNowUniform = uniform(0); // manager clock (ms) for the per-leaf birth-ease
   private kDist = 0;
   private camX = 0;
   private camY = 0;
@@ -333,6 +342,7 @@ export class QuadtreeManager {
   tick(dtMs: number): void {
     if (this.entries.size === 0) return;
     this.clockMs += dtMs; // resume-safe clock (no Date.now) + the ?lodmorphdebug age base
+    this.uNowUniform.value = this.clockMs; // drive the per-leaf birth-ease (always, even when debug off)
     const dbg = !!this.opts.debugLodMorph;
     const tintMorph = this.opts.debugColor === 'morph';
     if (!dbg && !tintMorph) return; // CDLOD morph is in-shader; nothing else to do
@@ -386,7 +396,11 @@ export class QuadtreeManager {
     let t = (dist - e0) / (dParent - e0);
     if (t < 0) t = 0;
     else if (t > 1) t = 1;
-    return t * t * (3 - 2 * t); // smoothstep
+    const distanceM = t * t * (3 - 2 * t); // smoothstep
+    // Birth-ease floor (mirrors the shader): a fresh leaf reads m=1 (parent) then decays.
+    let birth = 1 - (this.clockMs - e.liveAtMs) / BIRTH_MS;
+    if (birth < 0) birth = 0;
+    return distanceM > birth ? distanceM : birth;
   }
 
   /** ?lodmorphdebug: the sub-camera leaf's depth, morph, distance, and fade band (km). */
@@ -446,10 +460,17 @@ export class QuadtreeManager {
       const e0 = mix(dChild, dParent, MORPH_START_FRAC);
       const dist = positionWorld.distance(cameraPosition); // render space → small floats
       const mFactor = smoothstep(e0, dParent, dist); // 0 near (full) → 1 far (parent)
+      // Birth-ease FLOOR: start at 1 (= the parent surface this leaf replaces → its appearance is
+      // invisible) and decay to the distance-morph over BIRTH_MS, so a refinement that streamed in
+      // LATE (camera already past its morph-start) fades up from the parent instead of snapping in
+      // already-detailed. uBirth is per-leaf (set once here); uNow is one global clock uniform.
+      const uBirth = uniform(this.clockMs);
+      const birthEase = this.uNowUniform.sub(uBirth).div(BIRTH_MS).oneMinus().clamp(0, 1);
+      const mFinal = mFactor.max(birthEase);
       (mat as unknown as NodeMaterialLike).positionNode = mix(
         positionLocal,
         attribute('morphTarget', 'vec3'),
-        mFactor,
+        mFinal,
       );
       // Bias the finer leaf toward the camera so it wins the depth test over a coarser
       // ancestor still retained for the brief moment until purge (surfaces match there, so
