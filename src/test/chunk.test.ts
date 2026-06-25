@@ -320,3 +320,52 @@ describe('meshChunk morph targets (LOD geomorph)', () => {
     expect(fnv1a(m2.morphTargets)).toBe(fnv1a(m2.positions));
   });
 });
+
+describe('cross-face apron (watertight cube-face edges)', () => {
+  // Leaf A on +X (path [1]: u∈[0,1], v∈[-1,0]) and leaf B on +Y (path [2]: u∈[-1,0],
+  // v∈[0,1]) share the +X/+Y cube edge over z∈[-1,0]. Without cross-face wrapping
+  // their surfaces are kilometres apart; the wrap makes A's apron sample B's first
+  // interior row, so the boundary vertices coincide like same-LOD within-face leaves.
+  const A: ChunkRequest = { face: 0, path: [1], lod: 1 };
+  const B: ChunkRequest = { face: 2, path: [2], lod: 1 };
+  const world = (m: ReturnType<typeof meshChunk>): number[][] => {
+    const out: number[][] = [];
+    for (let i = 0; i < m.vertexCount; i++)
+      out.push([
+        m.positions[i * 3]! + m.origin[0],
+        m.positions[i * 3 + 1]! + m.origin[1],
+        m.positions[i * 3 + 2]! + m.origin[2],
+      ]);
+    return out;
+  };
+  // For each A vertex, distance to the nearest B vertex.
+  const nearest = (av: number[][], bv: number[][]): { coincident: number; minGap: number } => {
+    let coincident = 0;
+    let minGap = Infinity;
+    for (const a of av) {
+      let best = Infinity;
+      for (const b of bv) {
+        const d = Math.hypot(a[0]! - b[0]!, a[1]! - b[1]!, a[2]! - b[2]!);
+        if (d < best) best = d;
+      }
+      if (best < 1) coincident++;
+      if (best < minGap) minGap = best;
+    }
+    return { coincident, minGap };
+  };
+
+  it('adjacent leaves on different cube faces share coincident boundary vertices', () => {
+    const a = world(meshChunk(A, RECIPE, R, 16, 10, 0));
+    const b = world(meshChunk(B, RECIPE, R, 16, 10, 0));
+    const { coincident, minGap } = nearest(a, b);
+    // Was kilometres + zero coincident before the wrap; now a shared overlap row.
+    expect(minGap).toBeLessThan(1); // metres, not kilometres
+    expect(coincident).toBeGreaterThan(0);
+  });
+
+  it('is deterministic across runs', () => {
+    const a1 = meshChunk(A, RECIPE, R, 16, 10, 0);
+    const a2 = meshChunk(A, RECIPE, R, 16, 10, 0);
+    expect(fnv1a(a1.positions)).toBe(fnv1a(a2.positions));
+  });
+});

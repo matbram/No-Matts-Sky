@@ -55,6 +55,71 @@ export function faceDirection(faceIndex: number, u: number, v: number): [number,
   return [cx * invLen, cy * invLen, cz * invLen];
 }
 
+/** Face index whose normal is the (axis-aligned, ±1) vector (x,y,z); -1 if none. */
+function faceOfNormal(x: number, y: number, z: number): number {
+  for (let i = 0; i < CUBE_FACES.length; i++) {
+    const n = CUBE_FACES[i]!.normal;
+    if (n[0] === x && n[1] === y && n[2] === z) return i;
+  }
+  return -1; // unreachable for ±1 axis inputs
+}
+
+/**
+ * Map a face-(u,v) that overshoots its [-1,1]² square onto the NEIGHBOUR cube face
+ * it spills onto, returning that face's in-range (u,v). In-range inputs pass through
+ * UNCHANGED (byte-identical — keeps `faceDirection` and the frozen golden meshes the
+ * same for interior samples).
+ *
+ * This is what makes a leaf's 1-cell apron sample the neighbour face's FIRST INTERIOR
+ * ROW across a cube edge, so adjacent faces' leaves share their edge (watertight)
+ * instead of a leaf extrapolating its own plane off the cube (which left a km-scale
+ * seam). An overshoot of `t` past an edge reflects to inward depth `t` on the
+ * neighbour, at the matching along-edge position — NOT the geometric projection of the
+ * same ray (which lands on a non-grid point). The 8 cube corners (both axes out, 3
+ * faces meet, no 4th neighbour) clamp to the corner direction on the same face — a
+ * single apron point, covered by skirts.
+ */
+export function wrapFaceUV(
+  faceIndex: number,
+  u: number,
+  v: number,
+): { face: number; u: number; v: number } {
+  const inU = u >= -1 && u <= 1;
+  const inV = v >= -1 && v <= 1;
+  if (inU && inV) return { face: faceIndex, u, v };
+  if (!inU && !inV) {
+    return { face: faceIndex, u: u < -1 ? -1 : 1, v: v < -1 ? -1 : 1 };
+  }
+  const f = CUBE_FACES[faceIndex]!;
+  let ox: number, oy: number, oz: number; // outward edge axis (a ±unit axis)
+  let t: number; // overshoot past the edge
+  let a: number; // along-edge coordinate on this face
+  let aDir: Vec3; // along-edge axis on this face
+  if (!inU) {
+    const s = u < 0 ? -1 : 1;
+    ox = s * f.uDir[0]; oy = s * f.uDir[1]; oz = s * f.uDir[2];
+    t = Math.abs(u) - 1;
+    a = v; aDir = f.vDir;
+  } else {
+    const s = v < 0 ? -1 : 1;
+    ox = s * f.vDir[0]; oy = s * f.vDir[1]; oz = s * f.vDir[2];
+    t = Math.abs(v) - 1;
+    a = u; aDir = f.uDir;
+  }
+  const b = faceOfNormal(ox, oy, oz);
+  const nb = CUBE_FACES[b]!;
+  // Reflected point in B's tangent plane: (1-t) inward along THIS face's normal
+  // (which is one of B's tangent axes) plus `a` along the shared edge.
+  const qx = (1 - t) * f.normal[0] + a * aDir[0];
+  const qy = (1 - t) * f.normal[1] + a * aDir[1];
+  const qz = (1 - t) * f.normal[2] + a * aDir[2];
+  return {
+    face: b,
+    u: qx * nb.uDir[0] + qy * nb.uDir[1] + qz * nb.uDir[2],
+    v: qx * nb.vDir[0] + qy * nb.vDir[1] + qz * nb.vDir[2],
+  };
+}
+
 /** Plain mesh data — no Three.js types cross this boundary. */
 export interface SphereMesh {
   positions: Float32Array; // x,y,z per vertex

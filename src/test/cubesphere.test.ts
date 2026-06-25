@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildCubeSphere, CUBE_FACES } from '../core/cubesphere.ts';
+import { buildCubeSphere, CUBE_FACES, faceDirection, wrapFaceUV } from '../core/cubesphere.ts';
 import { EARTH_RADIUS_M } from '../core/constants.ts';
 import { fnv1a } from './digest.ts';
 
@@ -168,5 +168,62 @@ describe('buildCubeSphere — determinism (golden)', () => {
         "positions": "9c80cb71",
       }
     `);
+  });
+});
+
+describe('wrapFaceUV — cross-face apron mapping', () => {
+  it('passes in-range (u,v) through unchanged (identity → frozen interior meshes)', () => {
+    for (let f = 0; f < 6; f++) {
+      const r = wrapFaceUV(f, 0.3, -0.7);
+      expect(r.face).toBe(f);
+      expect(r.u).toBe(0.3);
+      expect(r.v).toBe(-0.7);
+    }
+  });
+
+  it('maps known edges to the neighbour face (verified table)', () => {
+    const t = 0.1; // overshoot → inward 1-t = 0.9
+    const a = 0.4;
+    const near = (r: { face: number; u: number; v: number }, fc: number, u: number, v: number): void => {
+      expect(r.face).toBe(fc);
+      expect(r.u).toBeCloseTo(u, 12);
+      expect(r.v).toBeCloseTo(v, 12);
+    };
+    near(wrapFaceUV(0, 1 + t, a), 2, a, 1 - t); // +X u+ → +Y
+    near(wrapFaceUV(1, 1 + t, a), 4, -(1 - t), a); // -X u+ → +Z (sign flip)
+    near(wrapFaceUV(2, a, 1 + t), 0, 1 - t, a); // +Y v+ → +X (v-edge)
+    near(wrapFaceUV(4, a, -1 - t), 3, a, 1 - t); // +Z v- → -Y
+  });
+
+  it('clamps cube corners (both axes out) to a finite unit direction on the same face', () => {
+    for (let f = 0; f < 6; f++) {
+      const r = wrapFaceUV(f, 1.1, 1.1);
+      expect(r.face).toBe(f);
+      expect(r.u).toBe(1);
+      expect(r.v).toBe(1);
+      const d = faceDirection(r.face, r.u, r.v);
+      const len = Math.hypot(d[0], d[1], d[2]);
+      expect(Number.isFinite(len)).toBe(true);
+      expect(len).toBeCloseTo(1, 12);
+    }
+  });
+
+  it('is continuous at every edge (t→0 wrap == the in-range edge direction)', () => {
+    const eps = 1e-7;
+    const wd = (f: number, u: number, v: number): [number, number, number] => {
+      const w = wrapFaceUV(f, u, v);
+      return faceDirection(w.face, w.u, w.v);
+    };
+    const close = (x: [number, number, number], y: [number, number, number]): void => {
+      expect(Math.hypot(x[0] - y[0], x[1] - y[1], x[2] - y[2])).toBeLessThan(1e-5);
+    };
+    for (let f = 0; f < 6; f++) {
+      for (const a of [-0.6, 0.0, 0.35]) {
+        close(wd(f, 1 + eps, a), faceDirection(f, 1, a)); // u+
+        close(wd(f, -1 - eps, a), faceDirection(f, -1, a)); // u-
+        close(wd(f, a, 1 + eps), faceDirection(f, a, 1)); // v+
+        close(wd(f, a, -1 - eps), faceDirection(f, a, -1)); // v-
+      }
+    }
   });
 });

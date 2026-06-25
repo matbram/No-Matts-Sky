@@ -13,7 +13,7 @@
 // the floating-origin seam (Step 4) without the per-frame machinery yet.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { faceDirection } from './cubesphere.ts';
+import { faceDirection, wrapFaceUV } from './cubesphere.ts';
 import { terrainAt, assembleDensity, type TerrainRecipe } from './density.ts';
 import { surfaceNets, type AABB, type SampledField } from './surfacenets.ts';
 
@@ -136,7 +136,12 @@ export function meshChunk(
     const v = v0 + dv * j;
     for (let i = 0; i < cnx; i++) {
       const ci = j * cnx + i;
-      const dir = faceDirection(req.face, u0 + du * i, v);
+      // Apron columns that overshoot this face's [-1,1]² are wrapped onto the
+      // neighbour cube face's first interior row, so face-edge leaves share their
+      // edge with the adjacent face (watertight). Interior columns pass through
+      // unchanged (identity), so interior meshes are bit-identical.
+      const w = wrapFaceUV(req.face, u0 + du * i, v);
+      const dir = faceDirection(w.face, w.u, w.v);
       colDir[ci * 3] = dir[0];
       colDir[ci * 3 + 1] = dir[1];
       colDir[ci * 3 + 2] = dir[2];
