@@ -70,6 +70,14 @@ const WALK_CONE_MARGIN = 1.4;
 // cone follows the look direction (translation alone would leave stale/blank tiles
 // after a turn). Kept under the cone's slack so the frustum never outruns the cut.
 const RECUT_ROT_COS = Math.cos((20 * Math.PI) / 180);
+// Time-based recut floor: while the camera is MOVING, re-cut at least this often even if it
+// hasn't crossed recutDist. At altitude recutDist is ~2% of distance (hundreds of km), so a
+// SLOW descent could hold a stale cut for many seconds, then jump — a wave. A periodic recut
+// keeps the leaf set tracking continuously (the per-vertex morph is already per-frame; this
+// just keeps the SET fresh). Gated on actual movement so a still camera never recuts (and the
+// headless settle check still settles). Fast motion crosses recutDist first → this is a no-op.
+const RECUT_MAX_MS = 400;
+const RECUT_MIN_MOVE_M = 1;
 // Walk-mode split threshold (px). Wider than fly's 300 so the now-graded LOD (which
 // places ~150 leaves per level) stays within budget at the finer MAX_DEPTH: the
 // nearest ground is still meshed to MAX_DEPTH (it projects far over this), only the
@@ -329,6 +337,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // big re-cut (preset switch / entering walk) so each fills fast. See BURST_PER_FRAME.
   let firstFillDone = false;
   const lastCutPos = new Vector3();
+  let lastCutTime = 0; // performance.now() of the last recut (time-based recut floor)
   const lastCutForward = new Vector3(); // walk: look dir at the last cut (recut-on-rotation)
   const prevWorldCam = new Vector3();
   // Speed-aware prefetch: smoothed rate (m/s) at which the camera is closing on the planet
@@ -615,7 +624,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
         player!.getForward(forward); // look direction (render space == world)
         turned = forward.dot(lastCutForward) < RECUT_ROT_COS;
       }
-      if (forceCut || moved > recutDist || turned) {
+      // Time-based recut floor: keep the leaf set tracking a slow descent continuously when
+      // recutDist (huge at altitude) wouldn't trip for many seconds. Only while actually moving.
+      const timeRecut = moved > RECUT_MIN_MOVE_M && now - lastCutTime > RECUT_MAX_MS;
+      if (forceCut || moved > recutDist || turned || timeRecut) {
         let halfFov: number;
         let splitPxOverride: number | undefined;
         if (ctrlMode) {
@@ -651,6 +663,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
           prefetchM,
         );
         lastCutPos.copy(worldCam);
+        lastCutTime = now;
         forceCut = false;
       }
       // Drain finished meshes onto the GPU under the per-frame budget (the only
