@@ -29,6 +29,7 @@ import {
   nodeBounds,
   lodBoundRadius,
   retainedShouldRemove,
+  isPathPrefix,
   type CameraView,
   type QuadNode,
 } from '../core/quadtree.ts';
@@ -52,6 +53,7 @@ interface Entry {
   morph: number; // CDLOD morph at the leaf CENTER (0=full near .. 1=parent far) — debug/HUD only
   needsSkirt: boolean; // does any edge lack a same-LOD neighbour in the cut?
   liveAtMs: number; // manager clock when this leaf went live (for ?lodmorphdebug age)
+  reqAtMs: number; // manager clock when this leaf was requested (pending) — for stream latency
 }
 interface MeshResult {
   id: number;
@@ -133,6 +135,14 @@ export class QuadtreeManager {
   private lodMorphLogN = 0;
   private maxNbrDelta = 0;
   private morphSummary = '';
+  // Per-cut stream diagnostics (?lodmorphdebug): fresh = a leaf that appeared with NO covering
+  // ancestor/descendant (over the backdrop → a visible pop CDLOD can't hide); refine = a swap a
+  // retained coarser leaf morph-hid; reqLat = request→live latency (how late detail arrived).
+  private freshThisCut = 0;
+  private refineThisCut = 0;
+  private reqLatSum = 0;
+  private reqLatMax = 0;
+  private reqLatN = 0;
   // CDLOD geomorph: one shared uniform = (viewportHeight/(2·tan(fovY/2)))/splitPx — the
   // same projected-size constant selectCut uses, so the per-vertex distance morph band
   // aligns with the split distance (set per frame by the render shell). The camera world
@@ -193,7 +203,13 @@ export class QuadtreeManager {
    * mesh first.
    */
   update(camera: CameraView, lookahead: [number, number, number], splitPx?: number): void {
-    this.uploadedThisCut = 0; // count leaves streamed in for THIS cut (?lodmorphdebug)
+    // Reset per-cut ?lodmorphdebug counters (accumulated as this cut's leaves stream in).
+    this.uploadedThisCut = 0;
+    this.freshThisCut = 0;
+    this.refineThisCut = 0;
+    this.reqLatSum = 0;
+    this.reqLatMax = 0;
+    this.reqLatN = 0;
     const cut = selectCut(camera, {
       radius: this.radius,
       heightMargin: this.heightMargin,
@@ -217,6 +233,7 @@ export class QuadtreeManager {
           morph: 0,
           needsSkirt: true, // set below from the full cut, before dispatch
           liveAtMs: 0,
+          reqAtMs: this.clockMs, // for ?lodmorphdebug request→live stream latency
         });
       }
     }
@@ -339,13 +356,16 @@ export class QuadtreeManager {
     }
     if (dbg) {
       const avg = mid > 0 ? sum / mid : 0;
-      const newestAge = newestLive >= 0 ? (this.clockMs - newestLive) | 0 : 0;
-      this.morphSummary = `morph midDist=${mid} avg=${avg.toFixed(2)} new=${newestAge}ms maxNbrΔ=${this.maxNbrDelta}`;
+      const latAvg = this.reqLatN > 0 ? (this.reqLatSum / this.reqLatN) | 0 : 0;
+      this.morphSummary =
+        `morph midDist=${mid} avg=${avg.toFixed(2)} fresh=${this.freshThisCut} reqLat=${latAvg}ms maxNbrΔ=${this.maxNbrDelta}`;
       if (++this.lodMorphLogN % 10 === 0) {
         console.log(
           `[NMS morph] live=${live} midDist=${mid} m[min=${mid ? mn.toFixed(2) : '-'} ` +
             `avg=${avg.toFixed(2)} max=${mid ? mx.toFixed(2) : '-'}] ` +
-            `newest=${newestAge}ms uploads/cut=${this.uploadedThisCut} maxNbrΔ=${this.maxNbrDelta}`,
+            `fresh=${this.freshThisCut} refine=${this.refineThisCut} ` +
+            `reqLat[avg=${latAvg} max=${this.reqLatMax | 0}]ms ` +
+            `uploads/cut=${this.uploadedThisCut} maxNbrΔ=${this.maxNbrDelta} ${this.nearLeafStr()}`,
         );
       }
     }
@@ -369,9 +389,31 @@ export class QuadtreeManager {
     return t * t * (3 - 2 * t); // smoothstep
   }
 
+  /** ?lodmorphdebug: the sub-camera leaf's depth, morph, distance, and fade band (km). */
+  private nearLeafStr(): string {
+    const { face, u, v } = this.faceUVOf(this.camX, this.camY, this.camZ);
+    let best: Entry | null = null;
+    for (const e of this.entries.values()) {
+      if (e.status !== 'live' || e.node.face !== face) continue;
+      const r = uvRectFromPath(e.node.path);
+      if (u < r.u0 || u > r.u1 || v < r.v0 || v > r.v1) continue;
+      if (!best || e.node.path.length > best.node.path.length) best = e;
+    }
+    if (!best) return 'near[none]';
+    const depth = best.node.path.length;
+    const dx = best.center[0] - this.camX, dy = best.center[1] - this.camY, dz = best.center[2] - this.camZ;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const dChild = 2 * lodBoundRadius(depth, this.radius) * this.kDist;
+    const dParent = 2 * lodBoundRadius(depth > 0 ? depth - 1 : 0, this.radius) * (depth > 0 ? this.kDist : 2 * this.kDist);
+    return `near[d=${depth} m=${this.centerMorph(best).toFixed(2)} dist=${(dist / 1000).toFixed(1)}km band=${(dChild / 1000).toFixed(1)}..${(dParent / 1000).toFixed(1)}km]`;
+  }
+
   /** Upload up to `budget` finished meshes to the GPU this frame; returns how many. */
   uploadReady(budget: number): number {
     let n = 0;
+    const dbg = !!this.opts.debugLodMorph;
+    let freshThisFrame = 0; // fresh-over-backdrop appearances this frame (a visible pop)
+    let freshDepthMin = 99, freshDepthMax = -1;
     while (n < budget && this.readyQueue.length > 0) {
       const key = this.readyQueue.shift()!;
       const e = this.entries.get(key);
@@ -421,6 +463,31 @@ export class QuadtreeManager {
         m.origin[1] - this.renderOrigin[1],
         m.origin[2] - this.renderOrigin[2],
       );
+      if (dbg) {
+        // Classify the appearance: REFINE = a LIVE ancestor/descendant on this face already
+        // covers the spot (the morph hides the swap); FRESH = nothing did → it appears over the
+        // backdrop, the one pop CDLOD can't hide. Plus request→live stream latency. (self is
+        // still 'ready' here, so it's excluded.)
+        let covered = false;
+        for (const o of this.entries.values()) {
+          if (o.status !== 'live' || o.node.face !== e.node.face) continue;
+          if (isPathPrefix(o.node.path, e.node.path) || isPathPrefix(e.node.path, o.node.path)) {
+            covered = true;
+            break;
+          }
+        }
+        if (covered) this.refineThisCut++;
+        else {
+          this.freshThisCut++;
+          freshThisFrame++;
+          if (depth < freshDepthMin) freshDepthMin = depth;
+          if (depth > freshDepthMax) freshDepthMax = depth;
+        }
+        const lat = this.clockMs - e.reqAtMs;
+        this.reqLatSum += lat;
+        this.reqLatN++;
+        if (lat > this.reqLatMax) this.reqLatMax = lat;
+      }
       e.mesh = mesh;
       e.mat = mat;
       e.center = m.origin;
@@ -431,6 +498,11 @@ export class QuadtreeManager {
       this.uploadedThisCut++;
       this.scene.add(mesh);
       n++;
+    }
+    // A fresh leaf appears over the backdrop with nothing to morph from — the residual pop.
+    // Log it the frame it happens so the user can correlate it with what they see.
+    if (dbg && freshThisFrame > 0) {
+      console.log(`[NMS pop] fresh=${freshThisFrame} depth=${freshDepthMin}..${freshDepthMax} (appeared over backdrop)`);
     }
     // A freshly-live leaf already renders at its correct CDLOD distance-morph (≈ parent at
     // the split distance), so any coarse ancestor it now covers can be dropped immediately.
