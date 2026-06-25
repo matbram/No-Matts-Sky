@@ -4,6 +4,7 @@ import {
   terrainAt,
   assembleDensity,
   sliceTerrainRecipe,
+  lodOctaves,
   type TerrainRecipe,
 } from '../core/density.ts';
 import { meshChunk, uvRectFromPath, chunkKey, type ChunkRequest } from '../core/chunk.ts';
@@ -116,6 +117,76 @@ describe('chunk apron (seamless same-LOD neighbors)', () => {
       const b = faceDirection(face, u0B + duB * 1, v0B + dvB * j); // [1] edge col
       expect(Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2])).toBeLessThan(1e-9);
     }
+  });
+});
+
+describe('cross-LOD apron gap (the crack adaptive octaves reopened)', () => {
+  // Same-LOD neighbours coincide at a shared edge (the apron test above). But a leaf
+  // and its COARSER neighbour now sample that edge with DIFFERENT octave counts
+  // (lodOctaves grows one octave per level), so their surfaces land at DIFFERENT
+  // radii there — the crack that exposes the inset backdrop at grazing walk angles.
+  // This pins the magnitude (≈ the dropped octave's amplitude) and proves a skirt
+  // sized to it covers the gap. Mirrors the regime fixed by shallow conditioned skirts.
+  const scale = RECIPE.noiseScale;
+  // Local mirror of the manager's skirt safety factor (render-side; not importable
+  // here without pulling in three.js). Kept in sync with quadtreeManager SKIRT_SAFETY.
+  const SKIRT_SAFETY = 4;
+
+  it('different LODs place the shared edge at different radii, and a skirt covers it', () => {
+    const coarseLod = 1;
+    const fineLod = 2;
+    const octC = lodOctaves(RECIPE, coarseLod); // 5
+    const octF = lodOctaves(RECIPE, fineLod); // 6
+    expect(octF).toBe(octC + 1); // adjacent levels differ by exactly one octave
+
+    // Sample the shared u=0 edge of face 2 over the finer leaf's overlap v∈[-1,-0.5];
+    // measure the radial gap between the coarse (octC) and fine (octF) surfaces.
+    const tC = new Float64Array(4);
+    const tF = new Float64Array(4);
+    let maxGap = 0;
+    for (let s = 0; s <= 32; s++) {
+      const v = -1 + (0.5 * s) / 32;
+      const d = faceDirection(2, 0, v);
+      terrainAt(RECIPE, d[0] * scale, d[1] * scale, d[2] * scale, tC, undefined, octC);
+      terrainAt(RECIPE, d[0] * scale, d[1] * scale, d[2] * scale, tF, undefined, octF);
+      maxGap = Math.max(maxGap, Math.abs(RECIPE.height * (tF[0]! - tC[0]!)));
+    }
+
+    // The bug: the surfaces are metres apart at the shared edge — NOT coincident like
+    // same-LOD neighbours (which agree to < 1e-9 in direction → sub-mm at Earth scale).
+    expect(maxGap).toBeGreaterThan(1);
+    // …but bounded by the dropped octave's amplitude → it IS the octave mismatch, not
+    // a structural hole. (height·gain^(octC-1) is a generous per-octave upper bound.)
+    expect(maxGap).toBeLessThan(RECIPE.height * RECIPE.gain ** (octC - 1) * 2);
+
+    // The skirt the manager hangs on the (finer) leaf is the SMALLER of the two sides'
+    // curtains; even it exceeds the gap, so the crack is bridged from at least one side.
+    const skirtFine = SKIRT_SAFETY * RECIPE.height * RECIPE.gain ** (octF - 1);
+    expect(skirtFine).toBeGreaterThan(maxGap);
+  });
+
+  it('the gap shrinks geometrically with depth (deepest leaves are crack-free)', () => {
+    // Each level deeper halves the finest-octave amplitude (gain 0.5), so the gap is
+    // largest at coarse transitions and negligible near the player; lod 11–15 clamp to
+    // OCT_MAX and share an octave count → zero gap (mutually watertight, no skirts).
+    const gapAt = (coarseLod: number): number => {
+      const octC = lodOctaves(RECIPE, coarseLod);
+      const octF = lodOctaves(RECIPE, coarseLod + 1);
+      const tC = new Float64Array(4);
+      const tF = new Float64Array(4);
+      let g = 0;
+      for (let s = 0; s <= 16; s++) {
+        const v = -1 + (0.5 * s) / 16;
+        const d = faceDirection(2, 0, v);
+        terrainAt(RECIPE, d[0] * scale, d[1] * scale, d[2] * scale, tC, undefined, octC);
+        terrainAt(RECIPE, d[0] * scale, d[1] * scale, d[2] * scale, tF, undefined, octF);
+        g = Math.max(g, Math.abs(RECIPE.height * (tF[0]! - tC[0]!)));
+      }
+      return g;
+    };
+    expect(gapAt(2)).toBeLessThan(gapAt(1)); // deeper → smaller crack
+    // At/above OCT_MAX both leaves share the same octave count → no surface mismatch.
+    expect(gapAt(14)).toBe(0); // lodOctaves(14)==lodOctaves(15)==OCT_MAX
   });
 });
 

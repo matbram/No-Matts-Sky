@@ -25,7 +25,7 @@ import {
 } from '../core/quadtree.ts';
 import { chunkKey, uvRectFromPath, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
 import { faceDirection } from '../core/cubesphere.ts';
-import type { TerrainRecipe } from '../core/density.ts';
+import { lodOctaves, type TerrainRecipe } from '../core/density.ts';
 
 /** A TSL uniform node carrying a single float (the per-leaf morph factor). */
 type MorphUniform = ReturnType<typeof uniform>;
@@ -54,6 +54,16 @@ interface MeshResult {
 
 /** LOD geomorph duration (ms): detail morphs in over this long instead of snapping. */
 const MORPH_MS = 350;
+
+// Skirt depth (m) at a LOD transition, sized to the cross-LOD SURFACE mismatch — NOT
+// the old km-scale "cover everything" curtain that was the visible boundary grid.
+// A coarser neighbour drops this leaf's finest octave, so the gap ≈ height·gain^(oct−1)
+// (the dropped octave's amplitude); SKIRT_SAFETY bridges it, clamped so the curtain is
+// never thinner than a sub-metre crack nor deep enough to reach the inset backdrop
+// (which sits height·1.05 below the surface). lodOctaves matches the mesher exactly.
+const SKIRT_SAFETY = 4;
+const SKIRT_MIN_M = 2;
+const SKIRT_MAX_M = 12_000;
 
 /**
  * Quantized world directions of a leaf's 4 edge MIDPOINTS. Two same-LOD neighbours
@@ -353,11 +363,15 @@ export class QuadtreeManager {
       const id = this.nextId++;
       this.jobKey.set(id, key);
       const depth = e.node.path.length;
-      const leafTangential = ((this.radius * Math.PI) / 2) / 2 ** depth;
       // needsSkirt is false unless skirts are enabled AND this edge lacks a same-LOD
-      // neighbour, so by default skirtDepth is 0 (no skirts → no boundary grid).
+      // neighbour, so non-transition leaves (incl. everything underfoot, where all
+      // leaves clamp to OCT_MAX and are mutually watertight) get skirtDepth 0 — no grid.
+      const oct = lodOctaves(this.recipe, depth);
       const skirtDepth = e.needsSkirt
-        ? Math.max(this.recipe.height * 0.25, Math.min(this.recipe.height * 2, leafTangential * 0.04))
+        ? Math.min(
+            SKIRT_MAX_M,
+            Math.max(SKIRT_MIN_M, SKIRT_SAFETY * this.recipe.height * this.recipe.gain ** (oct - 1)),
+          )
         : 0;
       const job: MeshJob & { id: number } = {
         id,

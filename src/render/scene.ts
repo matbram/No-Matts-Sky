@@ -72,6 +72,12 @@ const WALK_SPLIT_PX = 420;
 // Finished meshes uploaded to the GPU per frame (slice spec §7 — the only
 // generation cost allowed in the frame). The rest queue and drain over frames.
 const UPLOAD_PER_FRAME = 4;
+// While the view is still filling (first load / preset switch / entering walk), upload
+// more per frame: the screen is incomplete so a brief hitch is invisible, and it cuts
+// the "terrain develops over a few seconds" pop-in from ~3 s (639 leaves / 4) to
+// <~0.5 s. Reverts to UPLOAD_PER_FRAME once first coverage is reached, so steady-state
+// in-flight LOD changes never hitch.
+const BURST_PER_FRAME = 24;
 // How far ahead of the camera (in per-frame velocity units) to prioritize work.
 const LOOKAHEAD_FRAMES = 30;
 
@@ -133,7 +139,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     wire: params.has('wire'),
     lodcolor: params.has('lodcolor'),
     skirtcolor: params.has('skirtcolor'),
-    skirt: params.has('skirt'), // skirts are OFF by default now; ?skirt re-enables them
+    noskirt: params.has('noskirt'), // skirts are ON by default now; ?noskirt disables for A/B
     dark: params.has('dark'),
   });
 
@@ -178,9 +184,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const manager = new QuadtreeManager(scene, material, recipe, R, {
     splitPx: 300,
     maxDepth: MAX_DEPTH,
-    // Skirts OFF by default — the apron covers LOD-transition holes and the skirts were
-    // the visible boundary grid (?noskirt confirmed clean). ?skirt re-enables for A/B.
-    skirts: params.has('skirt'),
+    // Skirts ON by default — the LOD-adaptive octaves (lodOctaves) make a leaf and its
+    // COARSER neighbour sample their shared edge with different octave counts, so the
+    // apron no longer makes those edges coincide and the crack exposed the inset backdrop
+    // at grazing walk angles. Skirts are now sized to that ~m-scale mismatch (not the old
+    // km curtains) and conditioned to LOD-transition edges only. ?noskirt disables for A/B.
+    skirts: !params.has('noskirt'),
     // debug tint: 'lod' colors leaves by LOD level, 'skirt' highlights skirted leaves
     debugColor: params.has('lodcolor') ? 'lod' : params.has('skirtcolor') ? 'skirt' : undefined,
   });
@@ -254,6 +263,9 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   let renderOrigin = new Vector3(0, 0, 0);
   let targetWorld = new Vector3(0, 0, 0);
   let forceCut = true;
+  // Burst the GPU upload until the view first reaches full coverage; reset on every
+  // big re-cut (preset switch / entering walk) so each fills fast. See BURST_PER_FRAME.
+  let firstFillDone = false;
   const lastCutPos = new Vector3();
   const lastCutForward = new Vector3(); // walk: look dir at the last cut (recut-on-rotation)
   const prevWorldCam = new Vector3();
@@ -273,6 +285,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     controls.update();
     prevWorldCam.copy(p.cam);
     forceCut = true;
+    firstFillDone = false; // burst-fill the new view, then settle
   }
   applyPreset(presets.orbit!);
 
@@ -310,6 +323,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     player.getQuaternion(camera.quaternion);
     mode = 'walk';
     forceCut = true;
+    firstFillDone = false; // burst-fill the spawn area, then settle to UPLOAD_PER_FRAME
     canvas.focus(); // keyboard focus → WASD works immediately (no click needed)
   }
   // Request pointer lock, swallowing the promise rejection browsers throw if it's
@@ -473,8 +487,14 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
         forceCut = false;
       }
       // Drain finished meshes onto the GPU under the per-frame budget (the only
-      // generation cost in-frame; generation itself ran on the worker pool).
-      manager.uploadReady(UPLOAD_PER_FRAME);
+      // generation cost in-frame; generation itself ran on the worker pool). Burst the
+      // budget until the view first reaches full coverage (incomplete screen → hitch
+      // invisible), then settle to UPLOAD_PER_FRAME for hitch-free steady state.
+      manager.uploadReady(firstFillDone ? UPLOAD_PER_FRAME : BURST_PER_FRAME);
+      if (!firstFillDone) {
+        const s = manager.stats();
+        if (s.live > 0 && s.pending === 0 && s.inflight === 0 && s.ready === 0) firstFillDone = true;
+      }
       manager.tick(dt); // advance LOD geomorphs
       renderer.render(scene, camera);
     },
