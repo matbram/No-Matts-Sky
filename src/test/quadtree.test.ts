@@ -155,6 +155,29 @@ describe('selectCut', () => {
     expect(cut.length).toBeLessThanOrEqual(opts.maxLeaves ?? 4096);
   });
 
+  it('always-resident base: baseDepth=0 unchanged; baseDepth>0 tiles the whole sphere', () => {
+    const base = selectCut(near, opts);
+    // baseDepth=0 ⇒ byte-identical to the plain cut (default/determinism guard).
+    expect(selectCut(near, { ...opts, baseDepth: 0 }).map(keyOf)).toEqual(base.map(keyOf));
+    const pinned = selectCut(near, { ...opts, baseDepth: 2 });
+    // The far side is now COVERED (the plain cut horizon-culls it — see the test above), so a
+    // region rotating/streaming in always has a real coarse parent to morph from (no pop).
+    const hasFarSide = pinned.some((n) => {
+      const c = nodeBounds(n.face, n.path, R, 0).center;
+      return dot(norm(c), surfaceDir) < -0.5; // antipodal hemisphere
+    });
+    expect(hasFarSide).toBe(true);
+    // The complete base tiling is present: every leaf is at least baseDepth deep, and all
+    // 6·4² = 96 depth-2 cells are covered (resident base leaf on the far side OR refined near).
+    expect(Math.min(...pinned.map((n) => n.path.length))).toBeGreaterThanOrEqual(2);
+    const baseCells = new Set(pinned.map((n) => `${n.face}/${n.path.slice(0, 2).join('')}`));
+    expect(baseCells.size).toBe(6 * 16);
+    // The base doesn't suppress near-field refinement — the cut still goes deep under the camera.
+    expect(Math.max(...pinned.map((n) => n.path.length))).toBeGreaterThanOrEqual(6);
+    // Bounded: the pinned base adds only the far-side coverage, staying well under the cap.
+    expect(pinned.length).toBeLessThanOrEqual(opts.maxLeaves ?? 4096);
+  });
+
   it('speed-aware prefetch requests a finer/earlier cut; prefetchM=0 is unchanged', () => {
     const base = selectCut(near, opts);
     // prefetchM=0 ⇒ byte-identical to a plain screen-space-error cut (determinism guard:

@@ -56,6 +56,19 @@ export interface SelectOpts {
    * deterministic decision layer (the canonical generation core is untouched).
    */
   prefetchM?: number;
+  /**
+   * Always-resident coarse base depth. The coarsest `baseDepth` levels are NEVER culled,
+   * so the WHOLE sphere is always tiled at (at least) this depth — every region keeps a
+   * covering leaf even on the far side / off-cone. That leaf is the real CDLOD parent a
+   * finer leaf morphs FROM when a region rotates or streams in, so detail only sharpens
+   * (no "fresh over backdrop" pop the morph can't hide). Nodes shallower than baseDepth
+   * force-split (build the full base tiling); a node AT baseDepth that culling would drop,
+   * or that the screen-space error doesn't refine, becomes a resident base leaf. `0`
+   * (default) ⇒ no pinned base ⇒ byte-identical to the plain cut (determinism guard). The
+   * partition is preserved — a refined base node is replaced by its children and purged as
+   * usual, so there's no permanent coarse/fine overlap (no poke-through). [T] tune cost.
+   */
+  baseDepth?: number;
 }
 
 /** The 4 children of a node (quadrant order 0..3 — see uvRectFromPath). */
@@ -227,12 +240,29 @@ export function selectCut(camera: CameraView, opts: SelectOpts): QuadNode[] {
   const cosHalf = useCone ? Math.cos(halfFov!) : 0;
   const sinHalf = useCone ? Math.sin(halfFov!) : 0;
   const prefetchM = opts.prefetchM ?? 0; // speed-aware lead distance for the split test
+  const baseDepth = opts.baseDepth ?? 0; // always-resident coarse base (0 = off → unchanged)
 
   while (stack.length > 0) {
     const node = stack.pop()!;
+    const depth = node.path.length;
+    // Always-resident coarse base: the coarsest `baseDepth` levels are never culled, so the
+    // whole sphere stays meshed at low detail and every finer leaf has a real parent to morph
+    // from. Below baseDepth force-split to build the full base tiling (no SSE/cull gate).
+    if (depth < baseDepth) {
+      for (const child of childrenOf(node)) stack.push(child);
+      continue;
+    }
     const b = nodeBounds(node.face, node.path, opts.radius, opts.heightMargin);
-    if (cullH && overHorizonCos(b, camera.position, pc, cosThetaH, sinThetaH)) continue;
-    if (useCone && outsideConeCos(b, camera.position, forward!, cosHalf, sinHalf)) continue;
+    // A node at the base level that culling would drop becomes a RESIDENT base leaf (keeps
+    // the far side / off-cone always covered); deeper culled nodes are dropped as before.
+    // With baseDepth=0 this is the original behaviour exactly (culled depth-0 roots drop).
+    if (
+      (cullH && overHorizonCos(b, camera.position, pc, cosThetaH, sinThetaH)) ||
+      (useCone && outsideConeCos(b, camera.position, forward!, cosHalf, sinHalf))
+    ) {
+      if (baseDepth > 0 && depth === baseDepth) leaves.push(node);
+      continue;
+    }
 
     const dx = camera.position[0] - b.center[0];
     const dy = camera.position[1] - b.center[1];
@@ -265,5 +295,32 @@ export function selectCut(camera: CameraView, opts: SelectOpts): QuadNode[] {
       leaves.push(node);
     }
   }
+
+  // Always-resident base completeness. Force-splitting guarantees every leaf is ≥ baseDepth
+  // deep, but a base cell that's PARTIALLY in-cone can split and then have ALL its children
+  // culled (a frustum-edge sliver) → its region ends up with no leaf, which the backdrop
+  // would show through = the very pop we're removing. Backfill any base cell not covered by
+  // a leaf with a resident leaf, so the whole sphere is guaranteed tiled at baseDepth.
+  if (baseDepth > 0) {
+    const covered = new Set<string>();
+    for (const lf of leaves) covered.add(`${lf.face}/${lf.path.slice(0, baseDepth).join(',')}`);
+    for (let f = 0; f < 6; f++) {
+      for (const path of baseCellPaths(baseDepth)) {
+        if (!covered.has(`${f}/${path.join(',')}`)) leaves.push({ face: f, path: path.slice() });
+      }
+    }
+  }
   return leaves;
+}
+
+// All quadrant paths of length `depth` (the complete depth-`depth` tiling of one face):
+// 4^depth paths over {0,1,2,3}. Used to backfill any uncovered always-resident base cell.
+function baseCellPaths(depth: number): number[][] {
+  let paths: number[][] = [[]];
+  for (let d = 0; d < depth; d++) {
+    const next: number[][] = [];
+    for (const p of paths) for (let q = 0; q < 4; q++) next.push([...p, q]);
+    paths = next;
+  }
+  return paths;
 }

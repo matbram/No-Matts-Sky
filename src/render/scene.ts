@@ -57,6 +57,12 @@ const SURFACE_DIR = new Vector3(0.2, 1, 0.15).normalize();
 // Paired with LOD-adaptive octaves (density.lodOctaves) so the fine cells actually
 // carry meter-scale content. [T] dial DOWN (15→14→…) if the surface drops below 60 fps.
 const MAX_DEPTH = 15;
+// Always-resident coarse base depth. The whole sphere is kept meshed at this depth (6·4^d
+// leaves: depth 2 = 96, ~half always-resident on the far side) with NO horizon/cone cull,
+// so every finer leaf morphs from a real parent — detail sharpens in, no "fresh over
+// backdrop" pop when a region rotates/streams into view. Bounded + cheap; [T] dial down to
+// 1 (24 leaves) for more headroom, up for a finer always-present base (more far-side mesh).
+const BASE_DEPTH = 2;
 // Walk-mode forward-cone half-angle multiplier over the frustum corners (a touch
 // wider than fly's 1.2 so a turn has slack before the recut-on-rotation fires).
 const WALK_CONE_MARGIN = 1.4;
@@ -219,6 +225,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const manager = new QuadtreeManager(scene, material, recipe, R, {
     splitPx: FLY_SPLIT_PX,
     maxDepth: MAX_DEPTH,
+    // Always-resident coarse base: the whole sphere stays meshed at BASE_DEPTH so every
+    // finer leaf morphs from a real parent (no fresh-over-backdrop pop). The static inset
+    // backdrop stays as the ultimate below-everything filler (startup / frustum-edge gaps).
+    baseDepth: BASE_DEPTH,
     // Skirts OFF by default — they read as a boundary-line grid (the inward curtain is
     // mis-lit / visible at LOD transitions), which is what ?noskirt was working around.
     // The apron covers same-LOD edges; the residual cross-LOD cracks the adaptive octaves

@@ -109,6 +109,10 @@ function edgeKeys(node: QuadNode): string[] {
 export interface ManagerOpts {
   splitPx: number;
   maxDepth: number;
+  // Always-resident coarse base: pin the coarsest `baseDepth` levels live across the WHOLE
+  // sphere (no horizon/cone cull) so every finer leaf morphs from a real parent → no
+  // fresh-over-backdrop pop when a region rotates/streams in. 0 = off. See SelectOpts.baseDepth.
+  baseDepth?: number;
   workers?: number; // pool size (default: min(6, cores-1))
   skirts?: boolean; // enable LOD-transition skirts (default OFF — the apron already covers
   // holes at LOD transitions, and the skirts were the visible boundary grid; ?skirt re-enables)
@@ -271,6 +275,9 @@ export class QuadtreeManager {
       // Speed-aware prefetch: request finer leaves early so the CDLOD morph fades them
       // in continuously (no late snap). approachSpeed·leadTime is computed render-side.
       prefetchM,
+      // Always-resident coarse base — keep the whole sphere meshed at low detail so every
+      // refinement has a real parent to morph from (no backdrop pop). 0 = off.
+      baseDepth: this.opts.baseDepth ?? 0,
     });
 
     const wanted = new Set<string>();
