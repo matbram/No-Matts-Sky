@@ -139,7 +139,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     wire: params.has('wire'),
     lodcolor: params.has('lodcolor'),
     skirtcolor: params.has('skirtcolor'),
-    noskirt: params.has('noskirt'), // skirts are ON by default now; ?noskirt disables for A/B
+    skirt: params.has('skirt'), // skirts default OFF now; ?skirt re-enables for A/B
     dark: params.has('dark'),
   });
 
@@ -184,12 +184,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const manager = new QuadtreeManager(scene, material, recipe, R, {
     splitPx: 300,
     maxDepth: MAX_DEPTH,
-    // Skirts ON by default — the LOD-adaptive octaves (lodOctaves) make a leaf and its
-    // COARSER neighbour sample their shared edge with different octave counts, so the
-    // apron no longer makes those edges coincide and the crack exposed the inset backdrop
-    // at grazing walk angles. Skirts are now sized to that ~m-scale mismatch (not the old
-    // km curtains) and conditioned to LOD-transition edges only. ?noskirt disables for A/B.
-    skirts: !params.has('noskirt'),
+    // Skirts OFF by default — they read as a boundary-line grid (the inward curtain is
+    // mis-lit / visible at LOD transitions), which is what ?noskirt was working around.
+    // The apron covers same-LOD edges; the residual cross-LOD cracks the adaptive octaves
+    // reopen are to be fixed at the SOURCE (balanced cut + edge-locked morph), not hidden
+    // behind a visible curtain. ?skirt re-enables the old conditioned skirts for A/B.
+    skirts: params.has('skirt'),
     // debug tint: 'lod' colors leaves by LOD level, 'skirt' highlights skirted leaves
     debugColor: params.has('lodcolor') ? 'lod' : params.has('skirtcolor') ? 'skirt' : undefined,
   });
@@ -434,7 +434,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
         // Eye-height altitude above the mean radius is unreliable (mountains/basins),
         // so use a fixed 10 cm near for close terrain; the 0.1 m : ~hundreds-of-km
         // ratio is fine ONLY because logarithmic depth is on (?nolog z-fights here).
-        camera.near = 0.1;
+        // Defensive near clamp: drop below 0.1 m only when a footprint sample shows the
+        // nearest surface is within ~0.2 m (hard contact with a near-vertical face), so a
+        // wall can't poke through the near plane. Safe — logarithmic depth is on in walk.
+        camera.near = player ? Math.min(0.1, Math.max(0.02, player.nearestSurfaceGap() * 0.5)) : 0.1;
         camera.far = horizon + recipe.height * 8 + 5000;
       } else {
         const alt = Math.max(distCenter - R, 1);

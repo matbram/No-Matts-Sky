@@ -50,6 +50,11 @@ const MOUSE_SENS = 0.0022; // rad/px
 const GROUND_FOLLOW = 12; // 1/s exp-ease rate for LOD-pop ground smoothing
 const GROUND_BAND = 2; // m — only ease gaps smaller than this; bigger = real fall
 const MAX_DT = 0.05; // clamp dt (s) so an alt-tab hitch can't fling/tunnel
+// Footprint collision [T]: the ground probe takes the MAX analytic surface over a
+// small body footprint + a step-ahead point, so the eye rides OVER a slope it walks
+// into instead of the single radial probe punching the camera through the uphill face.
+const BODY_R = 0.4; // m — footprint half-width (player body radius)
+const STEP_AHEAD = 0.5; // m — forward look-ahead probe along the move direction
 
 /** Spin angle of the planet at the current time. Step 4: identity. Step 5 seam. */
 function spinAngle(): number {
@@ -82,6 +87,11 @@ export class PlayerController {
   private readonly _m = new Matrix4();
   private readonly _quat = new Quaternion();
   private readonly _surf = new Float64Array(7);
+  private readonly _probe = new Float64Array(7); // footprint sample scratch
+  private readonly _moveDir = new Vector3(); // unit tangential move dir (0 when idle)
+  private _centerSurfR = 0; // surface radius directly under the eye (for altitude())
+  private _fpMaxR = 0; // max surface radius over the footprint (the collision floor)
+  private _minGap = Infinity; // min radial eye→surface gap over the footprint (near clamp)
 
   constructor(
     private readonly recipe: TerrainRecipe,
@@ -143,10 +153,13 @@ export class PlayerController {
     if (input.right) this._move.add(this._right);
     if (input.left) this._move.sub(this._right);
     if (this._move.lengthSq() > 0) {
-      this._move.normalize().multiplyScalar(speed * dt);
+      this._move.normalize();
+      this._moveDir.copy(this._move); // unit move dir for the step-ahead probe
+      this._move.multiplyScalar(speed * dt);
       this.worldPos.add(this._move);
       this.speedEst = speed;
     } else {
+      this._moveDir.set(0, 0, 0);
       this.speedEst = 0;
     }
 
@@ -155,17 +168,36 @@ export class PlayerController {
     const r = this.worldPos.length();
     this._up.copy(this.worldPos).multiplyScalar(1 / r);
 
-    // 3. Ground probe along the new direction (analytic → matches the mesh exactly).
-    surfaceAt(
-      this.recipe,
-      this.planetRadius,
-      this.worldPos.x,
-      this.worldPos.y,
-      this.worldPos.z,
-      this._surf,
-      this.groundOctaves,
-    );
-    const groundR = this._surf[0]! + EYE;
+    // 3. Footprint ground probe — conservative MAX analytic surface over a small body
+    //    footprint + a step-ahead sample. A single radial probe gave only radial
+    //    clearance, so on a slope the eye/near-plane punched through the uphill face
+    //    (and, with DoubleSide terrain, you saw its backfaces + the inward skirts).
+    //    Taking the max lifts the eye OVER an approaching rise; it never blocks descent
+    //    (the footprint is ≤0.5 m and translates with you). Analytic only — never the
+    //    rendered mesh — and zero per-frame allocation.
+    const px = this.worldPos.x;
+    const py = this.worldPos.y;
+    const pz = this.worldPos.z;
+    // Center sample stays in _surf — the surface directly under the eye (altitude()).
+    surfaceAt(this.recipe, this.planetRadius, px, py, pz, this._surf, this.groundOctaves);
+    this._centerSurfR = this._surf[0]!;
+    this._fpMaxR = this._centerSurfR;
+    this._minGap = r - this._centerSurfR;
+    // 4-ring at body radius along ±east/±north (reuse the tangent basis), then a
+    // step-ahead sample along the move dir (the key one: lifts you over a rise you're
+    // walking into before the eye reaches it). surfaceAt normalizes its input, so a
+    // `meters · tangentUnit` offset ≈ that arc length on the sphere.
+    const e = this._east;
+    const nn = this._north;
+    this.probeFootprint(px, py, pz, BODY_R * e.x, BODY_R * e.y, BODY_R * e.z, r);
+    this.probeFootprint(px, py, pz, -BODY_R * e.x, -BODY_R * e.y, -BODY_R * e.z, r);
+    this.probeFootprint(px, py, pz, BODY_R * nn.x, BODY_R * nn.y, BODY_R * nn.z, r);
+    this.probeFootprint(px, py, pz, -BODY_R * nn.x, -BODY_R * nn.y, -BODY_R * nn.z, r);
+    if (this._moveDir.lengthSq() > 0) {
+      const m = this._moveDir;
+      this.probeFootprint(px, py, pz, STEP_AHEAD * m.x, STEP_AHEAD * m.y, STEP_AHEAD * m.z, r);
+    }
+    const groundR = this._fpMaxR + EYE;
 
     // 4. Integrate radius; hard floor at the ground (never penetrate).
     let newR = r + this.radialVel * dt;
@@ -207,6 +239,35 @@ export class PlayerController {
     void spinAngle(); // Step 5 seam (identity now) — keep referenced for clarity.
   }
 
+  /**
+   * Sample the analytic surface at (p + offset) and fold it into the footprint
+   * maximum (`_fpMaxR`, the collision floor) and the minimum radial eye→surface gap
+   * (`_minGap`, the near clamp). Zero per-call allocation (writes shared `_probe`).
+   */
+  private probeFootprint(
+    px: number,
+    py: number,
+    pz: number,
+    ox: number,
+    oy: number,
+    oz: number,
+    r: number,
+  ): void {
+    surfaceAt(
+      this.recipe,
+      this.planetRadius,
+      px + ox,
+      py + oy,
+      pz + oz,
+      this._probe,
+      this.groundOctaves,
+    );
+    const sr = this._probe[0]!;
+    if (sr > this._fpMaxR) this._fpMaxR = sr;
+    const gap = r - sr;
+    if (gap < this._minGap) this._minGap = gap;
+  }
+
   getWorldPos(out: Vector3): void {
     out.copy(this.worldPos);
   }
@@ -218,7 +279,7 @@ export class PlayerController {
   }
   /** Eye height above the local terrain surface (≈ EYE when grounded), meters. */
   altitude(): number {
-    return this.worldPos.length() - this._surf[0]!;
+    return this.worldPos.length() - this._centerSurfR;
   }
   /** Eye height above the mean radius (datum), meters. */
   altitudeAboveDatum(): number {
@@ -229,5 +290,9 @@ export class PlayerController {
   }
   isGrounded(): boolean {
     return this.grounded;
+  }
+  /** Smallest radial eye→surface gap across the footprint this frame, meters. */
+  nearestSurfaceGap(): number {
+    return this._minGap;
   }
 }
