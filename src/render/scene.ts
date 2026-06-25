@@ -72,6 +72,9 @@ const WALK_SPLIT_PX = 420;
 // Creative-flight split threshold (px) — coarser than walk: you fly fast and usually at
 // altitude, so a leaner cut keeps the leaf count/budget sane while still detailed near you.
 const CREATIVE_SPLIT_PX = 520;
+// Fly/orbit split threshold (px) — the manager default; shared with the CDLOD morph so the
+// distance-morph band matches the cut's split distance exactly.
+const FLY_SPLIT_PX = 300;
 
 // Finished meshes uploaded to the GPU per frame (slice spec §7 — the only
 // generation cost allowed in the frame). The rest queue and drain over frames.
@@ -197,7 +200,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // splitPx 300 (smaller, gentler LOD steps — affordable after the ~13× meshing
   // speedup); maxDepth = MAX_DEPTH gives meter-scale near-field cells for walking.
   const manager = new QuadtreeManager(scene, material, recipe, R, {
-    splitPx: 300,
+    splitPx: FLY_SPLIT_PX,
     maxDepth: MAX_DEPTH,
     // Skirts OFF by default — they read as a boundary-line grid (the inward curtain is
     // mis-lit / visible at LOD transitions), which is what ?noskirt was working around.
@@ -513,6 +516,13 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       worldCam.copy(camera.position).add(renderOrigin);
       vel.copy(worldCam).sub(prevWorldCam); // world units / frame
       prevWorldCam.copy(worldCam);
+
+      // CDLOD: feed the per-vertex distance-morph the same projected-size constant the cut
+      // uses (kDist = (vpH/(2·tan(fovY/2)))/splitPx for the current mode), so detail fades in
+      // continuously with distance and reaches the parent surface exactly at the split distance.
+      const curSplitPx = mode === 'walk' ? WALK_SPLIT_PX : mode === 'creative' ? CREATIVE_SPLIT_PX : FLY_SPLIT_PX;
+      const kDist = vpHeight / (2 * Math.tan(fovY / 2)) / curSplitPx;
+      manager.setMorphParams(kDist, worldCam.x, worldCam.y, worldCam.z);
 
       // Dynamic near/far from altitude + horizon distance, every frame.
       const distCenter = worldCam.length();

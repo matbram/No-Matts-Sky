@@ -3,6 +3,7 @@ import {
   childrenOf,
   nodeBounds,
   projectedSize,
+  lodBoundRadius,
   selectCut,
   isPathPrefix,
   retainedShouldRemove,
@@ -45,6 +46,23 @@ describe('quadtree node math', () => {
   it('projectedSize grows as distance shrinks, and is Infinity inside the bounds', () => {
     expect(projectedSize(1000, 1e6, VP, FOVY)).toBeLessThan(projectedSize(1000, 1e5, VP, FOVY));
     expect(projectedSize(1000, 500, VP, FOVY)).toBe(Infinity);
+  });
+
+  it('lodBoundRadius shrinks ~half per level and matches selectCut/CDLOD usage', () => {
+    const R = EARTH_RADIUS_M;
+    // Deeper = smaller tangential bound; the parent (one level up) is ~2× the child, which
+    // is what makes the CDLOD morph band [dChild, dParent] ≈ [d, 2d] (continuous across LODs).
+    for (let d = 1; d <= 12; d++) {
+      const child = lodBoundRadius(d, R);
+      const parent = lodBoundRadius(d - 1, R);
+      expect(child).toBeLessThan(parent);
+      // ~2× per level away from the root; gentler near it (cube-face curvature → ~1.5× at d=1).
+      expect(parent / child).toBeGreaterThan(1.4);
+      expect(parent / child).toBeLessThan(2.3);
+    }
+    // Depth is clamped (no out-of-range table read) and scales linearly with radius.
+    expect(lodBoundRadius(99, R)).toBeGreaterThan(0);
+    expect(lodBoundRadius(5, 2 * R)).toBeCloseTo(2 * lodBoundRadius(5, R), 6);
   });
 });
 

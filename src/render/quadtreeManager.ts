@@ -14,11 +14,20 @@
 // altitude (full per-frame floating origin is Step 4).
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { Scene, Mesh, BufferGeometry, BufferAttribute, Color, type Material } from 'three';
-import { uniform, mix, attribute, positionLocal } from 'three/tsl';
+import { Scene, Mesh, BufferGeometry, BufferAttribute, Color, Vector2, type Material } from 'three';
+import {
+  uniform,
+  mix,
+  attribute,
+  positionLocal,
+  positionWorld,
+  cameraPosition,
+  smoothstep,
+} from 'three/tsl';
 import {
   selectCut,
   nodeBounds,
+  lodBoundRadius,
   retainedShouldRemove,
   type CameraView,
   type QuadNode,
@@ -27,8 +36,6 @@ import { chunkKey, uvRectFromPath, type ChunkMesh, type MeshJob } from '../core/
 import { faceDirection, CUBE_FACES } from '../core/cubesphere.ts';
 import { lodOctaves, type TerrainRecipe } from '../core/density.ts';
 
-/** A TSL uniform node carrying a single float (the per-leaf morph factor). */
-type MorphUniform = ReturnType<typeof uniform>;
 /** Node materials expose positionNode; the base is typed as plain Material here. */
 interface NodeMaterialLike {
   positionNode: unknown;
@@ -40,10 +47,9 @@ interface Entry {
   status: Status;
   center: [number, number, number];
   mesh: Mesh | null;
-  mat: Material | null; // per-leaf material clone (carries the leaf's own morph uniform)
-  morphUniform: MorphUniform | null; // 0 = coarse/parent-like, 1 = full detail
+  mat: Material | null; // per-leaf material clone (carries the leaf's own CDLOD level uniform)
   ready: ChunkMesh | null;
-  morph: number; // 0..1 geomorph-in progress (drives morphUniform)
+  morph: number; // CDLOD morph at the leaf CENTER (0=full near .. 1=parent far) — debug/HUD only
   needsSkirt: boolean; // does any edge lack a same-LOD neighbour in the cut?
   liveAtMs: number; // manager clock when this leaf went live (for ?lodmorphdebug age)
 }
@@ -53,8 +59,14 @@ interface MeshResult {
   ms: number;
 }
 
-/** LOD geomorph duration (ms): detail morphs in over this long instead of snapping. */
-const MORPH_MS = 350;
+/**
+ * CDLOD morph region: a leaf shows full detail until the camera recedes to this fraction of
+ * the way from its split distance to its merge (parent) distance, then morphs to the parent
+ * surface by the merge distance — so detail fades continuously with distance and a leaf
+ * matches the coarser neighbour exactly at the shared LOD boundary. Used identically in the
+ * TSL shader (per-vertex) and `centerMorph` (CPU, for ?lodmorphdebug/?morphcolor).
+ */
+const MORPH_START_FRAC = 0.55;
 
 // Skirt depth (m) at a LOD transition, sized to the cross-LOD SURFACE mismatch — NOT
 // the old km-scale "cover everything" curtain that was the visible boundary grid.
@@ -121,6 +133,16 @@ export class QuadtreeManager {
   private lodMorphLogN = 0;
   private maxNbrDelta = 0;
   private morphSummary = '';
+  // CDLOD geomorph: one shared uniform = (viewportHeight/(2·tan(fovY/2)))/splitPx — the
+  // same projected-size constant selectCut uses, so the per-vertex distance morph band
+  // aligns with the split distance (set per frame by the render shell). The camera world
+  // position (render space) is mirrored on the CPU only to compute the leaf-CENTRE morph
+  // for ?lodmorphdebug/?morphcolor; the actual morph is per-vertex in TSL via cameraPosition.
+  private readonly kDistUniform = uniform(0);
+  private kDist = 0;
+  private camX = 0;
+  private camY = 0;
+  private camZ = 0;
 
   constructor(
     private readonly scene: Scene,
@@ -151,6 +173,21 @@ export class QuadtreeManager {
   }
 
   /**
+   * CDLOD per-frame params (call once per frame from the render shell):
+   *   kDist = (viewportHeight/(2·tan(fovY/2)))/splitPx — the projected-size constant
+   *   selectCut uses, so the distance morph reaches `parent` exactly at the split distance.
+   * camWorld is the camera position in WORLD space (for the CPU leaf-centre morph used by
+   * ?lodmorphdebug/?morphcolor only; the GPU morph uses the TSL cameraPosition builtin).
+   */
+  setMorphParams(kDist: number, camX: number, camY: number, camZ: number): void {
+    this.kDist = kDist;
+    this.kDistUniform.value = kDist;
+    this.camX = camX;
+    this.camY = camY;
+    this.camZ = camZ;
+  }
+
+  /**
    * Recompute the cut and reconcile. `lookahead` is the world point to prioritize
    * around (camera position biased along its velocity) so leaves ahead of motion
    * mesh first.
@@ -176,7 +213,6 @@ export class QuadtreeManager {
           center: b.center,
           mesh: null,
           mat: null,
-          morphUniform: null,
           ready: null,
           morph: 0,
           needsSkirt: true, // set below from the full cut, before dispatch
@@ -253,8 +289,10 @@ export class QuadtreeManager {
     const wantedArr: { node: QuadNode; live: boolean }[] = [];
     for (const key of this.wanted) {
       const e = this.entries.get(key);
-      // A replacement only "covers" once it's live AND has finished morphing in.
-      if (e) wantedArr.push({ node: e.node, live: e.status === 'live' && e.morph >= 1 });
+      // CDLOD: a replacement "covers" as soon as it's LIVE — it already renders at the
+      // correct distance-morph (≈ the parent surface at the split distance), so there is no
+      // 350 ms morph to wait for and nothing pops when the retained ancestor is removed.
+      if (e) wantedArr.push({ node: e.node, live: e.status === 'live' });
     }
     for (const [key, e] of this.entries) {
       if (e.status !== 'live' || this.wanted.has(key)) continue;
@@ -270,56 +308,65 @@ export class QuadtreeManager {
   }
 
   /**
-   * Advance LOD geomorphs — call once per frame. Newly-live leaves morph in
-   * (morph 0→1 over MORPH_MS); when one finishes, drop its polygon-offset bias and
-   * purge any retained leaf it now fully covers.
+   * Per-frame hook. The CDLOD geomorph itself is now PER-VERTEX in the shader (a function
+   * of camera distance — see uploadReady), so there is no CPU morph to advance. This only
+   * keeps the resume-safe clock and, when ?lodmorphdebug/?morphcolor is on, recomputes each
+   * leaf's CENTRE morph for the console line + the red→green tint.
    */
   tick(dtMs: number): void {
     if (this.entries.size === 0) return;
     this.clockMs += dtMs; // resume-safe clock (no Date.now) + the ?lodmorphdebug age base
-    const step = dtMs / MORPH_MS;
     const dbg = !!this.opts.debugLodMorph;
     const tintMorph = this.opts.debugColor === 'morph';
-    let anyCompleted = false;
-    let live = 0, mid = 0, sum = 0, mn = 1, mx = 0, newestLive = -1, slowestMidAge = 0;
+    if (!dbg && !tintMorph) return; // CDLOD morph is in-shader; nothing else to do
+    let live = 0, mid = 0, sum = 0, mn = 1, mx = 0, newestLive = -1;
     for (const e of this.entries.values()) {
       if (e.status !== 'live') continue;
       live++;
-      if (e.morph < 1 && e.morphUniform) {
-        e.morph = Math.min(1, e.morph + step);
-        e.morphUniform.value = e.morph;
-        // ?morphcolor: red (just-appeared) → green (settled), so the pop is visible.
-        if (tintMorph && e.mat) (e.mat as unknown as { color: Color }).color.setHSL(0.33 * e.morph, 0.85, 0.5);
-        if (e.morph >= 1) {
-          if (e.mat) e.mat.polygonOffset = false; // settle depth once fully resolved
-          anyCompleted = true;
-        }
-      }
+      const m = this.centerMorph(e);
+      e.morph = m;
+      // ?morphcolor: green = full detail (near, m=0) → red = parent (far, m=1). A correct
+      // CDLOD render shows a smooth concentric gradient, NOT per-leaf colour blocks.
+      if (tintMorph && e.mat) (e.mat as unknown as { color: Color }).color.setHSL(0.33 * (1 - m), 0.85, 0.5);
       if (dbg) {
         if (e.liveAtMs > newestLive) newestLive = e.liveAtMs;
-        if (e.morph < 1) {
-          mid++; sum += e.morph;
-          if (e.morph < mn) mn = e.morph;
-          if (e.morph > mx) mx = e.morph;
-          const age = this.clockMs - e.liveAtMs;
-          if (age > slowestMidAge) slowestMidAge = age;
+        if (m > 0.01 && m < 0.99) {
+          mid++; sum += m;
+          if (m < mn) mn = m;
+          if (m > mx) mx = m;
         }
       }
     }
-    if (anyCompleted) this.purgeRetained();
     if (dbg) {
       const avg = mid > 0 ? sum / mid : 0;
       const newestAge = newestLive >= 0 ? (this.clockMs - newestLive) | 0 : 0;
-      this.morphSummary = `morph mid=${mid} avg=${avg.toFixed(2)} new=${newestAge}ms maxNbrΔ=${this.maxNbrDelta}`;
+      this.morphSummary = `morph midDist=${mid} avg=${avg.toFixed(2)} new=${newestAge}ms maxNbrΔ=${this.maxNbrDelta}`;
       if (++this.lodMorphLogN % 10 === 0) {
         console.log(
-          `[NMS morph] live=${live} mid=${mid} morph[min=${mid ? mn.toFixed(2) : '-'} ` +
+          `[NMS morph] live=${live} midDist=${mid} m[min=${mid ? mn.toFixed(2) : '-'} ` +
             `avg=${avg.toFixed(2)} max=${mid ? mx.toFixed(2) : '-'}] ` +
-            `newest=${newestAge}ms slowestMid=${slowestMidAge | 0}ms ` +
-            `uploads/cut=${this.uploadedThisCut} maxNbrΔ=${this.maxNbrDelta}`,
+            `newest=${newestAge}ms uploads/cut=${this.uploadedThisCut} maxNbrΔ=${this.maxNbrDelta}`,
         );
       }
     }
+  }
+
+  /** CDLOD morph at a leaf's CENTRE (0=full near .. 1=parent far) — CPU mirror of the shader. */
+  private centerMorph(e: Entry): number {
+    if (this.kDist <= 0) return 0;
+    const dx = e.center[0] - this.camX, dy = e.center[1] - this.camY, dz = e.center[2] - this.camZ;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const depth = e.node.path.length;
+    const lodR = lodBoundRadius(depth, this.radius);
+    const parentR = depth > 0 ? lodBoundRadius(depth - 1, this.radius) : lodR * 2;
+    const dChild = 2 * lodR * this.kDist;
+    const dParent = 2 * parentR * this.kDist;
+    const e0 = dChild + (dParent - dChild) * MORPH_START_FRAC;
+    if (dParent <= e0) return 0;
+    let t = (dist - e0) / (dParent - e0);
+    if (t < 0) t = 0;
+    else if (t > 1) t = 1;
+    return t * t * (3 - 2 * t); // smoothstep
   }
 
   /** Upload up to `budget` finished meshes to the GPU this frame; returns how many. */
@@ -335,23 +382,36 @@ export class QuadtreeManager {
       geometry.setAttribute('normal', new BufferAttribute(m.normals, 3));
       geometry.setAttribute('morphTarget', new BufferAttribute(m.morphTargets, 3));
       geometry.setIndex(new BufferAttribute(m.indices, 1));
-      // Per-leaf material clone carrying its OWN morph uniform: the vertex position
-      // lerps morphTarget→full as morph goes 0→1, so detail resolves in as a single
-      // opaque surface. Biased toward the camera so it wins the depth test over the
-      // retained leaf it's morphing in over (tick() settles the bias once done).
       const mat = this.material.clone();
       if (this.opts.debugColor) {
         const c = (mat as unknown as { color: Color }).color;
         if (this.opts.debugColor === 'lod') c.setHSL((e.node.path.length * 0.13) % 1, 0.75, 0.5);
-        else if (this.opts.debugColor === 'morph') c.setHSL(0, 0.85, 0.5); // red at morph 0 (tick recolors)
+        else if (this.opts.debugColor === 'morph') c.setHSL(0.33, 0.85, 0.5); // green=full (tick recolors by distance)
         else c.copy(e.needsSkirt ? new Color(1, 0.15, 0.15) : new Color(0.16, 0.16, 0.2));
       }
-      const mu = uniform(0);
+      // CDLOD geomorph (per-vertex, in-shader): the vertex lerps full detail → the
+      // one-octave-coarser parent surface as a smooth function of CAMERA DISTANCE, reaching
+      // the parent exactly at this leaf's split distance (dParent). So detail fades in
+      // continuously across the whole view as you approach — no per-leaf time wave — and the
+      // edge stays matched to a coarser neighbour (which renders ITS full detail there). The
+      // band uses the SAME projected-size constants as selectCut (lodBoundRadius · kDist).
+      const depth = e.node.path.length;
+      const lodR = lodBoundRadius(depth, this.radius);
+      const parentR = depth > 0 ? lodBoundRadius(depth - 1, this.radius) : lodR * 2;
+      const uLevel = uniform(new Vector2(lodR, parentR)); // .x = child bound, .y = parent bound
+      const dChild = uLevel.x.mul(2).mul(this.kDistUniform);
+      const dParent = uLevel.y.mul(2).mul(this.kDistUniform);
+      const e0 = mix(dChild, dParent, MORPH_START_FRAC);
+      const dist = positionWorld.distance(cameraPosition); // render space → small floats
+      const mFactor = smoothstep(e0, dParent, dist); // 0 near (full) → 1 far (parent)
       (mat as unknown as NodeMaterialLike).positionNode = mix(
-        attribute('morphTarget', 'vec3'),
         positionLocal,
-        mu,
+        attribute('morphTarget', 'vec3'),
+        mFactor,
       );
+      // Bias the finer leaf toward the camera so it wins the depth test over a coarser
+      // ancestor still retained for the brief moment until purge (surfaces match there, so
+      // no morph divergence to fight — unlike the old 350 ms time morph).
       mat.polygonOffset = true;
       mat.polygonOffsetFactor = -1;
       mat.polygonOffsetUnits = -1;
@@ -363,17 +423,19 @@ export class QuadtreeManager {
       );
       e.mesh = mesh;
       e.mat = mat;
-      e.morphUniform = mu;
       e.center = m.origin;
       e.ready = null;
       e.status = 'live';
       e.morph = 0;
-      e.liveAtMs = this.clockMs; // for ?lodmorphdebug age/staggering
+      e.liveAtMs = this.clockMs; // for ?lodmorphdebug age
       this.uploadedThisCut++;
       this.scene.add(mesh);
       n++;
     }
-    return n; // purge happens in tick() when morphs complete, and in update()
+    // A freshly-live leaf already renders at its correct CDLOD distance-morph (≈ parent at
+    // the split distance), so any coarse ancestor it now covers can be dropped immediately.
+    if (n > 0) this.purgeRetained();
+    return n;
   }
 
   /** Live leaf meshes (for the ?clipdebug downward raycast). Debug-only. */

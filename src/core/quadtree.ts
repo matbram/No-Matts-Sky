@@ -113,6 +113,17 @@ const BOUND_FACTOR: Float64Array = (() => {
   return t;
 })();
 
+/**
+ * Tangential bounding radius of a leaf at `depth` (the SAME metric `selectCut` uses for
+ * its screen-space-error test). Shared with the render shell's CDLOD geomorph so the
+ * distance-morph band aligns exactly with the split distance (no seams). Depth is clamped
+ * to the precomputed table.
+ */
+export function lodBoundRadius(depth: number, radius: number): number {
+  const d = depth <= MAX_DEPTH_TABLE ? (depth < 0 ? 0 : depth) : MAX_DEPTH_TABLE;
+  return BOUND_FACTOR[d]! * radius;
+}
+
 /** World-space bounding sphere of a node: its surface patch ± the terrain margin. */
 export function nodeBounds(
   face: number,
@@ -223,8 +234,7 @@ export function selectCut(camera: CameraView, opts: SelectOpts): QuadNode[] {
     // standard screen-space-error metric and grades detail by distance (near = fine).
     // At orbit/fly distances BOUND_FACTOR·radius ≫ heightMargin, so those cuts are
     // unchanged; only the near/deep regime (the blow-up) is corrected.
-    const bd = node.path.length <= MAX_DEPTH_TABLE ? node.path.length : MAX_DEPTH_TABLE;
-    const lodRadius = BOUND_FACTOR[bd]! * opts.radius;
+    const lodRadius = lodBoundRadius(node.path.length, opts.radius);
     const px = projectedSize(lodRadius, dist, camera.viewportHeight, camera.fovY);
 
     if (node.path.length < opts.maxDepth && px > opts.splitPx && leaves.length < maxLeaves) {
