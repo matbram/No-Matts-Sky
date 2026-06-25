@@ -98,10 +98,19 @@ const LOOKAHEAD_FRAMES = 30;
 // streaming (~0.5–0.7 s observed) BEFORE the camera reaches their CDLOD morph band and
 // resolve gradually from the parent surface instead of snapping in late. ~0 at rest /
 // lateral motion (no wasted leaves); kicks in on a plunge. [T] dial up if pops persist,
-// down if a fast descent dips below 60 fps. PREFETCH_MAX_M caps the lead so a hyper-plunge
-// can't force the whole near-field to maxDepth and blow the leaf budget.
+// down if a fast descent dips below 60 fps.
 const PREFETCH_S = 0.7;
-const PREFETCH_MAX_M = 6000;
+// ALTITUDE-RELATIVE prefetch cap (replaces the old flat 6 km). The CDLOD morph band scales
+// with altitude (thousands of km at orbit, hundreds near the surface), so a flat-metres lead
+// was negligible at altitude — ?lodaudit showed pf/band≈0.001, i.e. detail still arrived in
+// discrete chunks up high instead of leading the band. Cap the lead at a FRACTION of the
+// camera's altitude so it's a meaningful slice of the band at ANY height, while bounding the
+// cut growth to < ~1 level deeper near the camera (a flat lead self-targets the deepest band;
+// see selectCut). FLOOR keeps a useful lead near the surface; CEIL + the maxLeaves cap +
+// birth-ease bound a hyper-plunge that outruns the mesher (it then degrades to a gentle fade).
+const PREFETCH_MAX_FRAC = 0.35;
+const PREFETCH_FLOOR_M = 3000;
+const PREFETCH_CEIL_M = 200_000;
 // EMA smoothing for the approach-rate estimate (per-frame blend of the new sample), so a
 // single jittery frame-time doesn't swing the prefetch distance. ~0.15 ≈ a few-frame lag.
 const APPROACH_EMA = 0.15;
@@ -322,6 +331,11 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const lastCutPos = new Vector3();
   const lastCutForward = new Vector3(); // walk: look dir at the last cut (recut-on-rotation)
   const prevWorldCam = new Vector3();
+  // Speed-aware prefetch: smoothed rate (m/s) at which the camera is closing on the planet
+  // centre (positive = descending). prevDistCenter seeds the per-frame delta; both are reset
+  // on every teleport (preset switch / enter walk/creative) so a jump isn't read as a descent.
+  let approachRateEMA = 0;
+  let prevDistCenter = -1;
 
   function applyPreset(p: Preset): void {
     renderOrigin = p.target.clone();
@@ -337,6 +351,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     controls.maxDistance = p.maxD;
     controls.update();
     prevWorldCam.copy(p.cam);
+    approachRateEMA = 0;
+    prevDistCenter = -1; // teleport is not a descent → don't prefetch a burst the next frame
     forceCut = true;
     firstFillDone = false; // burst-fill the new view, then settle
   }
@@ -349,10 +365,6 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const forward = new Vector3();
   const vel = new Vector3();
   const lookahead = new Vector3();
-  // Speed-aware prefetch: smoothed rate (m/s) at which the camera is closing on the
-  // planet centre (positive = descending). prevDistCenter seeds the per-frame delta.
-  let approachRateEMA = 0;
-  let prevDistCenter = -1;
 
   // ── Walking (Step 4) + creative flight: floating-origin + body-fixed player ──
   let mode: 'fly' | 'walk' | 'creative' = 'fly';
@@ -417,6 +429,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     camera.position.set(0, 0, 0);
     player.getQuaternion(camera.quaternion);
     mode = 'walk';
+    approachRateEMA = 0;
+    prevDistCenter = -1; // spawn teleport is not a descent
     forceCut = true;
     firstFillDone = false; // burst-fill the spawn area, then settle to UPLOAD_PER_FRAME
     canvas.focus(); // keyboard focus → WASD works immediately (no click needed)
@@ -436,6 +450,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     camera.position.set(0, 0, 0);
     player.getQuaternion(camera.quaternion);
     mode = 'creative';
+    approachRateEMA = 0;
+    prevDistCenter = -1; // spawn teleport is not a descent
     forceCut = true;
     firstFillDone = false;
     canvas.focus();
@@ -616,8 +632,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
           halfFov = Math.atan(Math.tan(fovY / 2) * Math.sqrt(1 + aspect * aspect)) * 1.2;
         }
         lookahead.copy(worldCam).addScaledVector(vel, LOOKAHEAD_FRAMES); // generate ahead of motion
-        // Lead distance = descent speed × lead time, capped. 0 when not approaching.
-        const prefetchM = Math.min(PREFETCH_MAX_M, Math.max(0, approachRateEMA) * PREFETCH_S);
+        // Lead distance = descent speed × lead time, capped at a fraction of altitude so it's a
+        // meaningful slice of the (altitude-scaled) morph band at ANY height — not the negligible
+        // flat 6 km it used to be up high. 0 when not approaching (no wasted leaves at rest).
+        const altitude = Math.max(1, distCenter - R);
+        const prefetchCap = Math.min(PREFETCH_CEIL_M, Math.max(PREFETCH_FLOOR_M, PREFETCH_MAX_FRAC * altitude));
+        const prefetchM = Math.min(prefetchCap, Math.max(0, approachRateEMA) * PREFETCH_S);
         manager.update(
           {
             position: [worldCam.x, worldCam.y, worldCam.z],
