@@ -44,6 +44,18 @@ export interface SelectOpts {
   maxDepth: number; // deepest leaf
   cullHorizon?: boolean; // drop nodes past the planet's horizon (default true)
   maxLeaves?: number; // safety cap on the cut size (default 4096)
+  /**
+   * Speed-aware PREFETCH lead distance (m). Brings every level's split distance
+   * FORWARD by this many meters (split when `dist < dSplit(depth) + prefetchM`), so a
+   * fast approach requests the finer leaves EARLY — they finish streaming before the
+   * camera reaches their CDLOD morph band and are born at the parent surface (m≈1),
+   * then resolve gradually with distance instead of snapping in late. The render shell
+   * sets it to `approachSpeed · leadTime`; `0` (default) ⇒ byte-identical to a plain
+   * screen-space-error cut. Applied to the SPLIT test only — culling uses the true
+   * distance, so prefetch never un-culls the horizon/cone. selectCut stays a pure,
+   * deterministic decision layer (the canonical generation core is untouched).
+   */
+  prefetchM?: number;
 }
 
 /** The 4 children of a node (quadrant order 0..3 — see uvRectFromPath). */
@@ -214,6 +226,7 @@ export function selectCut(camera: CameraView, opts: SelectOpts): QuadNode[] {
   const useCone = forward !== undefined && halfFov !== undefined;
   const cosHalf = useCone ? Math.cos(halfFov!) : 0;
   const sinHalf = useCone ? Math.sin(halfFov!) : 0;
+  const prefetchM = opts.prefetchM ?? 0; // speed-aware lead distance for the split test
 
   while (stack.length > 0) {
     const node = stack.pop()!;
@@ -235,7 +248,16 @@ export function selectCut(camera: CameraView, opts: SelectOpts): QuadNode[] {
     // At orbit/fly distances BOUND_FACTOR·radius ≫ heightMargin, so those cuts are
     // unchanged; only the near/deep regime (the blow-up) is corrected.
     const lodRadius = lodBoundRadius(node.path.length, opts.radius);
-    const px = projectedSize(lodRadius, dist, camera.viewportHeight, camera.fovY);
+    // Speed-aware prefetch: subtract the lead distance from the SPLIT distance only.
+    // px(dist) > splitPx ⟺ dist < dSplit(depth); using dist−prefetchM extends every
+    // level's split distance forward by prefetchM, so finer leaves are requested early
+    // and stream in before the camera reaches their morph band (no late snap). The flat
+    // meters lead is negligible at coarse levels (huge dSplit) and self-targets the
+    // deepest levels (tiny dSplit) — exactly where the late-arrival pop happens.
+    // projectedSize returns Infinity for distEff ≤ lodRadius (very close / overshoot) →
+    // split, which is correct. prefetchM=0 ⇒ distEff===dist ⇒ unchanged.
+    const distEff = prefetchM > 0 ? dist - prefetchM : dist;
+    const px = projectedSize(lodRadius, distEff, camera.viewportHeight, camera.fovY);
 
     if (node.path.length < opts.maxDepth && px > opts.splitPx && leaves.length < maxLeaves) {
       for (const child of childrenOf(node)) stack.push(child);

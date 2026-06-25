@@ -37,9 +37,10 @@ import { chunkKey, uvRectFromPath, type ChunkMesh, type MeshJob } from '../core/
 import { faceDirection, CUBE_FACES } from '../core/cubesphere.ts';
 import { lodOctaves, type TerrainRecipe } from '../core/density.ts';
 
-/** Node materials expose positionNode; the base is typed as plain Material here. */
+/** Node materials expose positionNode/normalNode; the base is typed as plain Material here. */
 interface NodeMaterialLike {
   positionNode: unknown;
+  normalNode: unknown;
 }
 
 type Status = 'pending' | 'inflight' | 'ready' | 'live';
@@ -151,6 +152,14 @@ export class QuadtreeManager {
   private reqLatSum = 0;
   private reqLatMax = 0;
   private reqLatN = 0;
+  // Speed-aware prefetch lead distance (m) the last cut used, + the "born morph" of each
+  // leaf at its go-live instant (the decisive ?lodmorphdebug metric: ~1.0 = born at the
+  // parent surface and resolving by distance = no pop; ≪1 = born already-detailed = a snap).
+  private prefetchM = 0;
+  private approachRate = 0; // m/s the camera is closing on the planet centre (per-frame, debug)
+  private bornMSum = 0;
+  private bornMMin = 1;
+  private bornMN = 0;
   // CDLOD geomorph: one shared uniform = (viewportHeight/(2·tan(fovY/2)))/splitPx — the
   // same projected-size constant selectCut uses, so the per-vertex distance morph band
   // aligns with the split distance (set per frame by the render shell). The camera world
@@ -198,9 +207,16 @@ export class QuadtreeManager {
    * camWorld is the camera position in WORLD space (for the CPU leaf-centre morph used by
    * ?lodmorphdebug/?morphcolor only; the GPU morph uses the TSL cameraPosition builtin).
    */
-  setMorphParams(kDist: number, camX: number, camY: number, camZ: number): void {
+  setMorphParams(
+    kDist: number,
+    camX: number,
+    camY: number,
+    camZ: number,
+    approachRate = 0,
+  ): void {
     this.kDist = kDist;
     this.kDistUniform.value = kDist;
+    this.approachRate = approachRate; // m/s toward planet centre (for ?lodmorphdebug)
     this.camX = camX;
     this.camY = camY;
     this.camZ = camZ;
@@ -211,7 +227,12 @@ export class QuadtreeManager {
    * around (camera position biased along its velocity) so leaves ahead of motion
    * mesh first.
    */
-  update(camera: CameraView, lookahead: [number, number, number], splitPx?: number): void {
+  update(
+    camera: CameraView,
+    lookahead: [number, number, number],
+    splitPx?: number,
+    prefetchM = 0,
+  ): void {
     // Reset per-cut ?lodmorphdebug counters (accumulated as this cut's leaves stream in).
     this.uploadedThisCut = 0;
     this.freshThisCut = 0;
@@ -219,11 +240,18 @@ export class QuadtreeManager {
     this.reqLatSum = 0;
     this.reqLatMax = 0;
     this.reqLatN = 0;
+    this.bornMSum = 0;
+    this.bornMMin = 1;
+    this.bornMN = 0;
+    this.prefetchM = prefetchM; // for ?lodmorphdebug readout
     const cut = selectCut(camera, {
       radius: this.radius,
       heightMargin: this.heightMargin,
       splitPx: splitPx ?? this.opts.splitPx,
       maxDepth: this.opts.maxDepth,
+      // Speed-aware prefetch: request finer leaves early so the CDLOD morph fades them
+      // in continuously (no late snap). approachSpeed·leadTime is computed render-side.
+      prefetchM,
     });
 
     const wanted = new Set<string>();
@@ -367,12 +395,19 @@ export class QuadtreeManager {
     if (dbg) {
       const avg = mid > 0 ? sum / mid : 0;
       const latAvg = this.reqLatN > 0 ? (this.reqLatSum / this.reqLatN) | 0 : 0;
+      // Speed-aware prefetch readout: approach speed (m/s), the lead distance it bought
+      // (km), and bornM — the morph leaves had at go-live (avg/min). The fix is working
+      // when bornM stays near ~1.0 even as approach/reqLat rise (born at the parent surface,
+      // resolving by distance = no pop) instead of dropping toward 0 (late = a snap).
+      const bornAvg = this.bornMN > 0 ? this.bornMSum / this.bornMN : 1;
+      const speed = `approach=${this.approachRate | 0}m/s prefetch=${(this.prefetchM / 1000).toFixed(1)}km`;
+      const born = `bornM[avg=${bornAvg.toFixed(2)} min=${this.bornMN ? this.bornMMin.toFixed(2) : '-'}]`;
       this.morphSummary =
-        `morph midDist=${mid} avg=${avg.toFixed(2)} fresh=${this.freshThisCut} reqLat=${latAvg}ms maxNbrΔ=${this.maxNbrDelta}`;
+        `morph midDist=${mid} avg=${avg.toFixed(2)} ${born} ${speed} fresh=${this.freshThisCut} reqLat=${latAvg}ms maxNbrΔ=${this.maxNbrDelta}`;
       if (++this.lodMorphLogN % 10 === 0) {
         console.log(
           `[NMS morph] live=${live} midDist=${mid} m[min=${mid ? mn.toFixed(2) : '-'} ` +
-            `avg=${avg.toFixed(2)} max=${mid ? mx.toFixed(2) : '-'}] ` +
+            `avg=${avg.toFixed(2)} max=${mid ? mx.toFixed(2) : '-'}] ${born} ${speed} ` +
             `fresh=${this.freshThisCut} refine=${this.refineThisCut} ` +
             `reqLat[avg=${latAvg} max=${this.reqLatMax | 0}]ms ` +
             `uploads/cut=${this.uploadedThisCut} maxNbrΔ=${this.maxNbrDelta} ${this.nearLeafStr()}`,
@@ -381,8 +416,10 @@ export class QuadtreeManager {
     }
   }
 
-  /** CDLOD morph at a leaf's CENTRE (0=full near .. 1=parent far) — CPU mirror of the shader. */
-  private centerMorph(e: Entry): number {
+  /** CDLOD DISTANCE morph at a leaf's CENTRE (0=full near .. 1=parent far), BEFORE birth-ease —
+   *  CPU mirror of the shader's `mFactor`. This is the "born morph" signal: ≈1 at the split
+   *  distance (leaf born showing the parent surface = no pop), ≪1 if it arrived late. */
+  private distanceMorph(e: Entry): number {
     if (this.kDist <= 0) return 0;
     const dx = e.center[0] - this.camX, dy = e.center[1] - this.camY, dz = e.center[2] - this.camZ;
     const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
@@ -396,7 +433,12 @@ export class QuadtreeManager {
     let t = (dist - e0) / (dParent - e0);
     if (t < 0) t = 0;
     else if (t > 1) t = 1;
-    const distanceM = t * t * (3 - 2 * t); // smoothstep
+    return t * t * (3 - 2 * t); // smoothstep
+  }
+
+  /** CDLOD morph at a leaf's CENTRE with the birth-ease floor (the value actually drawn). */
+  private centerMorph(e: Entry): number {
+    const distanceM = this.distanceMorph(e);
     // Birth-ease floor (mirrors the shader): a fresh leaf reads m=1 (parent) then decays.
     let birth = 1 - (this.clockMs - e.liveAtMs) / BIRTH_MS;
     if (birth < 0) birth = 0;
@@ -437,6 +479,7 @@ export class QuadtreeManager {
       geometry.setAttribute('position', new BufferAttribute(m.positions, 3));
       geometry.setAttribute('normal', new BufferAttribute(m.normals, 3));
       geometry.setAttribute('morphTarget', new BufferAttribute(m.morphTargets, 3));
+      geometry.setAttribute('morphTargetNormal', new BufferAttribute(m.morphTargetNormals, 3));
       geometry.setIndex(new BufferAttribute(m.indices, 1));
       const mat = this.material.clone();
       if (this.opts.debugColor) {
@@ -472,6 +515,17 @@ export class QuadtreeManager {
         attribute('morphTarget', 'vec3'),
         mFinal,
       );
+      // Morph the NORMAL by the SAME factor — the other half of the geomorph. Without this,
+      // a leaf whose GEOMETRY has morphed smooth toward its parent still SHADES with the
+      // fine analytic normals, so the high-frequency detail stays lit across the morph zone
+      // and stops abruptly at the LOD boundary (the "highly textured square"). Blending to
+      // the parent-surface normal (morphTargetNormal) keeps shading in lockstep with the
+      // morphed surface → the boundary becomes a smooth gradient. Re-normalize after the mix.
+      (mat as unknown as NodeMaterialLike).normalNode = mix(
+        attribute('normal', 'vec3'),
+        attribute('morphTargetNormal', 'vec3'),
+        mFinal,
+      ).normalize();
       // Bias the finer leaf toward the camera so it wins the depth test over a coarser
       // ancestor still retained for the brief moment until purge (surfaces match there, so
       // no morph divergence to fight — unlike the old 350 ms time morph).
@@ -516,6 +570,16 @@ export class QuadtreeManager {
       e.status = 'live';
       e.morph = 0;
       e.liveAtMs = this.clockMs; // for ?lodmorphdebug age
+      if (dbg) {
+        // "Born morph": the DISTANCE morph this leaf has the instant it goes live (before
+        // birth-ease). ≈1 ⇒ born at the parent surface and will resolve gradually as the
+        // camera closes = no pop (what speed-aware prefetch buys); ≪1 ⇒ arrived late, the
+        // camera is already past its morph band = a snap (what we're driving toward ~1).
+        const bm = this.distanceMorph(e);
+        this.bornMSum += bm;
+        this.bornMN++;
+        if (bm < this.bornMMin) this.bornMMin = bm;
+      }
       this.uploadedThisCut++;
       this.scene.add(mesh);
       n++;

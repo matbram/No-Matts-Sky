@@ -29,6 +29,7 @@ export interface ChunkMesh {
   positions: Float32Array; // x,y,z per vertex, RELATIVE to `origin`
   normals: Float32Array;
   morphTargets: Float32Array; // low-detail position per vertex (LOD geomorph source)
+  morphTargetNormals: Float32Array; // parent-surface normal per vertex (geomorph SHADING source)
   indices: Uint32Array;
   origin: [number, number, number]; // double world offset to add back at render
   bounds: AABB; // local space (same frame as positions)
@@ -207,6 +208,7 @@ export function meshChunk(
     positions: m.positions,
     normals: m.normals,
     morphTargets: m.morphTargets,
+    morphTargetNormals: m.morphTargetNormals,
     indices: m.indices,
     origin,
     bounds: m.bounds,

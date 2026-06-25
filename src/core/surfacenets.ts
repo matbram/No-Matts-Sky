@@ -31,6 +31,15 @@ export interface ExtractedMesh {
    * in. Equals `positions` exactly when the field carries no `cornerMorphPos`.
    */
   morphTargets: Float32Array;
+  /**
+   * Unit normal of the morph-target (parent) surface per vertex, same order as
+   * `normals`. The render shader lerps normals→morphTargetNormals with the SAME
+   * geomorph factor as positions→morphTargets, so a leaf morphed toward its parent
+   * also SHADES like the parent — without this, the fine-detail normals persist
+   * across the morph zone and the LOD boundary stays visible as a textured patch.
+   * Equals `normals` when the field carries no `cornerMorphPos`.
+   */
+  morphTargetNormals: Float32Array;
   indices: Uint32Array;
   vertexCount: number;
   triangleCount: number;
@@ -205,6 +214,8 @@ export function surfaceNets(
     }
   }
 
+  const mainIdxLen = idx.length; // triangles 0..mainIdxLen are the main surface (pre-skirt)
+
   // Pass 3 — skirts. Extrude tangential-boundary vertices radially inward into
   // curtains; a neighbor patch at a different LOD drops its own overlapping
   // curtain, so the crack between them is hidden (slice spec §5). Rendered
@@ -290,10 +301,46 @@ export function surfaceNets(
   }
 
   const vertexCount = pos.length / 3;
+
+  // Morph-target normals — the parent surface's per-vertex normals, so the shader can lerp
+  // the NORMAL with the geomorph (not just the position). Accumulate face normals from the
+  // MORPH positions over the MAIN surface triangles only (skirt curtains would corrupt base
+  // verts); each face is oriented outward against the fine normals (mirrors pushTri). Any
+  // vertex with no contribution (skirt verts / degenerate) falls back to its fine normal.
+  const mAcc = new Float64Array(vertexCount * 3);
+  for (let t = 0; t < mainIdxLen; t += 3) {
+    const a = idx[t]!, b = idx[t + 1]!, c = idx[t + 2]!;
+    const ax = mpos[a * 3]!, ay = mpos[a * 3 + 1]!, az = mpos[a * 3 + 2]!;
+    const e1x = mpos[b * 3]! - ax, e1y = mpos[b * 3 + 1]! - ay, e1z = mpos[b * 3 + 2]! - az;
+    const e2x = mpos[c * 3]! - ax, e2y = mpos[c * 3 + 1]! - ay, e2z = mpos[c * 3 + 2]! - az;
+    let fx = e1y * e2z - e1z * e2y;
+    let fy = e1z * e2x - e1x * e2z;
+    let fz = e1x * e2y - e1y * e2x;
+    const anx = nrm[a * 3]! + nrm[b * 3]! + nrm[c * 3]!;
+    const any = nrm[a * 3 + 1]! + nrm[b * 3 + 1]! + nrm[c * 3 + 1]!;
+    const anz = nrm[a * 3 + 2]! + nrm[b * 3 + 2]! + nrm[c * 3 + 2]!;
+    if (fx * anx + fy * any + fz * anz < 0) { fx = -fx; fy = -fy; fz = -fz; } // orient outward
+    mAcc[a * 3] = mAcc[a * 3]! + fx; mAcc[a * 3 + 1] = mAcc[a * 3 + 1]! + fy; mAcc[a * 3 + 2] = mAcc[a * 3 + 2]! + fz;
+    mAcc[b * 3] = mAcc[b * 3]! + fx; mAcc[b * 3 + 1] = mAcc[b * 3 + 1]! + fy; mAcc[b * 3 + 2] = mAcc[b * 3 + 2]! + fz;
+    mAcc[c * 3] = mAcc[c * 3]! + fx; mAcc[c * 3 + 1] = mAcc[c * 3 + 1]! + fy; mAcc[c * 3 + 2] = mAcc[c * 3 + 2]! + fz;
+  }
+  const mnrm = new Float32Array(vertexCount * 3);
+  for (let v = 0; v < vertexCount; v++) {
+    const x = mAcc[v * 3]!, y = mAcc[v * 3 + 1]!, z = mAcc[v * 3 + 2]!;
+    const len = Math.sqrt(x * x + y * y + z * z);
+    if (len > 1e-12) {
+      const inv = 1 / len;
+      mnrm[v * 3] = x * inv; mnrm[v * 3 + 1] = y * inv; mnrm[v * 3 + 2] = z * inv;
+    } else {
+      mnrm[v * 3] = nrm[v * 3]!; mnrm[v * 3 + 1] = nrm[v * 3 + 1]!; mnrm[v * 3 + 2] = nrm[v * 3 + 2]!;
+    }
+  }
+
   return {
     positions: Float32Array.from(pos),
     normals: Float32Array.from(nrm),
     morphTargets: Float32Array.from(mpos),
+    morphTargetNormals: mnrm,
     indices: Uint32Array.from(idx),
     vertexCount,
     triangleCount: idx.length / 3,

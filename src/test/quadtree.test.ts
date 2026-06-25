@@ -154,4 +154,20 @@ describe('selectCut', () => {
     expect(cut.length).toBeGreaterThan(6);
     expect(cut.length).toBeLessThanOrEqual(opts.maxLeaves ?? 4096);
   });
+
+  it('speed-aware prefetch requests a finer/earlier cut; prefetchM=0 is unchanged', () => {
+    const base = selectCut(near, opts);
+    // prefetchM=0 ⇒ byte-identical to a plain screen-space-error cut (determinism guard:
+    // the canonical generation core is untouched, and a stationary camera adds no leaves).
+    expect(selectCut(near, { ...opts, prefetchM: 0 }).map(keyOf)).toEqual(base.map(keyOf));
+    // A positive lead distance brings every level's split distance forward (split when
+    // dist < dSplit + prefetchM), so more of the approach is refined early → never fewer
+    // leaves, never coarser. This is what lets a fast descent's finer leaves stream in
+    // before the camera reaches their CDLOD morph band (born at the parent surface, no pop).
+    const pre = selectCut(near, { ...opts, prefetchM: 200_000 });
+    expect(pre.length).toBeGreaterThan(base.length);
+    const baseMaxDepth = Math.max(...base.map((n) => n.path.length));
+    const preMaxDepth = Math.max(...pre.map((n) => n.path.length));
+    expect(preMaxDepth).toBeGreaterThanOrEqual(baseMaxDepth);
+  });
 });

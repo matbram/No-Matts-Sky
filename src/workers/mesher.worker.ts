@@ -35,6 +35,7 @@ ctx.onmessage = (e: MessageEvent<IncomingJob>): void => {
     mesh.positions.buffer,
     mesh.normals.buffer,
     mesh.morphTargets.buffer,
+    mesh.morphTargetNormals.buffer,
     mesh.indices.buffer,
   ]);
 };

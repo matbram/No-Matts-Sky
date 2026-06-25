@@ -240,15 +240,19 @@ describe('meshChunk', () => {
 
   it('matches recorded digests (FROZEN)', () => {
     const m = meshChunk(req, RECIPE, R, 16, 10);
+    // morphTargetNormals is a NEW output (parent-surface normal per vertex, for the geomorph
+    // SHADING blend); positions/normals/indices hashes stay UNCHANGED — we only added data.
     expect({
       positions: fnv1a(m.positions),
       normals: fnv1a(m.normals),
+      morphTargetNormals: fnv1a(m.morphTargetNormals),
       indices: fnv1a(m.indices),
       vertexCount: m.vertexCount,
       triangleCount: m.triangleCount,
     }).toMatchInlineSnapshot(`
       {
         "indices": "506acfe2",
+        "morphTargetNormals": "d1176b75",
         "normals": "00144975",
         "positions": "4b7b7717",
         "triangleCount": 1258,
@@ -331,6 +335,39 @@ describe('meshChunk morph targets (LOD geomorph)', () => {
   it('matches a recorded digest (FROZEN)', () => {
     const m = meshChunk(req, RECIPE, R, 16, 10);
     expect(fnv1a(m.morphTargets)).toMatchInlineSnapshot(`"da3b208a"`);
+  });
+
+  it('emits one UNIT morph-target NORMAL per vertex (geomorph shading source)', () => {
+    const a = meshChunk(req, RECIPE, R, 16, 10);
+    const b = meshChunk(req, RECIPE, R, 16, 10);
+    expect(a.morphTargetNormals.length).toBe(a.vertexCount * 3);
+    expect(fnv1a(a.morphTargetNormals)).toBe(fnv1a(b.morphTargetNormals)); // deterministic
+    // Every parent-surface normal is unit length (the shader mixes + re-normalizes, but a
+    // degenerate/zero normal here would still wash out shading) — the basic correctness gate.
+    for (let v = 0; v < a.vertexCount; v++) {
+      const len = Math.hypot(
+        a.morphTargetNormals[v * 3]!,
+        a.morphTargetNormals[v * 3 + 1]!,
+        a.morphTargetNormals[v * 3 + 2]!,
+      );
+      expect(len).toBeGreaterThan(0.999);
+      expect(len).toBeLessThan(1.001);
+    }
+  });
+
+  it('parent normals point outward (same hemisphere as the fine normals)', () => {
+    // The parent surface is a smoothed version of the fine surface, so its normals should
+    // broadly agree (outward) with the fine analytic normals — a sign error would invert
+    // shading across the morph zone. Average dot over all vertices must be strongly positive.
+    const m = meshChunk(req, RECIPE, R, 16, 10);
+    let dotSum = 0;
+    for (let v = 0; v < m.vertexCount; v++) {
+      dotSum +=
+        m.normals[v * 3]! * m.morphTargetNormals[v * 3]! +
+        m.normals[v * 3 + 1]! * m.morphTargetNormals[v * 3 + 1]! +
+        m.normals[v * 3 + 2]! * m.morphTargetNormals[v * 3 + 2]!;
+    }
+    expect(dotSum / m.vertexCount).toBeGreaterThan(0.9);
   });
 
   it('differs from the base surface (the morph is actually active)', () => {

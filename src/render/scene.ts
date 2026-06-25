@@ -87,6 +87,18 @@ const UPLOAD_PER_FRAME = 4;
 const BURST_PER_FRAME = 24;
 // How far ahead of the camera (in per-frame velocity units) to prioritize work.
 const LOOKAHEAD_FRAMES = 30;
+// Speed-aware PREFETCH lead TIME (s): finer leaves are requested when the camera is
+// `approachSpeed · PREFETCH_S` meters from their natural split distance, so they finish
+// streaming (~0.5–0.7 s observed) BEFORE the camera reaches their CDLOD morph band and
+// resolve gradually from the parent surface instead of snapping in late. ~0 at rest /
+// lateral motion (no wasted leaves); kicks in on a plunge. [T] dial up if pops persist,
+// down if a fast descent dips below 60 fps. PREFETCH_MAX_M caps the lead so a hyper-plunge
+// can't force the whole near-field to maxDepth and blow the leaf budget.
+const PREFETCH_S = 0.7;
+const PREFETCH_MAX_M = 6000;
+// EMA smoothing for the approach-rate estimate (per-frame blend of the new sample), so a
+// single jittery frame-time doesn't swing the prefetch distance. ~0.15 ≈ a few-frame lag.
+const APPROACH_EMA = 0.15;
 
 interface Preset {
   target: Vector3; // world-space look-at
@@ -321,6 +333,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const forward = new Vector3();
   const vel = new Vector3();
   const lookahead = new Vector3();
+  // Speed-aware prefetch: smoothed rate (m/s) at which the camera is closing on the
+  // planet centre (positive = descending). prevDistCenter seeds the per-frame delta.
+  let approachRateEMA = 0;
+  let prevDistCenter = -1;
 
   // ── Walking (Step 4) + creative flight: floating-origin + body-fixed player ──
   let mode: 'fly' | 'walk' | 'creative' = 'fly';
@@ -522,11 +538,21 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // continuously with distance and reaches the parent surface exactly at the split distance.
       const curSplitPx = mode === 'walk' ? WALK_SPLIT_PX : mode === 'creative' ? CREATIVE_SPLIT_PX : FLY_SPLIT_PX;
       const kDist = vpHeight / (2 * Math.tan(fovY / 2)) / curSplitPx;
-      manager.setMorphParams(kDist, worldCam.x, worldCam.y, worldCam.z);
+      manager.setMorphParams(kDist, worldCam.x, worldCam.y, worldCam.z, approachRateEMA);
 
       // Dynamic near/far from altitude + horizon distance, every frame.
       const distCenter = worldCam.length();
       const horizon = Math.sqrt(Math.max(0, distCenter * distCenter - R * R));
+
+      // Speed-aware prefetch: track how fast the camera is closing on the planet centre
+      // (descent rate, m/s, EMA-smoothed). ~0 for lateral orbit/walk, large on a plunge —
+      // so finer leaves are requested early ONLY when actually approaching (no wasted
+      // leaves at rest). Fed into the cut below as a lead distance (approachRate·PREFETCH_S).
+      if (dt > 0) {
+        const inst = prevDistCenter >= 0 ? (prevDistCenter - distCenter) / (dt / 1000) : 0;
+        approachRateEMA += (inst - approachRateEMA) * APPROACH_EMA;
+      }
+      prevDistCenter = distCenter;
       if (mode === 'walk') {
         // Eye-height altitude above the mean radius is unreliable (mountains/basins),
         // so use a fixed 10 cm near for close terrain; the 0.1 m : ~hundreds-of-km
@@ -574,6 +600,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
           halfFov = Math.atan(Math.tan(fovY / 2) * Math.sqrt(1 + aspect * aspect)) * 1.2;
         }
         lookahead.copy(worldCam).addScaledVector(vel, LOOKAHEAD_FRAMES); // generate ahead of motion
+        // Lead distance = descent speed × lead time, capped. 0 when not approaching.
+        const prefetchM = Math.min(PREFETCH_MAX_M, Math.max(0, approachRateEMA) * PREFETCH_S);
         manager.update(
           {
             position: [worldCam.x, worldCam.y, worldCam.z],
@@ -584,6 +612,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
           },
           [lookahead.x, lookahead.y, lookahead.z],
           splitPxOverride,
+          prefetchM,
         );
         lastCutPos.copy(worldCam);
         forceCut = false;
