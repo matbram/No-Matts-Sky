@@ -116,6 +116,15 @@ export class PlayerController {
      * the fine terrain bumps. Defaults to the recipe's octaves (the old behavior).
      */
     private readonly groundOctaves?: number,
+    /**
+     * Optional probe of the ACTUAL RENDERED terrain height (a downward raycast against
+     * the live leaf meshes, supplied by the render shell). Returns the surface radius
+     * from the planet center under (x,y,z), or 0 if nothing is drawn there. During LOD
+     * churn a coarser leaf can be retained/rendered metres ABOVE the fine surface the
+     * analytic probe sees, so the eye sank below the visible ground; flooring to the
+     * higher of analytic and rendered makes you stand on what's actually drawn.
+     */
+    private readonly groundProbe?: (x: number, y: number, z: number) => number,
   ) {}
 
   /** Place the player at a body-fixed position and settle onto the ground. */
@@ -225,6 +234,13 @@ export class PlayerController {
       const m = this._moveDir;
       this.probeFootprint(px, py, pz, STEP_AHEAD * m.x, STEP_AHEAD * m.y, STEP_AHEAD * m.z, r);
     }
+    // Floor to the ACTUAL RENDERED surface when it sits above the analytic one. During
+    // LOD churn a coarser leaf retained over the fine one renders metres higher; the
+    // analytic footprint can't see it, so the eye sank below the visible ground. The
+    // render shell's raycast returns that drawn height — take the higher of the two so
+    // the eye is never below what's on screen. 0 = nothing drawn there (use analytic).
+    const renderedR = this.groundProbe ? this.groundProbe(px, py, pz) : 0;
+    if (renderedR > this._fpMaxR) this._fpMaxR = renderedR;
     const groundR = this._fpMaxR + EYE;
 
     // 4. Integrate radius; hard floor at the ground (never penetrate).
@@ -313,6 +329,7 @@ export class PlayerController {
       this._surf, this.groundOctaves,
     );
     this._centerSurfR = this._surf[0]!;
+    this._fpMaxR = this._centerSurfR; // so altitude() (eye above surface) works in fly too
     this.orient();
     void spinAngle(); // Step 5 seam (identity now)
   }
@@ -357,7 +374,7 @@ export class PlayerController {
   }
   /** Eye height above the local terrain surface (≈ EYE when grounded), meters. */
   altitude(): number {
-    return this.worldPos.length() - this._centerSurfR;
+    return this.worldPos.length() - this._fpMaxR; // eye above the floor we stand on (≈ EYE)
   }
   /** Eye height above the mean radius (datum), meters. */
   altitudeAboveDatum(): number {

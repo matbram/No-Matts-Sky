@@ -331,13 +331,8 @@ export class QuadtreeManager {
     return out;
   }
 
-  /**
-   * The deepest LIVE leaf whose face-(u,v) rect contains the world direction (wx,wy,wz),
-   * with its quadtree depth + geomorph value — for ?clipdebug, to see whether the mesh
-   * underfoot reached MAX_DEPTH and whether it's mid-morph. Debug-only (linear scan).
-   * Direction→(u,v): face = argmax(dir·normal); cube = dir/(dir·normal); u=cube·uDir, v=cube·vDir.
-   */
-  leafInfoUnder(wx: number, wy: number, wz: number): { depth: number; morph: number } | null {
+  /** Cube face + (u,v) of a world direction. face = argmax(dir·normal); cube = dir/(dir·normal). */
+  private faceUVOf(wx: number, wy: number, wz: number): { face: number; u: number; v: number } {
     const inv = 1 / Math.sqrt(wx * wx + wy * wy + wz * wz);
     const dx = wx * inv, dy = wy * inv, dz = wz * inv;
     let face = 0, best = -Infinity;
@@ -349,8 +344,20 @@ export class QuadtreeManager {
     const fb = CUBE_FACES[face]!;
     const nc = dx * fb.normal[0] + dy * fb.normal[1] + dz * fb.normal[2];
     const cx = dx / nc, cy = dy / nc, cz = dz / nc;
-    const u = cx * fb.uDir[0] + cy * fb.uDir[1] + cz * fb.uDir[2];
-    const v = cx * fb.vDir[0] + cy * fb.vDir[1] + cz * fb.vDir[2];
+    return {
+      face,
+      u: cx * fb.uDir[0] + cy * fb.uDir[1] + cz * fb.uDir[2],
+      v: cx * fb.vDir[0] + cy * fb.vDir[1] + cz * fb.vDir[2],
+    };
+  }
+
+  /**
+   * The deepest LIVE leaf whose face-(u,v) rect contains the world direction (wx,wy,wz),
+   * with its quadtree depth + geomorph value — for ?clipdebug, to see whether the mesh
+   * underfoot reached MAX_DEPTH and whether it's mid-morph. Debug-only (linear scan).
+   */
+  leafInfoUnder(wx: number, wy: number, wz: number): { depth: number; morph: number } | null {
+    const { face, u, v } = this.faceUVOf(wx, wy, wz);
     let result: { depth: number; morph: number } | null = null;
     for (const e of this.entries.values()) {
       if (e.status !== 'live' || e.node.face !== face) continue;
@@ -360,6 +367,24 @@ export class QuadtreeManager {
       if (!result || depth > result.depth) result = { depth, morph: e.morph };
     }
     return result;
+  }
+
+  /**
+   * All LIVE leaf meshes whose face-(u,v) rect contains the world direction — usually
+   * 1, but several when coarse leaves are still retained over fine ones during LOD
+   * churn. Pre-filters the player's collision raycast to these few meshes (not all ~380)
+   * so it can floor the eye to whatever is actually DRAWN under it.
+   */
+  leavesUnder(wx: number, wy: number, wz: number): Mesh[] {
+    const { face, u, v } = this.faceUVOf(wx, wy, wz);
+    const out: Mesh[] = [];
+    for (const e of this.entries.values()) {
+      if (e.status !== 'live' || !e.mesh || e.node.face !== face) continue;
+      const r = uvRectFromPath(e.node.path);
+      if (u < r.u0 || u > r.u1 || v < r.v0 || v > r.v1) continue;
+      out.push(e.mesh);
+    }
+    return out;
   }
 
   stats(): StreamStats {

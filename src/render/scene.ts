@@ -328,10 +328,37 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   let clipLogN = 0;
   let lastClip = ''; // last clip-debug summary, mirrored to the HUD
 
+  // Collision raycast (every walk frame): the player floors the eye to the HIGHEST rendered
+  // leaf under it, so it never sinks below the drawn terrain when a coarse leaf is retained
+  // above the fine one during LOD churn (the ?clipdebug-confirmed cause). Pre-filtered to the
+  // leaves under the player (manager.leavesUnder) and far-capped → a handful of triangle tests.
+  const _probeRay = new Raycaster();
+  _probeRay.far = 60;
+  const _probeUp = new Vector3();
+  const _probeOrigin = new Vector3();
+  const _probeDir = new Vector3();
+  const _probeHit = new Vector3();
+  function renderedSurfaceR(x: number, y: number, z: number): number {
+    const meshes = manager.leavesUnder(x, y, z);
+    if (meshes.length === 0) return 0; // nothing drawn here → use the analytic floor
+    const inv = 1 / Math.sqrt(x * x + y * y + z * z);
+    _probeUp.set(x * inv, y * inv, z * inv);
+    // Render space (relative to renderOrigin); start 20 m above the eye, cast straight down.
+    _probeOrigin
+      .set(x - renderOrigin.x, y - renderOrigin.y, z - renderOrigin.z)
+      .addScaledVector(_probeUp, 20);
+    _probeDir.copy(_probeUp).multiplyScalar(-1);
+    _probeRay.set(_probeOrigin, _probeDir);
+    const hits = _probeRay.intersectObjects(meshes, false);
+    if (hits.length === 0) return 0;
+    _probeHit.copy(hits[0]!.point).add(renderOrigin); // render → world (double) → radius
+    return _probeHit.length();
+  }
+
   function enterWalk(): void {
     surfaceAt(recipe, R, SURFACE_DIR.x, SURFACE_DIR.y, SURFACE_DIR.z, _surf7, groundOct);
     _spawn.copy(SURFACE_DIR).multiplyScalar(_surf7[0]! + 1.7); // body-fixed spawn at eye height
-    player = player ?? new PlayerController(recipe, R, groundOct);
+    player = player ?? new PlayerController(recipe, R, groundOct, renderedSurfaceR);
     player.setFly(false); // walk: gravity + ground collision (reset() snaps to ground)
     player.reset(_spawn, 0, 0);
     controls.enabled = false;
@@ -350,7 +377,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // PlayerController (setFly) so the sphere-stable look basis + floating origin are shared.
   function enterCreative(): void {
     _spawn.copy(camera.position).add(renderOrigin); // current camera world position
-    player = player ?? new PlayerController(recipe, R, groundOct);
+    player = player ?? new PlayerController(recipe, R, groundOct, renderedSurfaceR);
     player.setFly(true);
     player.reset(_spawn, 0, 0);
     controls.enabled = false;
