@@ -31,6 +31,27 @@ export interface TerrainRecipe {
   seed: number;
 }
 
+/**
+ * Max fBm octaves at the finest LOD. Bounds per-leaf cost (fBm is O(octaves)) and
+ * caps detail once finer octaves fall below the cell size, where they'd only
+ * alias. [T] tunable — lower it for perf headroom on weaker GPUs.
+ */
+export const OCT_MAX = 15;
+
+/**
+ * Octave count for a leaf at quadtree depth `lod`: ONE finer octave per level.
+ * With lacunarity 2 the finest octave's wavelength then stays a constant ratio to
+ * the cell size (which halves each level) → detail is always "matched," never
+ * aliased. Capped at OCT_MAX. The geomorph relies on adjacent levels differing by
+ * exactly one octave: a fine leaf's morph target (its value minus the finest
+ * octave) is then its coarse parent's detail level → crack-free LOD transitions.
+ *
+ * lod 0 → recipe.octaves (== today), so coarse/orbit leaves are unchanged.
+ */
+export function lodOctaves(recipe: TerrainRecipe, lod: number): number {
+  return Math.min(OCT_MAX, recipe.octaves + lod);
+}
+
 /** The slice's single recipe, keyed off the planet's terrain seed. [T] tunable. */
 export function sliceTerrainRecipe(terrainSeed: number): TerrainRecipe {
   return {
@@ -67,6 +88,11 @@ const _t = new Float64Array(4);
  * Optional `outLo` receives the terrain VALUE one octave smoother (the main fBm's
  * "parent-resolution" value under the SAME domain warp) — the LOD geomorph target.
  * No gradient is produced for it (morph normals are snapped). `out` is unaffected.
+ *
+ * Optional `octaveCount` overrides the recipe's octave count for the MAIN terrain
+ * fBm only (the LOD-adaptive detail — see `lodOctaves`). The domain warp keeps the
+ * recipe's octaves so q(p) is identical across LODs; only the high-frequency detail
+ * (and its geomorph target) scales, which is exactly what the morph is built to fade.
  */
 export function terrainAt(
   recipe: TerrainRecipe,
@@ -75,14 +101,19 @@ export function terrainAt(
   pz: number,
   out: Float64Array,
   outLo?: Float64Array,
+  octaveCount?: number,
 ): void {
   const A = recipe.warpStrength;
   const s = recipe.seed;
   const o = recipe.octaves;
+  const oMain = octaveCount ?? o;
   const lac = recipe.lacunarity;
   const g = recipe.gain;
 
-  // Three decorrelated warp channels (distinct seeds + offsets).
+  // Three decorrelated warp channels (distinct seeds + offsets). Warp octaves stay
+  // fixed at the recipe's count so the warped sample point q(p) is identical for
+  // every leaf regardless of LOD → adjacent leaves agree, the geomorph only has to
+  // hide the MAIN fBm's finest octave.
   fbm3((s ^ 0x1111_1111) >>> 0, px + 11.5, py + 5.2, pz + 19.3, o, lac, g, _wx);
   fbm3((s ^ 0x2222_2222) >>> 0, px + 7.7, py + 13.1, pz + 3.9, o, lac, g, _wy);
   fbm3((s ^ 0x3333_3333) >>> 0, px + 2.4, py + 9.8, pz + 27.1, o, lac, g, _wz);
@@ -92,7 +123,7 @@ export function terrainAt(
   const qz = pz + A * _wz[0]!;
   // Same warp for the morph target → its only difference from `out[0]` is the
   // dropped finest octave, i.e. a purely radial detail-smoothing displacement.
-  fbm3(s, qx, qy, qz, o, lac, g, _n, outLo);
+  fbm3(s, qx, qy, qz, oMain, lac, g, _n, outLo);
 
   const nx = _n[1]!;
   const ny = _n[2]!;
@@ -182,13 +213,14 @@ export function surfaceAt(
   dy: number,
   dz: number,
   out: Float64Array,
+  octaveCount?: number,
 ): void {
   const inv = 1 / Math.sqrt(dx * dx + dy * dy + dz * dz);
   const rx = dx * inv;
   const ry = dy * inv;
   const rz = dz * inv;
   const scale = recipe.noiseScale;
-  terrainAt(recipe, rx * scale, ry * scale, rz * scale, _sT);
+  terrainAt(recipe, rx * scale, ry * scale, rz * scale, _sT, undefined, octaveCount);
   const surfaceRadius = planetRadius + recipe.height * _sT[0]!;
   // ∇D at the surface point → outward normal = normalize(−∇D), matching the mesh.
   assembleDensity(

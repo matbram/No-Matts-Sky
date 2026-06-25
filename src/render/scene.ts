@@ -30,7 +30,7 @@ import { WebGPURenderer, MeshStandardNodeMaterial } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { EARTH_RADIUS_M } from '../core/constants.ts';
 import { buildCubeSphere } from '../core/cubesphere.ts';
-import { sliceTerrainRecipe, surfaceAt } from '../core/density.ts';
+import { sliceTerrainRecipe, surfaceAt, lodOctaves } from '../core/density.ts';
 import { sliceFacts } from '../core/facts.ts';
 import { childSeed, SALT } from '../core/seedchain.ts';
 import { QuadtreeManager } from './quadtreeManager.ts';
@@ -50,6 +50,24 @@ export interface SliceScene {
 
 // A fixed surface look-at direction for the close presets (some arbitrary spot).
 const SURFACE_DIR = new Vector3(0.2, 1, 0.15).normalize();
+
+// Finest quadtree depth. At Earth radius: depth 15 ≈ 9.5 m cells underfoot (depth
+// 14 ≈ 19 m, 16 ≈ 4.8 m) — enough near-field detail that walking shows parallax.
+// Paired with LOD-adaptive octaves (density.lodOctaves) so the fine cells actually
+// carry meter-scale content. [T] dial DOWN (15→14→…) if the surface drops below 60 fps.
+const MAX_DEPTH = 15;
+// Walk-mode forward-cone half-angle multiplier over the frustum corners (a touch
+// wider than fly's 1.2 so a turn has slack before the recut-on-rotation fires).
+const WALK_CONE_MARGIN = 1.4;
+// Walk-mode: re-cut the streaming cone when the view turns past this much, so the
+// cone follows the look direction (translation alone would leave stale/blank tiles
+// after a turn). Kept under the cone's slack so the frustum never outruns the cut.
+const RECUT_ROT_COS = Math.cos((20 * Math.PI) / 180);
+// Walk-mode split threshold (px). Wider than fly's 300 so the now-graded LOD (which
+// places ~150 leaves per level) stays within budget at the finer MAX_DEPTH: the
+// nearest ground is still meshed to MAX_DEPTH (it projects far over this), only the
+// mid-distance transition bands coarsen. Fly/orbit keep the manager's 300. [T] dial.
+const WALK_SPLIT_PX = 420;
 
 // Finished meshes uploaded to the GPU per frame (slice spec §7 — the only
 // generation cost allowed in the frame). The rest queue and drain over frames.
@@ -141,6 +159,9 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // Terrain recipe from the slice planet's coordinate-derived seed.
   const terrainSeed = childSeed(sliceFacts().seed, 0, SALT.terrain);
   const recipe = sliceTerrainRecipe(terrainSeed);
+  // Octave count of the FINEST leaf — what the collision probe must sample so the
+  // player stands on the same bumps the deepest mesh shows (not a smoother field).
+  const groundOct = lodOctaves(recipe, MAX_DEPTH);
   // Double-sided so skirt curtains show regardless of winding. Fully OPAQUE: the
   // LOD transition is a GEOMETRY morph (the manager clones this per leaf and drives
   // a per-leaf morph uniform that lerps each vertex morphTarget→position), so detail
@@ -153,10 +174,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   });
   material.wireframe = params.has('wire'); // debug: see the tessellation / where lines fall
   // splitPx 300 (smaller, gentler LOD steps — affordable after the ~13× meshing
-  // speedup); maxDepth 10 caps leaf counts.
+  // speedup); maxDepth = MAX_DEPTH gives meter-scale near-field cells for walking.
   const manager = new QuadtreeManager(scene, material, recipe, R, {
     splitPx: 300,
-    maxDepth: 10,
+    maxDepth: MAX_DEPTH,
     // Skirts OFF by default — the apron covers LOD-transition holes and the skirts were
     // the visible boundary grid (?noskirt confirmed clean). ?skirt re-enables for A/B.
     skirts: params.has('skirt'),
@@ -234,6 +255,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   let targetWorld = new Vector3(0, 0, 0);
   let forceCut = true;
   const lastCutPos = new Vector3();
+  const lastCutForward = new Vector3(); // walk: look dir at the last cut (recut-on-rotation)
   const prevWorldCam = new Vector3();
 
   function applyPreset(p: Preset): void {
@@ -273,14 +295,11 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const _spawn = new Vector3();
   const _surf7 = new Float64Array(7);
   const playerWorld = new Vector3();
-  const _walkPrev = new Vector3(); // previous-frame player pos (for the movement log)
-  let _walkLogMs = 0; // throttle accumulator for the walk-movement log
 
   function enterWalk(): void {
-    surfaceAt(recipe, R, SURFACE_DIR.x, SURFACE_DIR.y, SURFACE_DIR.z, _surf7);
+    surfaceAt(recipe, R, SURFACE_DIR.x, SURFACE_DIR.y, SURFACE_DIR.z, _surf7, groundOct);
     _spawn.copy(SURFACE_DIR).multiplyScalar(_surf7[0]! + 1.7); // body-fixed spawn at eye height
-    _walkPrev.copy(_spawn);
-    player = player ?? new PlayerController(recipe, R);
+    player = player ?? new PlayerController(recipe, R, groundOct);
     player.reset(_spawn, 0, 0);
     controls.enabled = false;
     renderOrigin.copy(_spawn);
@@ -292,10 +311,6 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     mode = 'walk';
     forceCut = true;
     canvas.focus(); // keyboard focus → WASD works immediately (no click needed)
-    console.log(
-      '[NMS] enterWalk → active=',
-      (document.activeElement && (document.activeElement.id || document.activeElement.tagName)) ?? '?',
-    );
   }
   // Request pointer lock, swallowing the promise rejection browsers throw if it's
   // called too soon after an Esc-exit ("cannot be acquired immediately after exit").
@@ -318,11 +333,6 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   }
 
   const onKeyDown = (e: KeyboardEvent): void => {
-    console.log(
-      '[NMS key↓]', e.code, 'mode=', mode,
-      'active=', (document.activeElement && (document.activeElement.id || document.activeElement.tagName)) ?? '?',
-      'lock=', document.pointerLockElement === canvas,
-    );
     switch (e.code) {
       case 'KeyW': held.forward = true; break;
       case 'KeyS': held.back = true; break;
@@ -337,7 +347,6 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // Esc is NOT handled: the browser auto-frees the mouse; we stay in walk mode
       // (click to re-lock). Exit walk via 1/2/3.
     }
-    if (mode === 'walk') console.log('[NMS held]', JSON.stringify(held));
   };
   const onKeyUp = (e: KeyboardEvent): void => {
     switch (e.code) {
@@ -360,10 +369,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       player.addMouse(e.movementX, e.movementY);
     }
   };
-  // Capture phase: receive the event BEFORE any bubble-phase handler a browser
-  // extension may have installed (the "Gistant" content-script seen in the console
-  // is a prime suspect for swallowing keydowns). If a [NMS key↓] log STILL doesn't
-  // appear for W, the event is being blocked even earlier → escalate.
+  // Capture phase: receive WASD before any bubble-phase handler (e.g. a browser
+  // extension content-script) can stopPropagation() and starve us — the asymmetry
+  // that earlier looked like "mouse works, keys don't." Harmless when no such
+  // handler exists. Must remove with the SAME { capture: true } option.
   window.addEventListener('keydown', onKeyDown, { capture: true });
   window.addEventListener('keyup', onKeyUp, { capture: true });
   canvas.addEventListener('click', onClick);
@@ -388,19 +397,6 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
         // origin near the player so GPU floats stay tiny (no jitter).
         player.update(dt / 1000, held);
         player.getWorldPos(playerWorld);
-        // Throttled movement log: distinguishes "held never set" vs "moving but
-        // invisible" vs "held set, not moving" while a move key is pressed.
-        _walkLogMs += dt;
-        if ((held.forward || held.back || held.left || held.right || held.jump) && _walkLogMs > 330) {
-          _walkLogMs = 0;
-          console.log(
-            '[NMS walk] held=', JSON.stringify(held),
-            'spd=', player.speed().toFixed(1),
-            'dmove=', playerWorld.distanceTo(_walkPrev).toFixed(3), 'm/frame',
-            'alt=', player.altitude().toFixed(2),
-          );
-        }
-        _walkPrev.copy(playerWorld);
         camera.position.copy(playerWorld).sub(renderOrigin);
         if (camera.position.lengthSq() > RECENTER_THRESHOLD * RECENTER_THRESHOLD) {
           renderOrigin.copy(playerWorld);
@@ -435,14 +431,26 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
 
       const distToTarget = worldCam.distanceTo(targetWorld);
       // Re-cut when the camera has moved enough (fixed small step while walking;
-      // adaptive while flying).
+      // adaptive while flying) OR — in walk — when the view has TURNED enough that
+      // the forward cone needs to swing to follow it. Translation alone would leave
+      // tiles behind you live and tiles ahead unmeshed after a turn.
       const moved = worldCam.distanceTo(lastCutPos);
       const recutDist = mode === 'walk' ? 8 : Math.max(50, distToTarget * 0.02);
-      if (forceCut || moved > recutDist) {
+      let turned = false;
+      if (mode === 'walk' && player) {
+        player.getForward(forward); // look direction (Step 4: render space == world)
+        turned = forward.dot(lastCutForward) < RECUT_ROT_COS;
+      }
+      if (forceCut || moved > recutDist || turned) {
         let halfFov: number;
+        let splitPxOverride: number | undefined;
         if (mode === 'walk' && player) {
-          player.getForward(forward); // look direction (Step 4: render space == world)
-          halfFov = Math.PI; // no cone cull while walking → smooth look-around (horizon cull still applies)
+          // `forward` already set above. Use a forward cone (NOT the full hemisphere)
+          // so the finer MAX_DEPTH near-field doesn't blow up the leaf count; the
+          // recut-on-rotation above keeps it pointed where you look.
+          halfFov = Math.atan(Math.tan(fovY / 2) * Math.sqrt(1 + aspect * aspect)) * WALK_CONE_MARGIN;
+          splitPxOverride = WALK_SPLIT_PX; // leaner cut at the finer walk MAX_DEPTH
+          lastCutForward.copy(forward);
         } else {
           forward.copy(targetWorld).sub(worldCam).normalize(); // orbit controls always look at target
           // Cone half-angle covering the frustum corners, with a small margin so
@@ -459,6 +467,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
             halfFov,
           },
           [lookahead.x, lookahead.y, lookahead.z],
+          splitPxOverride,
         );
         lastCutPos.copy(worldCam);
         forceCut = false;

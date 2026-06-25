@@ -86,6 +86,12 @@ export class PlayerController {
   constructor(
     private readonly recipe: TerrainRecipe,
     private readonly planetRadius: number,
+    /**
+     * Octave count for the collision probe — must match the FINEST visible mesh
+     * (lodOctaves(recipe, maxDepth)), or the player hovers above / clips through
+     * the fine terrain bumps. Defaults to the recipe's octaves (the old behavior).
+     */
+    private readonly groundOctaves?: number,
   ) {}
 
   /** Place the player at a body-fixed position and settle onto the ground. */
@@ -150,7 +156,15 @@ export class PlayerController {
     this._up.copy(this.worldPos).multiplyScalar(1 / r);
 
     // 3. Ground probe along the new direction (analytic → matches the mesh exactly).
-    surfaceAt(this.recipe, this.planetRadius, this.worldPos.x, this.worldPos.y, this.worldPos.z, this._surf);
+    surfaceAt(
+      this.recipe,
+      this.planetRadius,
+      this.worldPos.x,
+      this.worldPos.y,
+      this.worldPos.z,
+      this._surf,
+      this.groundOctaves,
+    );
     const groundR = this._surf[0]! + EYE;
 
     // 4. Integrate radius; hard floor at the ground (never penetrate).

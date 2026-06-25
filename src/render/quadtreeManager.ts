@@ -136,11 +136,11 @@ export class QuadtreeManager {
    * around (camera position biased along its velocity) so leaves ahead of motion
    * mesh first.
    */
-  update(camera: CameraView, lookahead: [number, number, number]): void {
+  update(camera: CameraView, lookahead: [number, number, number], splitPx?: number): void {
     const cut = selectCut(camera, {
       radius: this.radius,
       heightMargin: this.heightMargin,
-      splitPx: this.opts.splitPx,
+      splitPx: splitPx ?? this.opts.splitPx,
       maxDepth: this.opts.maxDepth,
     });
 

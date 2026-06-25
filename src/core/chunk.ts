@@ -14,7 +14,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { faceDirection, wrapFaceUV } from './cubesphere.ts';
-import { terrainAt, assembleDensity, type TerrainRecipe } from './density.ts';
+import { terrainAt, assembleDensity, lodOctaves, type TerrainRecipe } from './density.ts';
 import { surfaceNets, type AABB, type SampledField } from './surfacenets.ts';
 
 /** A chunk address: a cube face + a quadtree path of quadrants (0..3). */
@@ -124,6 +124,12 @@ export function meshChunk(
   const cnx = nx + 1, cny = ny + 1, cnz = nz + 1;
   const scale = recipe.noiseScale;
   const height = recipe.height;
+  // LOD-adaptive detail: a deeper (finer) leaf adds one fBm octave per level, so
+  // the finest feature stays matched to this leaf's (halving) cell size. The morph
+  // target (outLo, one octave coarser) is then exactly the parent leaf's detail →
+  // the existing geomorph + cross-fade hide the LOD transition. lod 0 == recipe
+  // octaves, so coarse/orbit leaves are byte-identical to before.
+  const oct = lodOctaves(recipe, req.lod);
 
   // Pass 1 — per COLUMN (i,j): the terrain noise depends only on direction, so
   // evaluate it ONCE per column and reuse for every radial layer. (Recomputing it
@@ -145,7 +151,7 @@ export function meshChunk(
       colDir[ci * 3] = dir[0];
       colDir[ci * 3 + 1] = dir[1];
       colDir[ci * 3 + 2] = dir[2];
-      terrainAt(recipe, dir[0] * scale, dir[1] * scale, dir[2] * scale, _t, _tLo);
+      terrainAt(recipe, dir[0] * scale, dir[1] * scale, dir[2] * scale, _t, _tLo, oct);
       colT[ci * 4] = _t[0]!;
       colT[ci * 4 + 1] = _t[1]!;
       colT[ci * 4 + 2] = _t[2]!;

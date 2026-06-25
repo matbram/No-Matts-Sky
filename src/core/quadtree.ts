@@ -214,7 +214,18 @@ export function selectCut(camera: CameraView, opts: SelectOpts): QuadNode[] {
     const dy = camera.position[1] - b.center[1];
     const dz = camera.position[2] - b.center[2];
     const dist = Math.hypot(dx, dy, dz);
-    const px = projectedSize(b.radius, dist, camera.viewportHeight, camera.fovY);
+    // LOD/split test uses the node's TANGENTIAL patch size, NOT the height-inflated
+    // cull radius. The ±heightMargin envelope is for culling tall peaks (above), but
+    // folding it into the screen-size metric made every deep leaf project as ~14 km
+    // regardless of its true tessellation size — so once a region was close enough to
+    // want depth ~9 it wanted ALL the way to maxDepth, collapsing near/far LOD
+    // discrimination and blowing the leaf count up to the cap. Tangential-only is the
+    // standard screen-space-error metric and grades detail by distance (near = fine).
+    // At orbit/fly distances BOUND_FACTOR·radius ≫ heightMargin, so those cuts are
+    // unchanged; only the near/deep regime (the blow-up) is corrected.
+    const bd = node.path.length <= MAX_DEPTH_TABLE ? node.path.length : MAX_DEPTH_TABLE;
+    const lodRadius = BOUND_FACTOR[bd]! * opts.radius;
+    const px = projectedSize(lodRadius, dist, camera.viewportHeight, camera.fovY);
 
     if (node.path.length < opts.maxDepth && px > opts.splitPx && leaves.length < maxLeaves) {
       for (const child of childrenOf(node)) stack.push(child);
