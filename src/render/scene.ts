@@ -62,22 +62,23 @@ interface Preset {
 }
 
 export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene> {
-  // REVERSED-Z DEPTH (default on): at real planet scale the near:far ratio is ~1:30,
-  // so a plain float32 depth buffer resolves only ~1 m near the surface and the
-  // per-leaf apron-overlap + skirt geometry z-fought into thin seam lines at every
-  // boundary (prominent under WebGPU; faint under WebGL2 — confirmed with the headless
-  // harness in scripts/shoot.mjs). Reversed-Z spends float32's precision where it's
-  // needed (near the camera) and clears the seams, at zero shader cost.
-  // Debug/diagnostic URL toggles (no effect in normal use): ?norevz disables it for
-  // A/B; ?logdepth uses logarithmic depth instead; ?webgl forces the WebGL2 backend
-  // (stable in headless CI, where software WebGPU drops its device).
+  // DEPTH PRECISION (logarithmic, default on): at real planet scale the near:far
+  // ratio is ~1:30, so a plain float32 depth buffer resolves only ~1 m near the
+  // surface and the per-leaf apron-overlap + skirt geometry z-fought into thin seam
+  // lines at every boundary. Logarithmic depth distributes precision across the whole
+  // range and clears the z-fighting in BOTH backends. (Reversed-Z is cheaper but its
+  // Three r184 WebGPU path is buggy — it dithered the inset backdrop through the
+  // terrain in big patches — so we don't use it by default.)
+  // Debug/diagnostic URL toggles (no effect in normal use): ?nolog disables log depth
+  // for A/B; ?revz tries reversed-Z instead; ?webgl forces the WebGL2 backend (stable
+  // in headless CI, where software WebGPU drops its device).
   const params = new URLSearchParams(typeof location !== 'undefined' ? location.search : '');
   const renderer = new WebGPURenderer({
     canvas,
     antialias: true,
     forceWebGL: params.has('webgl'),
-    reversedDepthBuffer: !params.has('norevz'),
-    logarithmicDepthBuffer: params.has('logdepth'),
+    logarithmicDepthBuffer: !params.has('nolog'),
+    reversedDepthBuffer: params.has('revz'),
   });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.toneMapping = ACESFilmicToneMapping;
