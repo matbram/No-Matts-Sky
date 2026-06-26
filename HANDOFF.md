@@ -114,6 +114,28 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
   cube-face *corner* during the fastest climb (a `balanceCut` cross-face corner-probe limitation, pre-existing,
   not fixable by the re-balance; the 500 ms birth-ease masks it to ~1 level) — tiny/transient, not the pop.
 
+- **Root-cause "generations" fix — parent-grid morph target (same session/branch):** after gated refinement
+  killed the multi-level backdrop pop, a *steady* zoom still showed detail arriving in discrete steps "in both
+  shape and texture." The `swapDelta` diagnostic (added to drive this, log-driven per the user) measured it on
+  a real GPU: a child born at morph=1 differed from the parent leaf it replaces by **~17° normal / ~1 km, at
+  EVERY refinement depth** (constant — fBm self-similarity). Cause: `meshChunk` baked the morph target as the
+  one-octave-coarser field sampled on the CHILD's finer grid, while the parent leaf renders that field on its
+  2×-coarser grid — so morph=1 resolved detail the parent can't, popping the normal each split (both lit shape
+  and slope-band albedo are normal-derived ⇒ "both equally"). Fix: a **half-resolution parent-grid pass** in
+  `meshChunk` samples the coarser field on the parent's grid (spacing 2×, anchored so the child's dyadic rect
+  edges land on parent grid lines, +1 parent-cell apron) and bilinearly interpolates it to each child column →
+  morph=1 IS the parent's bilinear surface (a true no-op swap). The morph value stays the oct-normalized
+  `_tLo` (the shader does `mix(full, target, m)`, so m=1 must equal the baked target — NOT a fresh (oct-1)
+  fBm). Morph normal becomes a per-column parent-grid bilinear (drops the per-corner `assembleDensity`).
+  `surfacenets.ts` unchanged; base surface (positions/normals) **byte-frozen**; `morphTargets`/
+  `morphTargetNormals` digests re-blessed. Seam-safe: morph target stays a pure function of direction, so the
+  parent-grid bilinear collapses to the same shared 1D interp at any edge on a parent grid line (same-LOD,
+  cross-face, and across-parent neighbours agree). `swapDelta` now reads `dNrm≈0.35° dPos≈57 m` (only the
+  pre-existing ~1.6% `_tLo`-normalization residual) — pop removed. 91 tests + typecheck + build green.
+  ⚠️ Real-GPU confirm: steady zoom — `[NMS step] swap[…]≈0` at all depths, detail "just gets clearer," no
+  per-generation step. (A faint *static* sand/rock speckle, if any, is the separate slope-band threshold —
+  deferred, optional shader softening; the user chose mesher-only first.)
+
 Measured-good on WebGPU (build the user ran): orbit→surface descent holds 60 fps / ~16.8 ms,
 `cov=96/96 holes=0` throughout, `fresh=0 refine=N` (sharpen-in-place, no pop), `bornM≈1.0`, largest cut ~466
 leaves (no spike), no rAF `[Violation]` stalls.
@@ -167,15 +189,13 @@ leaves (no spike), no rAF `[Violation]` stalls.
   need) → snap in part-detailed; **C** `new[depth:count]` = a whole LOD level arriving in one recut burst;
   **D** `mNear/wMorph/gA/gB` = whether the surface texture steps independently of the geometry morph (gA/gB
   are smooth in distance, so if texture steps it's `wMorph` = the morph, i.e. the same root as A/B);
-  **swap** `[dPos=Xm(avg) dNrm=Y°(avg) n=N]` = the **decisive** measurement — per refinement leaf going live,
-  how far its morph=1 surface departs from the parent leaf it replaces (`swapDelta` in `/core`, sampled at
-  parent-cell centres where the child's new in-between vertices sit). The geomorph assumes morph=1 is
-  invisible (== the parent), but the morph target is the coarser field on the CHILD's finer grid, so it
-  resolves detail the coarse parent grid couldn't. **Large `dNrm`/`dPos` ⇒ the morph target doesn't reproduce
-  the parent → mesher fix** (make morph=1 a true parent-grid no-op); **≈0 ⇒ a clean swap, so the visible step
-  is the slope-band shader threshold amplifying the normal morph → shader fix.** The gap is large at coarse
-  refinements (a big parent cell undersamples its octaves) and shrinks with depth, so read it at the depths a
-  real zoom refines through (`C:new[...]`), not the coarse early levels.
+  **swap** `[dPos=Xm(avg) dNrm=Y°(avg) n=N]` = per refinement leaf going live, the residual between its
+  morph=1 surface and the parent leaf it replaces (`swapDelta` in `/core`). This DROVE and now GUARDS the
+  parent-grid morph fix: a real-GPU zoom measured `dNrm≈17° avg, dPos≈1 km` at every depth — proof the morph
+  target did NOT reproduce the parent (it was the coarser field on the CHILD's finer grid, resolving detail
+  the coarse parent grid couldn't), so every one-level split popped the normal ~17°. **Fixed** by baking the
+  morph target as the parent's GRID surface (see below); `swap` now reads ≲ a couple ° / tens of m (only the
+  pre-existing `_tLo`-normalization residual) ⇒ morph=1 ≈ parent ⇒ pop-free swap.
 - **The HUD overlay** now also shows `worst <ms>` + a `⚠ N jank` count and goes RED on any hitch — the
   smoothed "fps" alone hid the stutter. **`maxNbrΔ`** is now the ACCURATE fine-probe metric (the old
   quarter-cell probe over-reported, e.g. `=4` on cuts that were already 2:1 balanced).
