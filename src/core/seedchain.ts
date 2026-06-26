@@ -52,10 +52,20 @@ export interface PlanetAddress {
 /**
  * Fold a hierarchical address into a single planet seed by chaining childSeed
  * through galaxy → system → planet. Pure and reproducible.
+ *
+ * SALT CONVENTION ([S] — frozen by seedchain.test.ts): the ADDRESS-descent steps
+ * (galaxy, system) use salt `0` deliberately — it is the reserved "structural
+ * address-fold" salt, distinct from the per-PURPOSE salts in `SALT` (which start at
+ * 1). Only the final, purpose-bearing step (planet facts) uses a named salt
+ * (`SALT.planet`). The canonical `region` level (pipeline §2: galaxy→region→system)
+ * is deliberately DEFERRED for the slice (one planet at {0,0,0}); when region facts
+ * arrive the chain will gain a region step and re-bless this golden. Do not change
+ * the salt values or fold order without re-blessing seedchain.test.ts — it would
+ * silently regenerate every planet.
  */
 export function planetSeed(addr: PlanetAddress): number {
   let s = MASTER_SEED;
-  s = childSeed(s, addr.galaxy, 0);
+  s = childSeed(s, addr.galaxy, 0); // structural address-fold salt (0), not a purpose salt
   s = childSeed(s, addr.system, 0);
   s = childSeed(s, addr.planet, SALT.planet);
   return s >>> 0;

@@ -2,7 +2,7 @@
 
 You are starting work on a real-scale, real-physics, procedurally-generated space exploration game. This file orients you and tells you exactly what to build first. **Read it fully before writing any code.**
 
-There is a complete design corpus (seven documents, ~2,300 lines) in this repo's `/design` folder. **You do not need to build everything in it now — and you must not try.** The corpus describes the whole universe; your job right now is the **vertical slice** (one planet, real scale, fly from orbit to surface, walk, real rotation + orbit, 60fps). Everything else is a later ring grown onto that proven core.
+There is a complete design corpus (eight documents, ~2,300 lines) in this repo's `/design` folder. **You do not need to build everything in it now — and you must not try.** The corpus describes the whole universe; your job right now is the **vertical slice** (one planet, real scale, fly from orbit to surface, walk, real rotation + orbit, 60fps). Everything else is a later ring grown onto that proven core.
 
 > **For the *current* state of the build (what's already done, how to run/verify it, and what's next), read [`HANDOFF.md`](HANDOFF.md) first.** This file (CLAUDE.md) is the forward-looking spec; HANDOFF.md is the backward-looking status companion.
 
@@ -51,7 +51,7 @@ Authority hierarchy: **the Constitution is the final authority on what the unive
 The single most important architectural rule: **separate the headless generation core from the Three.js render shell** (master plan Part 0). The core must run with *no* Three.js imported — that's the test that you've split it correctly, and it's what makes the core unit-testable and portable.
 
 ```
-/design                <- the seven design docs (reference)
+/design                <- the eight design docs (reference)
 /src
   /core                <- GENERATION CORE. Pure TS. NO three.js import, ever.
                           hash, noise/fBm/domain-warp, density field,

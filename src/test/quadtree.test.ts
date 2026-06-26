@@ -10,6 +10,8 @@ import {
   clampCutToReachableFrontier,
   isPathPrefix,
   retainedShouldRemove,
+  packRegion,
+  unpackPath,
   type CameraView,
   type SelectOpts,
   type QuadNode,
@@ -17,6 +19,7 @@ import {
 import { chunkKey, uvRectFromPath } from '../core/chunk.ts';
 import { wrapFaceUV } from '../core/cubesphere.ts';
 import { EARTH_RADIUS_M } from '../core/constants.ts';
+import { fnv1a } from './digest.ts';
 
 // Step 2 gate (slice spec §6): correct LOD selection, coarse far → fine near, far
 // side culled. All verified headlessly; the seamless/no-cracks half is in-browser.
@@ -389,3 +392,142 @@ describe('clampCutToReachableFrontier (gated incremental refinement)', () => {
 function refineToDepth(node: QuadNode, depth: number): QuadNode[] {
   return node.path.length >= depth ? [node] : childrenOf(node).flatMap((c) => refineToDepth(c, depth));
 }
+
+describe('production cut composition (FROZEN)', () => {
+  // Freeze the LOD decision layer — the cut drives every meshed leaf, so silent drift here
+  // changes what the player sees. We pin both stages of the production pipeline
+  // (quadtreeManager.update): the pure selectCut SSE partition, and the settled
+  // balanceCut(clampCutToReachableFrontier(selectCut, live, baseDepth)) cut. At steady state
+  // `live` == the ideal cut, so the clamp is identity and the result is the balanced settled
+  // cut the camera actually renders. A compact {count, maxDepth, digest} catches any change.
+  const opts: SelectOpts = {
+    radius: R,
+    heightMargin: 14_000 * 1.6,
+    splitPx: 300, // FLY_SPLIT_PX (scene.ts)
+    maxDepth: 15, // MAX_DEPTH (scene.ts)
+    baseDepth: 2, // BASE_DEPTH (scene.ts)
+  };
+  const dir = norm([0.2, 1, 0.15]);
+  const lookDown: [number, number, number] = [-dir[0], -dir[1], -dir[2]];
+  const camAt = (alt: number): CameraView => ({
+    position: [dir[0] * (R + alt), dir[1] * (R + alt), dir[2] * (R + alt)],
+    viewportHeight: VP,
+    fovY: FOVY,
+    forward: lookDown,
+    halfFov: 1.0,
+  });
+  // orbit / mid / surface — the three preset altitudes (scene.ts presets).
+  const cams = { orbit: camAt(R * 2), mid: camAt(R * 0.12), surface: camAt(28_000) };
+
+  const enc = new TextEncoder();
+  const cutDigest = (cut: QuadNode[]): string =>
+    fnv1a(enc.encode(cut.map(keyOf).sort().join('|')));
+  const maxDepthOf = (cut: QuadNode[]): number => Math.max(...cut.map((nd) => nd.path.length));
+
+  const summarize = (cam: CameraView): Record<string, { count: number; maxDepth: number; digest: string }> => {
+    const ideal = selectCut(cam, opts);
+    // Steady state: everything in the ideal cut is already live → clamp is identity.
+    const settled = balanceCut(clampCutToReachableFrontier(ideal, ideal, opts.baseDepth!), opts.maxDepth);
+    return {
+      selectCut: { count: ideal.length, maxDepth: maxDepthOf(ideal), digest: cutDigest(ideal) },
+      settled: { count: settled.length, maxDepth: maxDepthOf(settled), digest: cutDigest(settled) },
+    };
+  };
+
+  it('orbit / mid / surface cuts match recorded digests', () => {
+    expect({
+      orbit: summarize(cams.orbit),
+      mid: summarize(cams.mid),
+      surface: summarize(cams.surface),
+    }).toMatchInlineSnapshot(`
+      {
+        "mid": {
+          "selectCut": {
+            "count": 561,
+            "digest": "9e4ba87a",
+            "maxDepth": 7,
+          },
+          "settled": {
+            "count": 561,
+            "digest": "9e4ba87a",
+            "maxDepth": 7,
+          },
+        },
+        "orbit": {
+          "selectCut": {
+            "count": 123,
+            "digest": "c2f512e5",
+            "maxDepth": 3,
+          },
+          "settled": {
+            "count": 123,
+            "digest": "c2f512e5",
+            "maxDepth": 3,
+          },
+        },
+        "surface": {
+          "selectCut": {
+            "count": 561,
+            "digest": "f2b516a7",
+            "maxDepth": 12,
+          },
+          "settled": {
+            "count": 561,
+            "digest": "f2b516a7",
+            "maxDepth": 12,
+          },
+        },
+      }
+    `);
+  });
+
+  it('the settled cut is 2:1-balanced at every preset (morphable everywhere)', () => {
+    for (const cam of Object.values(cams)) {
+      const ideal = selectCut(cam, opts);
+      const settled = balanceCut(clampCutToReachableFrontier(ideal, ideal, opts.baseDepth!), opts.maxDepth);
+      expect(maxNeighborDelta(settled, opts.maxDepth)).toBeLessThanOrEqual(1);
+    }
+  });
+});
+
+describe('packRegion / unpackPath — injectivity (the recut-key correctness)', () => {
+  // packRegion packs (face, path digits, depth) into one JS-safe integer so the hot cut
+  // Sets are Set<number>. Correctness REQUIRES injectivity (distinct regions → distinct
+  // keys; depth encoded so [], [0], [0,0] never collide) and an exact round-trip. The cut
+  // goldens above exercise this implicitly; here it is proven directly over a wide sweep.
+  it('round-trips and is collision-free across a deep sweep', () => {
+    const keys = new Map<number, string>(); // key -> "face/path" (to report a collision)
+    let count = 0;
+    // Deterministic sweep: all faces, all paths up to depth 6, plus a few deep (≤15) paths.
+    const walk = (face: number, path: number[]): void => {
+      const key = packRegion(face, path, path.length);
+      expect(Number.isSafeInteger(key)).toBe(true);
+      expect(key).toBeGreaterThanOrEqual(0);
+      expect(key).toBeLessThan(2 ** 37); // layout budget: face<<34 | depth<<30 | pathBits
+      expect(unpackPath(key - face * 2 ** 34 - path.length * 2 ** 30, path.length)).toEqual(path);
+      const prev = keys.get(key);
+      const id = `${face}/${path.join('')}`;
+      if (prev !== undefined) expect(prev).toBe(id); // same key ⇒ must be the same region
+      keys.set(key, id);
+      count++;
+      if (path.length < 6) for (let q = 0; q < 4; q++) walk(face, [...path, q]);
+    };
+    for (let f = 0; f < 6; f++) walk(f, []);
+    // A handful of max-depth paths (depth 15) to exercise the high pathBits range.
+    for (let f = 0; f < 6; f++) {
+      const deep = Array.from({ length: 15 }, (_, i) => (i * 7 + f) % 4);
+      const key = packRegion(f, deep, 15);
+      expect(Number.isSafeInteger(key) && key < 2 ** 37).toBe(true);
+      expect(unpackPath(key - f * 2 ** 34 - 15 * 2 ** 30, 15)).toEqual(deep);
+      keys.set(key, `${f}/${deep.join('')}`);
+    }
+    // No two distinct regions shared a key.
+    expect(keys.size).toBe(count + 6);
+  });
+
+  it('a prefix and its extension get DISTINCT keys (depth is encoded, not just digits)', () => {
+    expect(packRegion(0, [], 0)).not.toBe(packRegion(0, [0], 1));
+    expect(packRegion(0, [0], 1)).not.toBe(packRegion(0, [0, 0], 2));
+    expect(packRegion(3, [1, 2], 2)).not.toBe(packRegion(3, [1, 2, 0], 3));
+  });
+});

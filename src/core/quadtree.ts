@@ -186,15 +186,17 @@ function assertRegionDepth(maxDepth: number): void {
 }
 
 /** Packed integer key for region (face + the first `len` quadrant digits of `path`). Prefixes nest by
- *  encoding depth explicitly. Equal keys ⟺ same face, same depth, same digits (injective). */
-function packRegion(face: number, path: number[], len: number): number {
+ *  encoding depth explicitly. Equal keys ⟺ same face, same depth, same digits (injective).
+ *  EXPORTED for the injectivity golden (test/quadtree.test.ts); pure, no behaviour change. */
+export function packRegion(face: number, path: number[], len: number): number {
   let pathBits = 0;
   for (let i = 0; i < len; i++) pathBits = pathBits * 4 + path[i]!;
   return face * REGION_FACE_UNIT + len * REGION_DEPTH_UNIT + pathBits;
 }
 
-/** Recover the quadrant digits from a packed key's pathBits + depth (inverse of packRegion's packing). */
-function unpackPath(pathBits: number, depth: number): number[] {
+/** Recover the quadrant digits from a packed key's pathBits + depth (inverse of packRegion's packing).
+ *  EXPORTED alongside packRegion for the round-trip injectivity golden. */
+export function unpackPath(pathBits: number, depth: number): number[] {
   const path: number[] = new Array(depth);
   for (let i = depth - 1; i >= 0; i--) {
     path[i] = pathBits % 4;

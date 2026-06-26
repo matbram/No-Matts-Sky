@@ -228,7 +228,7 @@ export class QuadtreeManager {
     private readonly opts: ManagerOpts,
   ) {
     this.heightMargin = recipe.height * 1.6;
-    // The ONE shared terrain material (per-leaf data rides in the `aLevel` attribute); its kDist
+    // The ONE shared terrain material (per-leaf data rides in the `aLodR`/`aParentR` attributes); its kDist
     // uniform is updated each frame via setMorphParams.
     const handle = createTerrainMaterial({ wireframe: opts.wireframe, slopePreset: opts.slopePreset, noDetail: opts.noDetail });
     this.sharedMat = handle.material;
@@ -847,7 +847,7 @@ export class QuadtreeManager {
       geometry.setAttribute('morphTargetNormal', new BufferAttribute(m.morphTargetNormals, 3));
       geometry.setIndex(new BufferAttribute(m.indices, 1));
       // Per-leaf CDLOD level (lodR, parentR) as a constant-per-leaf vertex attribute. The ONE shared
-      // material's morph graph (terrainMaterial.ts) reads `aLevel` to build this leaf's split/merge
+      // material's morph graph (terrainMaterial.ts) reads `aLodR`/`aParentR` to build this leaf's split/merge
       // distances — so every leaf renders with the same material (no per-leaf clone / node-graph
       // rebuild). lodBoundRadius matches selectCut's metric, so the per-vertex distance-morph band
       // aligns with the cut's split distance exactly. dChild=2·lodR·kDist, dParent=2·parentR·kDist.
@@ -962,7 +962,7 @@ export class QuadtreeManager {
       }
       if (this.opts.debugAudit && !this.wiringLogged) {
         // One-time sanity: confirm the geomorph is wired on this build — geometry carries the
-        // morph attributes (incl. the per-leaf aLevel + morphTargetNormal) AND the shared material
+        // morph attributes (incl. the per-leaf aLodR/aParentR + morphTargetNormal) AND the shared material
         // overrides both position & normal nodes.
         this.wiringLogged = true;
         const sm = this.sharedMat as unknown as { positionNode: unknown; normalNode: unknown };

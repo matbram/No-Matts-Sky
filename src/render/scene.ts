@@ -254,7 +254,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // OPAQUE, double-sided MeshStandardNodeMaterial whose per-vertex CDLOD morph lerps each vertex
   // morphTarget→position (and its normal) as a function of camera distance — so detail resolves in
   // with a single opaque surface, no dither, no two surfaces at once. Per-leaf data rides in the
-  // `aLevel` attribute, so there is no per-leaf material clone.
+  // `aLodR`/`aParentR` attributes, so there is no per-leaf material clone.
   // splitPx 300 (smaller, gentler LOD steps — affordable after the ~13× meshing
   // speedup); maxDepth = MAX_DEPTH gives meter-scale near-field cells for walking.
   const manager = new QuadtreeManager(scene, recipe, R, {

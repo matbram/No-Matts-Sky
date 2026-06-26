@@ -1,7 +1,8 @@
 # HANDOFF — No Matt's Sky (current build state)
 
 > Read **`CLAUDE.md`** first (it's the build spec + guardrails). This file is the companion: **what is
-> actually built right now, how to run/verify it, and what's next.** Last updated at commit `2227974`.
+> actually built right now, how to run/verify it, and what's next.** For the live commit/branch run
+> `git rev-parse --short HEAD` / `git branch --show-current` (don't trust a hard-coded hash here — it goes stale the next commit).
 >
 > **Authority:** the law lives in **`/design`** (7 docs). When they disagree, the order is
 > **Constitution → master plan → slice spec** (`CLAUDE.md` §1). This handoff describes the *build state*;
@@ -18,9 +19,11 @@ shadow, velocity-inheriting launch) and Step 6 (atmosphere LUT + triplanar mater
 ## 2. First 5 minutes (new session)
 ```bash
 cd No-Matts-Sky
-git checkout claude/eloquent-tesla-98njmv && git pull
+git pull   # a fresh clone is already on the task's feature branch — don't hard-code a branch name (it changes per task)
 npm install
-npm test          # 6 suites: hash, noise, cubesphere, density, chunk, quadtree (golden/determinism)
+npm test          # 11 suites (golden/determinism): hash, noise, cubesphere, density, chunk, quadtree,
+                  #   seedchain, facts, surfacenets, core-boundary, digest
+npm run build     # tsc --noEmit && vite build (the same gates CI runs — .github/workflows/ci.yml)
 npm run typecheck # tsc --noEmit
 npm run dev       # open the printed localhost URL in a WebGPU browser (Chrome/Edge)
 ```
@@ -33,7 +36,9 @@ npm run dev       # open the printed localhost URL in a WebGPU browser (Chrome/E
 ## 3. Stack & repo facts
 - **TypeScript** + **Three.js WebGPU** (`three@^0.184`, `import { WebGPURenderer } from 'three/webgpu'`,
   TSL shaders) + **Vite 7** + **Vitest 3** + **Playwright** (headless harness only). **Node ≥ 20.19**.
-- Branch: **`claude/eloquent-tesla-98njmv`** (latest commit `2227974`, clean tree).
+- Branch: the task's feature branch (run `git branch --show-current`; `git rev-parse --short HEAD` for the commit). The
+  determinism/CI-hardening pass (seedchain/facts/production-seed/core-boundary/surfacenets/quadtree-cut/digest goldens +
+  `.github/workflows/ci.yml`) landed on `claude/app-audit-next-steps-0urxct`.
 - Scripts: `dev`, `build` (`tsc --noEmit && vite build`), `preview`, `typecheck`, `test`, `test:watch`,
   `shoot` (`node scripts/shoot.mjs [tag]`).
 - WebGPU init is **async** (`await renderer.init()`) and the loop uses `renderer.setAnimationLoop(fn)`.
@@ -80,8 +85,9 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
   `e13cdf7`, `2227974`.)
 - **Gradual visual-transition pass ("plane approaching Earth" — this session, branch
   `claude/lod-visual-transition-audit-jeq2fz`):** (1) tuned for continuity — `MORPH_START_FRAC` 0.55→0.30
-  (wider fade band), `RECUT_MAX_MS` 400→200 (leaves trickle, not batch), `PREFETCH_S` 0.7→1.0 (born at the
-  parent surface); (2) **one shared material** (`terrainMaterial.ts`) — the per-leaf morph node-graph clone is
+  (wider fade band), `RECUT_MAX_MS` 400→300 (leaves trickle, not batch), `PREFETCH_S` kept at 0.7 (a 1.0
+  experiment was reverted — the live values are `RECUT_MAX_MS=300`, `PREFETCH_S=0.7`, see §7); (2) **one shared
+  material** (`terrainMaterial.ts`) — the per-leaf morph node-graph clone is
   gone (per-leaf data → `aLodR`/`aParentR` attrs), and the **time-based birth-ease was removed** (it faded a
   recut's batch in as a synchronized "wave"; the per-vertex distance morph alone carries leaves in now); (3)
   **distance-faded surface detail** — slope material bands + procedural `mx_noise` detail (coarse ~40 m, fine
@@ -218,6 +224,22 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
   not a regression; if the panel is ~57 Hz, 17.6 ms is already "locked to the display"). Deferred fallback if
   the recut still bites: move cut-selection to a worker (it's pure/worker-safe).
 
+- **Determinism + CI hardening pass (branch `claude/app-audit-next-steps-0urxct`, from the deep-audit next-steps
+  plan):** closed the guardrail-§6 gap the audit found — the `[S]` seed chain, the facts stub, and the
+  *production* seed path were on the live runtime path but unguarded by any frozen golden. Added **5 new test
+  suites + extensions** (91→**119 tests**), all render-output-unchanged (no golden re-bless): `seedchain.test.ts`
+  (freezes `MASTER_SEED`, the `SALT` map, `planetSeed`/`childSeed` incl. the production
+  `childSeed(sliceFacts().seed,0,SALT.terrain)`), `facts.test.ts` (the coordinate-keyed `sliceFacts` seam),
+  `chunk.test.ts` +production-seed golden (the real address→seed→recipe→mesh wire), `core-boundary.test.ts`
+  (asserts `/core` imports no three.js — guardrail §1 now self-policing, via `import.meta.glob('?raw')`),
+  `surfacenets.test.ts` (standalone manifold/watertight + frozen digest on a sphere SDF), `quadtree.test.ts`
+  +frozen orbit/mid/surface cut snapshots and a `packRegion`/`unpackPath` injectivity sweep (both now exported),
+  `digest.test.ts` (FNV-1a known-answer vectors). Plus **`.github/workflows/ci.yml`** (typecheck+test+build on
+  push/PR — the enforcement substrate behind every "frozen"/"convention-only" guard). Doc drift repaired
+  (HANDOFF/PERFORMANCE/CLAUDE: stale branch/commit, the failing checkout line, the `RECUT_MAX_MS`/`PREFETCH_S`
+  contradiction, the §6 dials, `aLevel`→`aLodR`/`aParentR`, seven→eight docs) and the `salt=0` structural-descent
+  convention documented + frozen. typecheck + 119 tests + build green.
+
 Measured-good on WebGPU (build the user ran): orbit→surface descent holds 60 fps / ~16.8 ms,
 `cov=96/96 holes=0` throughout, `fresh=0 refine=N` (sharpen-in-place, no pop), `bornM≈1.0`, largest cut ~466
 leaves (no spike), no rAF `[Violation]` stalls.
@@ -229,7 +251,15 @@ leaves (no spike), no rAF `[Violation]` stalls.
 > GPU after any change.
 
 ## 6. What's NEXT (pick up here)
-1. **GATED: cube-face-corner `maxNbrΔ=2` transient.** With gated incremental refinement + the 2:1 `balanceCut`
+0. **FLAGGED (latent, not yet fixed): Surface Nets pass-2 upper-axis OOB.** Each tangential branch in
+   `surfacenets.ts` pass-2 guards the lower bounds (`j>=1,k>=1`) but not the upper (`j<ny,k<nz`), so a boundary
+   sign-change can index `cellVert` past its `nx·ny·nz` extent (the read wraps to a neighbouring cell or returns
+   undefined). Adding the upper guards is **NOT a no-op** — it changes the frozen mesh digests (~68 fewer tris on
+   the standard leaf), i.e. those boundary reads currently DO emit apron-boundary triangles. Latent today (the
+   outer radial shell is air + the recipe is smooth, so no visible defect), so the determinism-hardening pass left
+   it in place (it must not re-bless) and documented it in code. Fixing it is a deliberate change needing a golden
+   re-bless + a real-GPU seam/coverage check. (Audit finding, confirmed.)
+1. **(Audit: likely a NON-issue) cube-face-corner `maxNbrΔ=2` transient.** With gated incremental refinement + the 2:1 `balanceCut`
    (both now implemented), the cut is `maxNbrΔ≤1` in steady state and through almost every transition. The one
    exception is a **transient `maxNbrΔ=2` at a cube-face corner** during a fast climb: `balanceCut`'s
    cross-face neighbour probe (`maxNeighborDepth`/`coveringDepth` via `wrapFaceUV`) doesn't catch the
@@ -307,7 +337,8 @@ expensive O(live²) seam + O(96·live) coverage scans (off by default even under
 - Add/extend a **golden test** whenever you add a core generation function.
 
 ## 9. Tests
-`npm test` → `src/test/{hash,noise,cubesphere,density,chunk,quadtree}.test.ts`. Golden/determinism via
+`npm test` → `src/test/{hash,noise,cubesphere,density,chunk,quadtree,seedchain,facts,surfacenets,core-boundary,digest}.test.ts`
+(119 tests, 11 suites). Golden/determinism via
 `toMatchInlineSnapshot` + FNV-1a digest (`src/test/digest.ts`). These are **frozen** — if a golden value
 changes, the generation pipeline drifted (and the future Rust port would diverge); only re-bless
 deliberately (e.g. the planned `edgeMask` change will legitimately regenerate mesher digests).

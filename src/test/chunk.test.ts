@@ -12,6 +12,8 @@ import { meshChunk, uvRectFromPath, chunkKey, swapDelta, type ChunkRequest } fro
 import { surfaceNets, type SampledField } from '../core/surfacenets.ts';
 import { faceDirection } from '../core/cubesphere.ts';
 import { EARTH_RADIUS_M } from '../core/constants.ts';
+import { childSeed, SALT } from '../core/seedchain.ts';
+import { sliceFacts } from '../core/facts.ts';
 import { fnv1a } from './digest.ts';
 
 // Step 1 gate (slice spec §6): a correctly-shaped, correctly-LIT patch matching
@@ -533,6 +535,43 @@ describe('swapDelta (residual morph=1 vs parent leaf — diagnostic)', () => {
         "dPosAvg": 23.07,
         "dPosMax": 56.98,
         "samples": 16,
+      }
+    `);
+  });
+});
+
+describe('production seed path (the live planet, end-to-end determinism)', () => {
+  // The existing meshChunk goldens pin the FORMULA via an unrelated literal seed
+  // (sliceTerrainRecipe(0x0bad_f00d)). This anchors the WIRE the running game uses:
+  // address -> planetSeed -> childSeed(.., SALT.terrain) -> sliceTerrainRecipe -> mesh
+  // (exactly scene.ts:248). A change to MASTER_SEED, any salt, the childSeed fold, or
+  // sliceTerrainRecipe trips THIS test — the determinism the final-acceptance gate
+  // ("reload regenerates the identical planet") depends on. /core-only: the 2-line
+  // derivation is replicated inline rather than importing scene.ts (which pulls three).
+  const PROD_RECIPE: TerrainRecipe = sliceTerrainRecipe(childSeed(sliceFacts().seed, 0, SALT.terrain));
+  const req: ChunkRequest = { face: 2, path: [2, 1], lod: 2 };
+
+  it('uses the same terrain seed scene.ts derives for the slice planet', () => {
+    expect(PROD_RECIPE.seed).toBe(childSeed(sliceFacts().seed, 0, SALT.terrain));
+  });
+
+  it('matches a recorded digest built from the PRODUCTION recipe (FROZEN)', () => {
+    const m = meshChunk(req, PROD_RECIPE, R, 16, 10);
+    expect({
+      positions: fnv1a(m.positions),
+      normals: fnv1a(m.normals),
+      morphTargets: fnv1a(m.morphTargets),
+      indices: fnv1a(m.indices),
+      vertexCount: m.vertexCount,
+      triangleCount: m.triangleCount,
+    }).toMatchInlineSnapshot(`
+      {
+        "indices": "a9ff7c46",
+        "morphTargets": "8c12ce42",
+        "normals": "fc7c26f1",
+        "positions": "0f595388",
+        "triangleCount": 1238,
+        "vertexCount": 606,
       }
     `);
   });
