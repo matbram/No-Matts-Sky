@@ -76,7 +76,7 @@ const RECUT_ROT_COS = Math.cos((20 * Math.PI) / 180);
 // keeps the leaf set tracking continuously (the per-vertex morph is already per-frame; this
 // just keeps the SET fresh). Gated on actual movement so a still camera never recuts (and the
 // headless settle check still settles). Fast motion crosses recutDist first → this is a no-op.
-const RECUT_MAX_MS = 400;
+const RECUT_MAX_MS = 300;
 const RECUT_MIN_MOVE_M = 1;
 // Walk-mode split threshold (px). Wider than fly's 300 so the now-graded LOD (which
 // places ~150 leaves per level) stays within budget at the finer MAX_DEPTH: the
@@ -108,20 +108,23 @@ const LOOKAHEAD_FRAMES = 30;
 // lateral motion (no wasted leaves); kicks in on a plunge. [T] dial up if pops persist,
 // down if a fast descent dips below 60 fps.
 const PREFETCH_S = 0.7;
-// ALTITUDE-RELATIVE prefetch cap (replaces the old flat 6 km). The CDLOD morph band scales
-// with altitude (thousands of km at orbit, hundreds near the surface), so a flat-metres lead
-// was negligible at altitude — ?lodaudit showed pf/band≈0.001, i.e. detail still arrived in
-// discrete chunks up high instead of leading the band. Cap the lead at a FRACTION of the
-// camera's altitude so it's a meaningful slice of the band at ANY height, while bounding the
-// cut growth to < ~1 level deeper near the camera (a flat lead self-targets the deepest band;
-// see selectCut). FLOOR keeps a useful lead near the surface; CEIL + the maxLeaves cap +
-// birth-ease bound a hyper-plunge that outruns the mesher (it then degrades to a gentle fade).
+// ALTITUDE-RELATIVE prefetch cap. The CDLOD morph band scales with altitude (thousands of km at
+// orbit, hundreds near the surface). Cap the lead at a FRACTION of altitude so it's a meaningful
+// slice of the band, but bound it tightly: CEIL is 20 km (was 200 km — that, combined with the
+// spurious millions-m/s approach from orbit zoom, ballooned the cut to ~500 leaves and was the main
+// "laggy" churn). With `approach` now clamped to APPROACH_MAX_MPS the lead self-bounds anyway.
 const PREFETCH_MAX_FRAC = 0.35;
 const PREFETCH_FLOOR_M = 3000;
-const PREFETCH_CEIL_M = 200_000;
+const PREFETCH_CEIL_M = 20_000;
 // EMA smoothing for the approach-rate estimate (per-frame blend of the new sample), so a
 // single jittery frame-time doesn't swing the prefetch distance. ~0.15 ≈ a few-frame lag.
 const APPROACH_EMA = 0.15;
+// Sanity bounds on the approach-rate estimate (the fix for the orbit-zoom millions-of-m/s spike).
+// APPROACH_MAX_MPS caps the per-frame closing rate to a plausible DESCENT speed (5 km/s) so a fast
+// scroll-zoom can't pin prefetch and balloon the cut; APPROACH_DT_MAX_MS ignores frames slower than
+// ~10 fps (a stall/tab-switch) whose rate would be garbage.
+const APPROACH_MAX_MPS = 5000;
+const APPROACH_DT_MAX_MS = 100;
 
 interface Preset {
   target: Vector3; // world-space look-at
@@ -163,6 +166,14 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const lodAudit = params.has('lodaudit');
   const lodMorphDebug = params.has('lodmorphdebug') || lodAudit; // audit implies the morph line too
   const morphColor = params.has('morphcolor');
+  // ?perf: cheap per-frame cost breakdown — times update()/uploadReady()/tick() and logs any frame
+  //   where one spikes, plus the raw approach/prefetch inputs. This is what reveals "high fps but
+  //   laggy" (the overlay smooths spikes; this catches the spike + says which stage caused it).
+  // ?seamscan: OPT-IN the O(live²) seam scan + O(96·live) coverage scan (they used to run under
+  //   ?lodaudit and, at ~500 live leaves, were a periodic main-thread spike — i.e. the diagnostics
+  //   themselves added lag). Off by default now so ?perf/?lodaudit measure WITHOUT perturbing.
+  const perf = params.has('perf');
+  const seamScan = params.has('seamscan');
   const renderer = new WebGPURenderer({
     canvas,
     antialias: true,
@@ -170,7 +181,17 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     logarithmicDepthBuffer: useLog,
     reversedDepthBuffer: useRevz,
   });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  // Pixel ratio (fill-rate lever): on a HiDPI/Retina display devicePixelRatio is 2, so we shade 4× the
+  // fragments — the dominant cost when the terrain shader fills the viewport. ?dpr=N overrides the cap so we
+  // can measure/trade fragment cost vs sharpness. Default cap 1.5: on a Retina (devicePixelRatio 2) display
+  // that's ~44% fewer fragments than 2.0 while staying sharp; 1× displays are unaffected (min(1,1.5)=1).
+  // ?dpr=2 restores full sharpness, ?dpr=1 is max perf.
+  const dprCap = (() => {
+    const v = parseFloat(params.get('dpr') ?? '');
+    return Number.isFinite(v) && v > 0 ? v : 1.5;
+  })();
+  const effPixelRatio = Math.min(window.devicePixelRatio, dprCap);
+  renderer.setPixelRatio(effPixelRatio);
   renderer.toneMapping = ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
   // CRITICAL (CLAUDE.md §2): WebGPURenderer init is async — await before render.
@@ -188,6 +209,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   );
   console.log('[NMS] renderer backend:', be?.constructor?.name, '| isWebGPUBackend:', be?.isWebGPUBackend);
   console.log('[NMS] depth:', { logarithmicDepthBuffer: useLog, reversedDepthBuffer: useRevz, forceWebGL: useWebGL });
+  console.log('[NMS] pixelRatio:', { devicePixelRatio: window.devicePixelRatio, cap: dprCap, effective: effPixelRatio });
   console.log('[NMS] debug toggles:', {
     noback: params.has('noback'),
     wire: params.has('wire'),
@@ -198,6 +220,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     lodmorphdebug: lodMorphDebug, // ?lodmorphdebug: geomorph staggering/imbalance logging
     lodaudit: lodAudit, // ?lodaudit: full pipeline diagnostics ([NMS audit] seam/coverage/cadence/…)
     morphcolor: morphColor, // ?morphcolor: tint leaves by geomorph progress (LOD pop-in visible)
+    perf, // ?perf: per-frame cost breakdown + approach/prefetch/churn ([NMS perf])
+    seamscan: seamScan, // ?seamscan: opt-in the O(live²) seam/coverage scans (off by default)
     dark: params.has('dark'),
   });
 
@@ -226,22 +250,23 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // Octave count of the FINEST leaf — what the collision probe must sample so the
   // player stands on the same bumps the deepest mesh shows (not a smoother field).
   const groundOct = lodOctaves(recipe, MAX_DEPTH);
-  // Double-sided so skirt curtains show regardless of winding. Fully OPAQUE: the
-  // LOD transition is a GEOMETRY morph (the manager clones this per leaf and drives
-  // a per-leaf morph uniform that lerps each vertex morphTarget→position), so detail
-  // resolves in with a single opaque surface — no dither, no two surfaces at once.
-  const material = new MeshStandardNodeMaterial({
-    color: 0x9a8c7a,
-    roughness: 0.92,
-    metalness: 0.0,
-    side: DoubleSide,
-  });
-  material.wireframe = params.has('wire'); // debug: see the tessellation / where lines fall
+  // The terrain material is now owned by the manager (createTerrainMaterial): ONE shared, fully
+  // OPAQUE, double-sided MeshStandardNodeMaterial whose per-vertex CDLOD morph lerps each vertex
+  // morphTarget→position (and its normal) as a function of camera distance — so detail resolves in
+  // with a single opaque surface, no dither, no two surfaces at once. Per-leaf data rides in the
+  // `aLevel` attribute, so there is no per-leaf material clone.
   // splitPx 300 (smaller, gentler LOD steps — affordable after the ~13× meshing
   // speedup); maxDepth = MAX_DEPTH gives meter-scale near-field cells for walking.
-  const manager = new QuadtreeManager(scene, material, recipe, R, {
+  const manager = new QuadtreeManager(scene, recipe, R, {
     splitPx: FLY_SPLIT_PX,
     maxDepth: MAX_DEPTH,
+    wireframe: params.has('wire'), // debug: see the tessellation / where lines fall
+    // ?slopeband=N: pick a slope-band "look" preset (0=current/hard, 1=wide, 2=low-contrast, 3=soft).
+    // Render-only cosmetic; default 0 leaves today's look unchanged.
+    slopePreset: Number(params.get('slopeband')) || 0,
+    // ?nodetail: GPU probe — build the terrain material WITHOUT the two per-pixel mx_noise_vec3 (+ mottle
+    // + normal perturbation). If this collapses gpu/other, the procedural noise is the fill-rate cost.
+    noDetail: params.has('nodetail'),
     // Always-resident coarse base: the whole sphere stays meshed at BASE_DEPTH so every
     // finer leaf morphs from a real parent (no fresh-over-backdrop pop). The static inset
     // backdrop stays as the ultimate below-everything filler (startup / frustum-edge gaps).
@@ -262,6 +287,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
           : undefined,
     debugLodMorph: lodMorphDebug,
     debugAudit: lodAudit,
+    debugSeamScan: seamScan, // the O(live²) seam + coverage scans only run when ?seamscan is set
+    debugChurn: perf, // count meshes created/disposed per second for the [NMS perf] line
   });
 
   // No-black backdrop: a single smooth sphere INSET below the deepest terrain
@@ -345,6 +372,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // on every teleport (preset switch / enter walk/creative) so a jump isn't read as a descent.
   let approachRateEMA = 0;
   let prevDistCenter = -1;
+  // ?perf state: per-window maxima of each main-thread stage's cost (ms) + the raw approach inputs,
+  // logged as [NMS perf] every ~30 frames. The frame dt itself is on the HUD (Stats); this says
+  // WHICH stage is heavy when a spike happens (recut vs upload vs tick vs GPU/other).
+  let perfN = 0;
+  let perfMaxUpd = 0, perfMaxUp = 0, perfMaxTick = 0, perfMaxDt = 0;
+  let perfLastInst = 0, perfLastPrefetch = 0;
 
   function applyPreset(p: Preset): void {
     renderOrigin = p.target.clone();
@@ -586,12 +619,19 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       const horizon = Math.sqrt(Math.max(0, distCenter * distCenter - R * R));
 
       // Speed-aware prefetch: track how fast the camera is closing on the planet centre
-      // (descent rate, m/s, EMA-smoothed). ~0 for lateral orbit/walk, large on a plunge —
-      // so finer leaves are requested early ONLY when actually approaching (no wasted
-      // leaves at rest). Fed into the cut below as a lead distance (approachRate·PREFETCH_S).
-      if (dt > 0) {
-        const inst = prevDistCenter >= 0 ? (prevDistCenter - distCenter) / (dt / 1000) : 0;
+      // (descent rate, m/s, EMA-smoothed). ~0 for lateral orbit/walk, large on a plunge — finer
+      // leaves are requested early ONLY when actually approaching. CRITICAL FIX: the orbit camera's
+      // drag/zoom moves the camera thousands of km in ONE frame, which read as MILLIONS of m/s
+      // (logged approach up to ±41,000,000) and pinned prefetch to its ceiling → the cut ballooned
+      // to ~500 leaves and thrashed (the "laggy" churn). So (a) ignore abnormal dt (a stall /
+      // tab-switch makes the rate garbage), and (b) CLAMP the instantaneous rate to a sane descent
+      // speed so a scroll-wheel zoom can't balloon the cut. Teleports already reset prevDistCenter.
+      if (dt > 0 && dt < APPROACH_DT_MAX_MS && prevDistCenter >= 0) {
+        let inst = (prevDistCenter - distCenter) / (dt / 1000);
+        if (inst > APPROACH_MAX_MPS) inst = APPROACH_MAX_MPS;
+        else if (inst < -APPROACH_MAX_MPS) inst = -APPROACH_MAX_MPS;
         approachRateEMA += (inst - approachRateEMA) * APPROACH_EMA;
+        perfLastInst = inst; // raw (clamped) per-frame rate, for the [NMS perf] line
       }
       prevDistCenter = distCenter;
       if (mode === 'walk') {
@@ -627,7 +667,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // Time-based recut floor: keep the leaf set tracking a slow descent continuously when
       // recutDist (huge at altitude) wouldn't trip for many seconds. Only while actually moving.
       const timeRecut = moved > RECUT_MIN_MOVE_M && now - lastCutTime > RECUT_MAX_MS;
-      if (forceCut || moved > recutDist || turned || timeRecut) {
+      // Recut-while-refining: gated incremental refinement admits only ONE level deeper than what's live
+      // per recut, so after a hard zoom (or zoom-then-STOP, where moved≈0 and timeRecut never trips) the
+      // detail front would freeze one level in. Keep firing recuts every RECUT_MAX_MS while the manager
+      // reports the front is still climbing; it stops on its own once the cut reaches its target depth.
+      const refineRecut = manager.isRefining() && now - lastCutTime > RECUT_MAX_MS;
+      if (forceCut || moved > recutDist || turned || timeRecut || refineRecut) {
         let halfFov: number;
         let splitPxOverride: number | undefined;
         if (ctrlMode) {
@@ -650,6 +695,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
         const altitude = Math.max(1, distCenter - R);
         const prefetchCap = Math.min(PREFETCH_CEIL_M, Math.max(PREFETCH_FLOOR_M, PREFETCH_MAX_FRAC * altitude));
         const prefetchM = Math.min(prefetchCap, Math.max(0, approachRateEMA) * PREFETCH_S);
+        perfLastPrefetch = prefetchM;
+        const tU = perf ? performance.now() : 0;
         manager.update(
           {
             position: [worldCam.x, worldCam.y, worldCam.z],
@@ -662,6 +709,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
           splitPxOverride,
           prefetchM,
         );
+        if (perf) perfMaxUpd = Math.max(perfMaxUpd, performance.now() - tU);
         lastCutPos.copy(worldCam);
         lastCutTime = now;
         forceCut = false;
@@ -670,12 +718,37 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // generation cost in-frame; generation itself ran on the worker pool). Burst the
       // budget until the view first reaches full coverage (incomplete screen → hitch
       // invisible), then settle to UPLOAD_PER_FRAME for hitch-free steady state.
+      const tUp = perf ? performance.now() : 0;
       manager.uploadReady(firstFillDone ? UPLOAD_PER_FRAME : BURST_PER_FRAME);
+      if (perf) perfMaxUp = Math.max(perfMaxUp, performance.now() - tUp);
       if (!firstFillDone) {
         const s = manager.stats();
         if (s.live > 0 && s.pending === 0 && s.inflight === 0 && s.ready === 0) firstFillDone = true;
       }
+      const tT = perf ? performance.now() : 0;
       manager.tick(dt); // advance LOD geomorphs
+      if (perf) perfMaxTick = Math.max(perfMaxTick, performance.now() - tT);
+
+      // [NMS perf] — the breakdown that separates a real stutter's CAUSE. The HUD (Stats) shows the
+      // worst frame dt; this says WHICH main-thread stage spiked (recut/upload/tick) vs GPU/other
+      // (= dt minus the measured stages), plus the live leaf count (= draw calls) and the
+      // approach/prefetch inputs that drive cut size. Throttled to ~every 30 frames.
+      if (perf) {
+        if (dt > perfMaxDt) perfMaxDt = dt;
+        if (++perfN >= 30) {
+          const s = manager.stats();
+          const measured = perfMaxUpd + perfMaxUp + perfMaxTick;
+          console.log(
+            `[NMS perf] worstDt=${perfMaxDt.toFixed(1)}ms | recut=${perfMaxUpd.toFixed(1)} ` +
+              `upload=${perfMaxUp.toFixed(1)} tick=${perfMaxTick.toFixed(1)} gpu/other≈${Math.max(0, perfMaxDt - measured).toFixed(1)}ms | ` +
+              `live=${s.live}draws churn=${manager.churnPerSec()}/s | ` +
+              `approach=${(approachRateEMA / 1000).toFixed(1)}km/s inst=${(perfLastInst / 1000).toFixed(1)}km/s ` +
+              `prefetch=${(perfLastPrefetch / 1000).toFixed(1)}km`,
+          );
+          perfN = 0;
+          perfMaxUpd = perfMaxUp = perfMaxTick = perfMaxDt = 0;
+        }
+      }
 
       // ?clipdebug (throttled): compare the analytic collision floor to the RENDERED mesh
       // height under the player (downward raycast against live leaf meshes) + log the leaf
@@ -738,11 +811,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       window.removeEventListener('keyup', onKeyUp, { capture: true });
       window.removeEventListener('mousemove', onMouseMove);
       canvas.removeEventListener('click', onClick);
-      manager.dispose();
+      manager.dispose(); // disposes the shared terrain material it owns
       controls.dispose();
       backdropGeo.dispose();
       backdropMaterial.dispose();
-      material.dispose();
       renderer.dispose();
     },
   };

@@ -60,8 +60,15 @@ export const CHUNK_GRID_RADIAL = 12;
 // call (surfaceNets allocates them) so they can be transferred and kept.
 let _sColDir: Float64Array = new Float64Array(0);
 let _sColT: Float64Array = new Float64Array(0);
-let _sColTLo: Float64Array = new Float64Array(0); // per-column coarser terrain value+grad (morph normal)
+let _sColTLo: Float64Array = new Float64Array(0); // per-column one-octave-coarser value+grad (_tLo), 4/col
 let _sColDr: Float64Array = new Float64Array(0); // per-column radial morph offset (m)
+let _sColMN: Float64Array = new Float64Array(0); // per-column morph-target (parent) NORMAL, unit (3 per col)
+// Parent-GRID morph source: the one-octave-coarser field sampled on the PARENT's 2×-coarser grid (then
+// bilinearly interpolated to each child column). This is what makes morph=1 reproduce the parent LEAF — the
+// child's fine grid resolves detail the parent grid can't, so sampling the coarse field on the FINE grid
+// (the old morph target) left a per-refinement normal pop; the parent grid removes it.
+let _sPVal: Float64Array = new Float64Array(0); // parent-grid coarser value (oct-normalized _tLo[0])
+let _sPNrm: Float64Array = new Float64Array(0); // parent-grid coarser analytic normal, unit (3 per pt)
 let _sDensity: Float64Array = new Float64Array(0);
 let _sCornerPos: Float64Array = new Float64Array(0);
 let _sCornerNormal: Float64Array = new Float64Array(0);
@@ -129,20 +136,22 @@ export function meshChunk(
   const scale = recipe.noiseScale;
   const height = recipe.height;
   // LOD-adaptive detail: a deeper (finer) leaf adds one fBm octave per level, so
-  // the finest feature stays matched to this leaf's (halving) cell size. The morph
-  // target (outLo, one octave coarser) is then exactly the parent leaf's detail →
-  // the existing geomorph + cross-fade hide the LOD transition. lod 0 == recipe
-  // octaves, so coarse/orbit leaves are byte-identical to before.
+  // the finest feature stays matched to this leaf's (halving) cell size. lod 0 ==
+  // recipe octaves, so coarse/orbit leaves are byte-identical to before.
   const oct = lodOctaves(recipe, req.lod);
 
   // Pass 1 — per COLUMN (i,j): the terrain noise depends only on direction, so
   // evaluate it ONCE per column and reuse for every radial layer. (Recomputing it
   // per 3D corner was ~13× redundant work across the radial axis — the bottleneck.)
+  // Only the FULL detail value+gradient is per-column; the morph target comes from a
+  // separate parent-GRID pass below (so morph=1 reproduces the parent LEAF, not the
+  // coarse field on this leaf's finer grid — the per-refinement normal-pop fix).
   const colCount = cnx * cny;
   const colDir = (_sColDir = fit(_sColDir, colCount * 3));
   const colT = (_sColT = fit(_sColT, colCount * 4)); // [tv, tdx, tdy, tdz] per column
-  const colTLo = (_sColTLo = fit(_sColTLo, colCount * 4)); // coarser [tv, td*] (morph normal)
+  const colTLo = (_sColTLo = fit(_sColTLo, colCount * 4)); // one-octave-coarser [tv, tdx, tdy, tdz] per column
   const colDr = (_sColDr = fit(_sColDr, colCount)); // radial morph offset per column
+  const colMN = (_sColMN = fit(_sColMN, colCount * 3)); // morph-target (parent) normal per column
   for (let j = 0; j < cny; j++) {
     const v = v0 + dv * j;
     for (let i = 0; i < cnx; i++) {
@@ -156,22 +165,124 @@ export function meshChunk(
       colDir[ci * 3] = dir[0];
       colDir[ci * 3 + 1] = dir[1];
       colDir[ci * 3 + 2] = dir[2];
+      // Full detail value+grad → colT. The one-octave-coarser value+grad (terrainAt's outLo, ~free since it
+      // shares `inv` — no extra fBm) → colTLo: the parent-grid pass below reuses these at the interior
+      // parent points (which coincide with the ODD child columns) instead of re-evaluating terrainAt there.
       terrainAt(recipe, dir[0] * scale, dir[1] * scale, dir[2] * scale, _t, _tLo, oct);
       colT[ci * 4] = _t[0]!;
       colT[ci * 4 + 1] = _t[1]!;
       colT[ci * 4 + 2] = _t[2]!;
       colT[ci * 4 + 3] = _t[3]!;
-      // Coarser (one-octave-dropped) terrain value+gradient — the morph target's
-      // surface AND its analytic normal source (matching colT/cornerNormal), so a
-      // fully-morphed leaf shades exactly like its coarse neighbour (no bright square).
       colTLo[ci * 4] = _tLo[0]!;
       colTLo[ci * 4 + 1] = _tLo[1]!;
       colTLo[ci * 4 + 2] = _tLo[2]!;
       colTLo[ci * 4 + 3] = _tLo[3]!;
-      // Morph target sits at the one-octave-smoother surface, so its radial offset
-      // from the base surface is height·(tvLo − tv). Pure function of direction →
-      // neighbours agree exactly → the geomorph opens no seams mid-transition.
-      colDr[ci] = height * (_tLo[0]! - _t[0]!);
+    }
+  }
+
+  // ── Morph target — the PARENT LEAF'S surface, reproduced (CDLOD parent-grid morph) ──
+  // The geomorph's premise is that a child born at morph=1 is invisible — exactly the coarse parent leaf it
+  // replaces. The parent renders the one-octave-coarser field on its 2×-coarser grid (piecewise-bilinear
+  // between parent grid points); sampling that field on THIS leaf's finer grid (the old morph target)
+  // resolved detail the parent can't, so every refinement swapped in a ~17° normal pop. Here we sample the
+  // coarser field on the PARENT grid and bilinearly interpolate it to each child column, so morph=1 IS the
+  // parent surface. The morph value stays the oct-normalized `_tLo` (terrainAt's outLo) — NOT a fresh
+  // (oct-1)-octave fBm — because the shader does mix(full, target, m) and m=1 must equal the baked target.
+  if (tan % 2 === 0) {
+    // Parent grid: spacing 2× the child's, anchored so the child rect edges land on parent grid lines (the
+    // child rect is one dyadic quadrant of the parent). One parent-cell apron each side guarantees every
+    // child column — including the two child-apron columns — is bracketed by 4 parent points in range.
+    const pdu = 2 * du, pdv = 2 * dv;
+    const pu0 = rect.u0 - pdu, pv0 = rect.v0 - pdv;
+    const pcnx = tan / 2 + 3, pcny = tan / 2 + 3;
+    const pVal = (_sPVal = fit(_sPVal, pcnx * pcny));
+    const pNrm = (_sPNrm = fit(_sPNrm, pcnx * pcny * 3));
+    // The INTERIOR parent points (pi/pj in [1, pcnx-2]) sit exactly on the ODD child columns
+    // (parent pi ↔ child column 2·pi−1, same direction), so reuse their already-evaluated `colTLo`/`colDir`
+    // instead of calling terrainAt again (~289 of ~361 parent fBm evals/chunk recovered). Only the parent
+    // PERIMETER (one parent cell beyond the child grid's apron) is evaluated fresh, at the same
+    // `pu0+pdu·pi` coordinate as before. Morph normals (assembleDensity on the coarser field) stay
+    // identical. Determinism: the interior coordinate `u0+du·(2pi−1)` and the perimeter `pu0+pdu·pi` are the
+    // same arithmetic the golden test froze, so the morph digests are unchanged (the test proves it).
+    for (let pj = 0; pj < pcny; pj++) {
+      const pv = pv0 + pdv * pj;
+      const interiorJ = pj >= 1 && pj <= pcny - 2;
+      const cj = 2 * pj - 1; // child row coinciding with this parent row (interior only)
+      for (let pi = 0; pi < pcnx; pi++) {
+        const pp = pj * pcnx + pi;
+        let dx: number, dy: number, dz: number, tv: number, td1: number, td2: number, td3: number;
+        if (interiorJ && pi >= 1 && pi <= pcnx - 2) {
+          // Reuse the coinciding odd child column (no terrainAt).
+          const ci = cj * cnx + (2 * pi - 1);
+          dx = colDir[ci * 3]!; dy = colDir[ci * 3 + 1]!; dz = colDir[ci * 3 + 2]!;
+          tv = colTLo[ci * 4]!; td1 = colTLo[ci * 4 + 1]!; td2 = colTLo[ci * 4 + 2]!; td3 = colTLo[ci * 4 + 3]!;
+        } else {
+          // Parent-grid perimeter: evaluate the coarser field fresh (same coordinate as before).
+          const w = wrapFaceUV(req.face, pu0 + pdu * pi, pv);
+          const dir = faceDirection(w.face, w.u, w.v);
+          terrainAt(recipe, dir[0] * scale, dir[1] * scale, dir[2] * scale, _t, _tLo, oct);
+          dx = dir[0]; dy = dir[1]; dz = dir[2];
+          tv = _tLo[0]!; td1 = _tLo[1]!; td2 = _tLo[2]!; td3 = _tLo[3]!;
+        }
+        pVal[pp] = tv;
+        // Analytic morph normal at the parent surface radius (radius + height·tvLo), one octave dropped —
+        // same source as the base normal, so a fully-morphed leaf shades exactly like its parent.
+        const rmP = radius + height * tv;
+        assembleDensity(radius, rmP, dx, dy, dz, tv, td1, td2, td3, height, scale, _dLo);
+        const mgx = -_dLo[1]!, mgy = -_dLo[2]!, mgz = -_dLo[3]!;
+        const mln = 1 / Math.sqrt(mgx * mgx + mgy * mgy + mgz * mgz + 1e-30);
+        pNrm[pp * 3] = mgx * mln;
+        pNrm[pp * 3 + 1] = mgy * mln;
+        pNrm[pp * 3 + 2] = mgz * mln;
+      }
+    }
+    // Bilinearly interpolate the parent grid to each child column. Child column index i sits at parent
+    // fractional coord fu=(i+1)/2 (odd i → on a parent grid line, tu=0; even i → parent-cell midpoint,
+    // tu=0.5), so the result is exactly the parent leaf's bilinear surface — a pure function of direction,
+    // hence seam-consistent with same-LOD neighbours (incl. cross-face and children of different parents).
+    for (let j = 0; j < cny; j++) {
+      const fv = (j + 1) / 2;
+      let pj0 = fv | 0;
+      if (pj0 > pcny - 2) pj0 = pcny - 2;
+      const tvv = fv - pj0;
+      for (let i = 0; i < cnx; i++) {
+        const ci = j * cnx + i;
+        const fu = (i + 1) / 2;
+        let pi0 = fu | 0;
+        if (pi0 > pcnx - 2) pi0 = pcnx - 2;
+        const tuu = fu - pi0;
+        const a = pj0 * pcnx + pi0, b = a + 1, c = a + pcnx, e = c + 1;
+        const w00 = (1 - tuu) * (1 - tvv), w10 = tuu * (1 - tvv), w01 = (1 - tuu) * tvv, w11 = tuu * tvv;
+        const mLo = w00 * pVal[a]! + w10 * pVal[b]! + w01 * pVal[c]! + w11 * pVal[e]!;
+        colDr[ci] = height * (mLo - colT[ci * 4]!);
+        let nx2 = w00 * pNrm[a * 3]! + w10 * pNrm[b * 3]! + w01 * pNrm[c * 3]! + w11 * pNrm[e * 3]!;
+        let ny2 = w00 * pNrm[a * 3 + 1]! + w10 * pNrm[b * 3 + 1]! + w01 * pNrm[c * 3 + 1]! + w11 * pNrm[e * 3 + 1]!;
+        let nz2 = w00 * pNrm[a * 3 + 2]! + w10 * pNrm[b * 3 + 2]! + w01 * pNrm[c * 3 + 2]! + w11 * pNrm[e * 3 + 2]!;
+        const nl = 1 / Math.sqrt(nx2 * nx2 + ny2 * ny2 + nz2 * nz2 + 1e-30);
+        colMN[ci * 3] = nx2 * nl;
+        colMN[ci * 3 + 1] = ny2 * nl;
+        colMN[ci * 3 + 2] = nz2 * nl;
+      }
+    }
+  } else {
+    // Odd `tan` (no caller does this; defensive): the parent grid can't align, so fall back to the coarser
+    // field at this leaf's own grid — correct but with the small per-refinement pop the parent grid removes.
+    for (let j = 0; j < cny; j++) {
+      const v = v0 + dv * j;
+      for (let i = 0; i < cnx; i++) {
+        const ci = j * cnx + i;
+        const w = wrapFaceUV(req.face, u0 + du * i, v);
+        const dir = faceDirection(w.face, w.u, w.v);
+        terrainAt(recipe, dir[0] * scale, dir[1] * scale, dir[2] * scale, _t, _tLo, oct);
+        colDr[ci] = height * (_tLo[0]! - colT[ci * 4]!);
+        const rmP = radius + height * _tLo[0]!;
+        assembleDensity(radius, rmP, dir[0], dir[1], dir[2], _tLo[0]!, _tLo[1]!, _tLo[2]!, _tLo[3]!, height, scale, _dLo);
+        const mgx = -_dLo[1]!, mgy = -_dLo[2]!, mgz = -_dLo[3]!;
+        const mln = 1 / Math.sqrt(mgx * mgx + mgy * mgy + mgz * mgz + 1e-30);
+        colMN[ci * 3] = mgx * mln;
+        colMN[ci * 3 + 1] = mgy * mln;
+        colMN[ci * 3 + 2] = mgz * mln;
+      }
     }
   }
 
@@ -209,20 +320,11 @@ export function meshChunk(
       cornerNormal[p * 3] = gx * ln;
       cornerNormal[p * 3 + 1] = gy * ln;
       cornerNormal[p * 3 + 2] = gz * ln;
-      // Morph-target ANALYTIC normal: normalize(−∇D) of the COARSER field at the morph
-      // radius rm (same formula as the base normal, one octave dropped). This is what
-      // makes a morphed leaf shade identically to its coarse neighbour — the fix for the
-      // bright "textured square" (Δeff≈0 yet visible ⇒ it was a shading mismatch).
-      assembleDensity(
-        radius, rm, dx, dy, dz,
-        colTLo[ci * 4]!, colTLo[ci * 4 + 1]!, colTLo[ci * 4 + 2]!, colTLo[ci * 4 + 3]!,
-        height, scale, _dLo,
-      );
-      const mgx = -_dLo[1]!, mgy = -_dLo[2]!, mgz = -_dLo[3]!;
-      const mln = 1 / Math.sqrt(mgx * mgx + mgy * mgy + mgz * mgz + 1e-30);
-      cornerMorphNormal[p * 3] = mgx * mln;
-      cornerMorphNormal[p * 3 + 1] = mgy * mln;
-      cornerMorphNormal[p * 3 + 2] = mgz * mln;
+      // Morph-target normal = the parent-grid analytic normal for this column (computed in the parent-grid
+      // pass, constant over the radial axis), so a fully-morphed leaf shades exactly like its parent leaf.
+      cornerMorphNormal[p * 3] = colMN[ci * 3]!;
+      cornerMorphNormal[p * 3 + 1] = colMN[ci * 3 + 1]!;
+      cornerMorphNormal[p * 3 + 2] = colMN[ci * 3 + 2]!;
       p++;
     }
   }
@@ -242,5 +344,108 @@ export function meshChunk(
     triangleCount: m.triangleCount,
     lod: req.lod,
     key: chunkKey(req),
+  };
+}
+
+/** Swap discontinuity at a one-level LOD refinement (metres + degrees). */
+export interface SwapDelta {
+  dPosMax: number; // worst surface-position gap (m) over the sampled points
+  dPosAvg: number;
+  dNrmMaxDeg: number; // worst normal-direction gap (deg) over the sampled points
+  dNrmAvgDeg: number;
+  samples: number;
+}
+
+/**
+ * DIAGNOSTIC (not on the mesher hot path): the residual discontinuity when a child leaf swaps in at
+ * morph=1, AFTER the parent-grid morph fix.
+ *
+ * The geomorph's premise is that a child born at morph=1 is invisible — exactly the coarse parent leaf it
+ * replaces. `meshChunk` now reproduces the parent's GRID (it bilinearly samples the coarser field on the
+ * parent's 2×-coarser grid), so the dominant ~17° grid-discretization pop the OLD child-grid morph showed is
+ * gone. What this measures is the only mismatch the grid alignment can't remove: the field-level difference
+ * between the mesher's morph-target source — the oct-normalized one-octave-coarser value `_tLo` (terrainAt's
+ * outLo, octaves `oct = lodOctaves(recipe, lod)`) — and the ACTUAL parent leaf's base field (octaves
+ * `octParent = oct-1`, normalized over its own `octParent` amplitudes). Because `_tLo` shares the child's
+ * `oct`-amplitude denominator, it is a smooth ~1–2% scaling of the parent's value → a tiny radial offset
+ * (≲ a few hundred m at peaks) and ≲ ~2° of normal tilt. So a SMALL reading here confirms the swap is
+ * effectively pop-free; a LARGE reading would mean the morph target no longer matches the parent.
+ *
+ * Sampled at a perAxis×perAxis spread across the child's uv rect; both surfaces evaluated at the SAME
+ * direction so the comparison isolates the field/normalization difference (grid is matched by the mesher).
+ * Returns max/avg position gap (m) + normal gap (deg). Pure + deterministic.
+ */
+export function swapDelta(
+  req: ChunkRequest,
+  recipe: TerrainRecipe,
+  radius: number,
+  perAxis = 4,
+): SwapDelta {
+  // No parent → nothing swaps (root/base leaf). Report zero.
+  if (req.path.length === 0) {
+    return { dPosMax: 0, dPosAvg: 0, dNrmMaxDeg: 0, dNrmAvgDeg: 0, samples: 0 };
+  }
+  const child = uvRectFromPath(req.path);
+  const oct = lodOctaves(recipe, req.lod); // child octaves → terrainAt's outLo is the morph-target value
+  const octParent = lodOctaves(recipe, req.lod - 1); // the actual parent leaf's octave count
+  const scale = recipe.noiseScale;
+  const height = recipe.height;
+
+  const t = new Float64Array(4);
+  const tLo = new Float64Array(4);
+  const d = new Float64Array(4);
+
+  // Surface point + outward analytic normal at face-(u,v) for a given octave count, optionally reading the
+  // one-octave-coarser `outLo` (the mesher's morph-target value) instead of the full value.
+  const surf = (u: number, v: number, octaves: number, useLo: boolean, pos: Float64Array, nrm: Float64Array): void => {
+    const dir = faceDirection(req.face, u, v);
+    terrainAt(recipe, dir[0] * scale, dir[1] * scale, dir[2] * scale, t, useLo ? tLo : undefined, octaves);
+    const s = useLo ? tLo : t;
+    const r = radius + height * s[0]!;
+    pos[0] = dir[0] * r;
+    pos[1] = dir[1] * r;
+    pos[2] = dir[2] * r;
+    assembleDensity(radius, r, dir[0], dir[1], dir[2], s[0]!, s[1]!, s[2]!, s[3]!, height, scale, d);
+    const gx = -d[1]!, gy = -d[2]!, gz = -d[3]!;
+    const ln = 1 / Math.sqrt(gx * gx + gy * gy + gz * gz + 1e-30);
+    nrm[0] = gx * ln;
+    nrm[1] = gy * ln;
+    nrm[2] = gz * ln;
+  };
+
+  const cPos = new Float64Array(3), cNrm = new Float64Array(3);
+  const pPos = new Float64Array(3), pNrm = new Float64Array(3);
+
+  let dPosMax = 0, dPosSum = 0, dNrmMax = 0, dNrmSum = 0, count = 0;
+
+  for (let a = 0; a < perAxis; a++) {
+    const su = child.u0 + (child.u1 - child.u0) * ((a + 0.5) / perAxis);
+    for (let b = 0; b < perAxis; b++) {
+      const sv = child.v0 + (child.v1 - child.v0) * ((b + 0.5) / perAxis);
+
+      // Child morph=1 = the mesher's morph-target value (`_tLo`, oct-normalized one-octave-coarser).
+      surf(su, sv, oct, true, cPos, cNrm);
+      // Parent leaf = the real lod-(D-1) base field (octParent octaves, octParent-normalized).
+      surf(su, sv, octParent, false, pPos, pNrm);
+
+      const dPos = Math.hypot(cPos[0]! - pPos[0]!, cPos[1]! - pPos[1]!, cPos[2]! - pPos[2]!);
+      let dot = cNrm[0]! * pNrm[0]! + cNrm[1]! * pNrm[1]! + cNrm[2]! * pNrm[2]!;
+      if (dot > 1) dot = 1; else if (dot < -1) dot = -1;
+      const dNrm = (Math.acos(dot) * 180) / Math.PI;
+
+      if (dPos > dPosMax) dPosMax = dPos;
+      if (dNrm > dNrmMax) dNrmMax = dNrm;
+      dPosSum += dPos;
+      dNrmSum += dNrm;
+      count++;
+    }
+  }
+
+  return {
+    dPosMax,
+    dPosAvg: count ? dPosSum / count : 0,
+    dNrmMaxDeg: dNrmMax,
+    dNrmAvgDeg: count ? dNrmSum / count : 0,
+    samples: count,
   };
 }

@@ -5,13 +5,17 @@ import {
   projectedSize,
   lodBoundRadius,
   selectCut,
+  balanceCut,
+  maxNeighborDelta,
+  clampCutToReachableFrontier,
   isPathPrefix,
   retainedShouldRemove,
   type CameraView,
   type SelectOpts,
   type QuadNode,
 } from '../core/quadtree.ts';
-import { chunkKey } from '../core/chunk.ts';
+import { chunkKey, uvRectFromPath } from '../core/chunk.ts';
+import { wrapFaceUV } from '../core/cubesphere.ts';
 import { EARTH_RADIUS_M } from '../core/constants.ts';
 
 // Step 2 gate (slice spec §6): correct LOD selection, coarse far → fine near, far
@@ -194,3 +198,194 @@ describe('selectCut', () => {
     expect(preMaxDepth).toBeGreaterThanOrEqual(baseMaxDepth);
   });
 });
+
+describe('balanceCut (2:1 restricted quadtree)', () => {
+  const MAXD = 8;
+  const bkey = (n: QuadNode): string => `${n.face}/${n.path.join('')}`;
+
+  // Full-sphere depth-1 base: 6 faces × 4 quadrants = 24 leaves, perfectly balanced.
+  const fullBase = (): QuadNode[] => {
+    const out: QuadNode[] = [];
+    for (let f = 0; f < 6; f++) for (let q = 0; q < 4; q++) out.push({ face: f, path: [q] });
+    return out;
+  };
+  // Uniformly refine a node to `depth` (a balanced patch, but coarser/finer than its neighbours).
+  const refineTo = (node: QuadNode, depth: number): QuadNode[] =>
+    node.path.length >= depth ? [node] : childrenOf(node).flatMap((c) => refineTo(c, depth));
+
+  // INDEPENDENT 2:1 check (denser than balanceCut's own probe, so a missed neighbour fails here):
+  // probe each leaf edge at 15 points and report the largest |neighbourDepth − depth| across the cut.
+  const coveringDepthT = (cut: Set<string>, face: number, u: number, v: number): number => {
+    let u0 = -1, u1 = 1, v0 = -1, v1 = 1;
+    const path: number[] = [];
+    for (let d = 1; d <= MAXD; d++) {
+      const um = (u0 + u1) / 2, vm = (v0 + v1) / 2;
+      let q = 0;
+      if (u >= um) { q |= 1; u0 = um; } else u1 = um;
+      if (v >= vm) { q |= 2; v0 = vm; } else v1 = vm;
+      path.push(q);
+      if (cut.has(`${face}/${path.join('')}`)) return d;
+    }
+    return -1;
+  };
+  const maxNbrDelta = (leaves: QuadNode[]): number => {
+    const cut = new Set(leaves.map(bkey));
+    let maxD = 0;
+    for (const lf of leaves) {
+      const r = uvRectFromPath(lf.path);
+      const eps = (r.u1 - r.u0) * 0.02;
+      const d = lf.path.length;
+      for (let i = 1; i < 16; i++) {
+        const t = i / 16;
+        const v = r.v0 + (r.v1 - r.v0) * t;
+        const u = r.u0 + (r.u1 - r.u0) * t;
+        for (const [pu, pv] of [[r.u1 + eps, v], [r.u0 - eps, v], [u, r.v1 + eps], [u, r.v0 - eps]]) {
+          const w = wrapFaceUV(lf.face, pu!, pv!);
+          const nd = coveringDepthT(cut, w.face, w.u, w.v);
+          if (nd >= 0) maxD = Math.max(maxD, Math.abs(nd - d));
+        }
+      }
+    }
+    return maxD;
+  };
+
+  it('is a no-op on an already-balanced uniform cut', () => {
+    const base = fullBase();
+    expect(maxNbrDelta(base)).toBeLessThanOrEqual(1);
+    const balanced = balanceCut(base, MAXD);
+    expect(balanced.length).toBe(base.length);
+    expect(new Set(balanced.map(bkey))).toEqual(new Set(base.map(bkey)));
+  });
+
+  it('eliminates >1-level steps (2:1 balances an imbalanced cut)', () => {
+    // A depth-4 patch dropped beside depth-1 neighbours = a 3-level step (the maxNbrΔ=4 the
+    // ?lodaudit logs showed). Replace face-0 quadrant 0 with its depth-4 tiling; keep the rest at 1.
+    const cut = fullBase().filter((l) => !(l.face === 0 && l.path[0] === 0));
+    cut.push(...refineTo({ face: 0, path: [0] }, 4));
+    expect(maxNbrDelta(cut)).toBeGreaterThan(1); // input is imbalanced
+
+    const balanced = balanceCut(cut, MAXD);
+    expect(maxNbrDelta(balanced)).toBeLessThanOrEqual(1); // output is 2:1 balanced → morphable
+    expect(balanced.length).toBeGreaterThan(cut.length); // only ADDED transition leaves
+
+    // The exported metric agrees with the independent dense checker: >1 before, ≤1 after. (This is
+    // the ACCURATE fine-probe metric that replaced the render-side quarter-cell overshoot probe,
+    // which falsely reported maxNbrΔ up to 4 on cuts that were in fact already edge-balanced.)
+    expect(maxNeighborDelta(cut, MAXD)).toBeGreaterThan(1);
+    expect(maxNeighborDelta(balanced, MAXD)).toBeLessThanOrEqual(1);
+  });
+
+  it('is deterministic and never coarsens (every input region stays at ≥ its depth)', () => {
+    const cut = fullBase().filter((l) => !(l.face === 2 && l.path[0] === 1));
+    cut.push(...refineTo({ face: 2, path: [1] }, 4));
+    const a = balanceCut(cut, MAXD);
+    const b = balanceCut(cut, MAXD);
+    expect(new Set(a.map(bkey))).toEqual(new Set(b.map(bkey)));
+    // Coverage preserved: at each input leaf's centre, the balanced cut covers it at ≥ its depth.
+    const balSet = new Set(a.map(bkey));
+    for (const lf of cut) {
+      const r = uvRectFromPath(lf.path);
+      const nd = coveringDepthT(balSet, lf.face, (r.u0 + r.u1) / 2, (r.v0 + r.v1) / 2);
+      expect(nd).toBeGreaterThanOrEqual(lf.path.length);
+    }
+  });
+});
+
+describe('clampCutToReachableFrontier (gated incremental refinement)', () => {
+  const BASE = 2;
+  const n = (face: number, path: number[]): QuadNode => ({ face, path });
+  const depthOf = (cut: QuadNode[], face: number, path: number[]): number => {
+    // depth at which `cut` covers the region (face,path): the clamped leaf is an ancestor-or-equal of it.
+    for (const lf of cut) if (lf.face === face && isPathPrefix(lf.path, path)) return lf.path.length;
+    return -1;
+  };
+
+  it('cold start (no live coverage) requests only the base depth', () => {
+    const target = n(0, [0, 0, 0, 0, 0, 0]); // depth 6
+    const out = clampCutToReachableFrontier([target], [], BASE);
+    expect(out).toEqual([n(0, [0, 0])]); // clamped to baseDepth, nothing deeper
+  });
+
+  it('refines exactly one level past the deepest live ancestor', () => {
+    const target = n(0, [0, 0, 0, 0, 0, 0]); // wants depth 6
+    // Live coverage is the depth-2 base leaf only → admit depth 3, never the deep target.
+    let out = clampCutToReachableFrontier([target], [n(0, [0, 0])], BASE);
+    expect(out).toEqual([n(0, [0, 0, 0])]);
+    // Once depth 3 is live, the next generation admits depth 4 — the front advances one level.
+    out = clampCutToReachableFrontier([target], [n(0, [0, 0, 0])], BASE);
+    expect(out).toEqual([n(0, [0, 0, 0, 0])]);
+  });
+
+  it('does NOT coarsen on merge-up: a region holding finer live detail keeps the target depth', () => {
+    // Camera pulling back: wants depth 4, but the 4 depth-5 children are live (and the coarse ancestors
+    // have been purged near the camera). The clamp must request depth 4 directly — gating here would
+    // collapse to the base and re-climb (a zoom-out flicker). Retention/morph make the merge smooth.
+    const target = n(0, [0, 0, 0, 0]); // depth 4
+    const liveChildren = [0, 1, 2, 3].map((q) => n(0, [0, 0, 0, 0, q])); // depth-5 detail, no live ancestor
+    const out = clampCutToReachableFrontier([target], liveChildren, BASE);
+    expect(out).toEqual([n(0, [0, 0, 0, 0])]); // target depth preserved, NOT forced to baseDepth
+  });
+
+  it('is idempotent once the target itself is live (the settled state)', () => {
+    const target = n(0, [0, 0, 0]);
+    const out = clampCutToReachableFrontier([target], [n(0, [0, 0, 0])], BASE);
+    expect(out).toEqual([target]);
+  });
+
+  it('de-duplicates many deep targets that collapse onto a shared shallow ancestor', () => {
+    // Four depth-5 targets sharing the prefix [0,0,0]; only the depth-2 base is live, so each clamps to
+    // its deepest-live-ancestor (depth 2) + 1 = depth 3 = [0,0,0]. All four collapse to one leaf.
+    const deepTargets = [0, 1, 2, 3].map((q) => n(0, [0, 0, 0, q, 0])); // depth-5, common prefix [0,0,0]
+    const out = clampCutToReachableFrontier(deepTargets, [n(0, [0, 0])], BASE);
+    expect(out).toEqual([n(0, [0, 0, 0])]); // one deduped depth-3 leaf, not four
+  });
+
+  it('is deterministic (same inputs → identical output)', () => {
+    const targets = [n(0, [0, 0, 0, 0]), n(1, [1, 1, 1]), n(3, [2, 0, 1, 3, 2])];
+    const live = [n(0, [0, 0]), n(1, [1]), n(3, [2, 0, 1])];
+    const a = clampCutToReachableFrontier(targets, live, BASE);
+    const b = clampCutToReachableFrontier(targets, live, BASE);
+    expect(a).toEqual(b);
+  });
+
+  it('every output is in [baseDepth, liveAncestorDepth+1] and never deeper than its target', () => {
+    const targets: QuadNode[] = [];
+    for (let f = 0; f < 6; f++)
+      for (let q = 0; q < 4; q++) targets.push(...refineToDepth(n(f, [q]), 7));
+    const live = [n(0, [0, 0]), n(0, [0, 1]), n(2, [3, 1, 0])]; // mixed live depths
+    const out = clampCutToReachableFrontier(targets, live, BASE);
+    for (const o of out) {
+      expect(o.path.length).toBeGreaterThanOrEqual(BASE); // base floor honored
+      expect(o.path.length).toBeLessThanOrEqual(7); // never deeper than the target
+    }
+    // The refined live regions advance exactly one level; the rest sit at the base floor.
+    expect(depthOf(out, 0, [0, 0, 0])).toBe(3); // live depth-2 → admit depth 3
+    expect(depthOf(out, 2, [3, 1, 0, 0])).toBe(4); // live depth-3 → admit depth 4
+    expect(depthOf(out, 5, [0, 0])).toBe(BASE); // cold region → base floor
+  });
+
+  it('keeps the clamped cut 2:1-balanced (morphable) when live coverage is balanced', () => {
+    // Backs the "clamp AFTER balanceCut" trap: clamping a uniform-deep target against a BALANCED live set
+    // adds at most one level per region, so adjacent regions stay ≤1 level apart → the morph still hides
+    // every seam. Build a balanced live set, request everything deep, clamp, and re-check the delta.
+    const MAXD = 9;
+    const bkey = (q: QuadNode): string => `${q.face}/${q.path.join('')}`;
+    const imbalanced: QuadNode[] = [];
+    for (let f = 0; f < 6; f++) for (let q = 0; q < 4; q++) imbalanced.push(n(f, [q]));
+    imbalanced.splice(imbalanced.findIndex((l) => l.face === 0 && l.path[0] === 0), 1);
+    imbalanced.push(...refineToDepth(n(0, [0]), 4)); // one deep patch
+    const live = balanceCut(imbalanced, MAXD); // guaranteed ≤1-balanced
+    expect(maxNeighborDelta(live, MAXD)).toBeLessThanOrEqual(1);
+
+    const targets: QuadNode[] = [];
+    for (let f = 0; f < 6; f++) for (let q = 0; q < 4; q++) targets.push(...refineToDepth(n(f, [q]), 7));
+    const clamped = clampCutToReachableFrontier(targets, live, BASE);
+    expect(new Set(clamped.map(bkey)).size).toBe(clamped.length); // a proper (deduped) cut
+    expect(maxNeighborDelta(clamped, MAXD)).toBeLessThanOrEqual(1); // still morphable
+  });
+});
+
+/** Uniformly refine a node down to `depth` (test helper, mirrors balanceCut's local refineTo). */
+function refineToDepth(node: QuadNode, depth: number): QuadNode[] {
+  return node.path.length >= depth ? [node] : childrenOf(node).flatMap((c) => refineToDepth(c, depth));
+}

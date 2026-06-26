@@ -14,18 +14,12 @@
 // altitude (full per-frame floating origin is Step 4).
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { Scene, Mesh, BufferGeometry, BufferAttribute, Color, Vector2, type Material } from 'three';
-import {
-  uniform,
-  mix,
-  attribute,
-  positionLocal,
-  positionWorld,
-  cameraPosition,
-  smoothstep,
-} from 'three/tsl';
+import { Scene, Mesh, BufferGeometry, BufferAttribute, Color, Vector3, type Material } from 'three';
 import {
   selectCut,
+  balanceCut,
+  clampCutToReachableFrontier,
+  maxNeighborDelta as maxNeighborDeltaCore,
   nodeBounds,
   lodBoundRadius,
   retainedShouldRemove,
@@ -33,15 +27,19 @@ import {
   type CameraView,
   type QuadNode,
 } from '../core/quadtree.ts';
-import { chunkKey, uvRectFromPath, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
+import { chunkKey, uvRectFromPath, swapDelta, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
 import { faceDirection, wrapFaceUV, CUBE_FACES } from '../core/cubesphere.ts';
 import { lodOctaves, terrainAt, type TerrainRecipe } from '../core/density.ts';
-
-/** Node materials expose positionNode/normalNode; the base is typed as plain Material here. */
-interface NodeMaterialLike {
-  positionNode: unknown;
-  normalNode: unknown;
-}
+import {
+  createTerrainMaterial,
+  detailPhaseOf,
+  MORPH_START_FRAC,
+  BIRTH_MS,
+  DETAIL_A_NEAR_M,
+  DETAIL_A_FAR_M,
+  DETAIL_B_NEAR_M,
+  DETAIL_B_FAR_M,
+} from './terrainMaterial.ts';
 
 type Status = 'pending' | 'inflight' | 'ready' | 'live';
 interface Entry {
@@ -49,7 +47,8 @@ interface Entry {
   status: Status;
   center: [number, number, number];
   mesh: Mesh | null;
-  mat: Material | null; // per-leaf material clone (carries the leaf's own CDLOD level uniform)
+  mat: Material | null; // OWNED per-leaf material: null in normal mode (uses the shared material);
+  // a clone only in debug-tint modes (?lodcolor/?skirtcolor/?morphcolor). Disposed iff non-null.
   ready: ChunkMesh | null;
   morph: number; // CDLOD morph at the leaf CENTER (0=full near .. 1=parent far) — debug/HUD only
   needsSkirt: boolean; // does any edge lack a same-LOD neighbour in the cut?
@@ -62,22 +61,14 @@ interface MeshResult {
   ms: number;
 }
 
-/**
- * CDLOD morph region: a leaf shows full detail until the camera recedes to this fraction of
- * the way from its split distance to its merge (parent) distance, then morphs to the parent
- * surface by the merge distance — so detail fades continuously with distance and a leaf
- * matches the coarser neighbour exactly at the shared LOD boundary. Used identically in the
- * TSL shader (per-vertex) and `centerMorph` (CPU, for ?lodmorphdebug/?morphcolor).
- */
-const MORPH_START_FRAC = 0.55;
-
-/**
- * Birth-ease (ms): a newly-live leaf starts at morph=1 (= the parent surface it replaces, so its
- * appearance is invisible) and eases to its true distance-morph over this long. Hides late-streaming
- * refinements (which would otherwise snap in already-detailed past their morph-start distance) by
- * fading them up from the parent. At normal speed distanceMorph≈1 at birth too, so it's a no-op.
- */
-const BIRTH_MS = 300;
+// MORPH_START_FRAC (the CDLOD fade-band start) lives in terrainMaterial.ts so the TSL graph and
+// this file's CPU mirror (`distanceMorph`, for ?lodmorphdebug/?morphcolor) stay in lockstep.
+//
+// The old time-based "birth-ease" (a newly-live leaf eased up from the parent over 300 ms) was
+// REMOVED: with speed-aware prefetch keeping leaves born at the parent surface (bornM≈1), it was
+// redundant, and because a recut's batch of new leaves all share a birth instant it faded them in
+// as one synchronized front — a visible "wave." The per-vertex distance morph alone now carries
+// every leaf in continuously, independent of when it streamed in.
 
 // Skirt depth (m) at a LOD transition, sized to the cross-LOD SURFACE mismatch — NOT
 // the old km-scale "cover everything" curtain that was the visible boundary grid.
@@ -113,12 +104,19 @@ export interface ManagerOpts {
   // sphere (no horizon/cone cull) so every finer leaf morphs from a real parent → no
   // fresh-over-backdrop pop when a region rotates/streams in. 0 = off. See SelectOpts.baseDepth.
   baseDepth?: number;
-  workers?: number; // pool size (default: min(6, cores-1))
+  workers?: number; // pool size (default: min(10, cores-1))
+  wireframe?: boolean; // debug: render the shared terrain material as wireframe (?wire)
+  slopePreset?: number; // ?slopeband=N: slope-band look preset (index into SLOPE_PRESETS; default 0 = current)
+  noDetail?: boolean; // ?nodetail: build the terrain material without the per-pixel mx_noise detail (GPU probe)
   skirts?: boolean; // enable LOD-transition skirts (default OFF — the apron already covers
   // holes at LOD transitions, and the skirts were the visible boundary grid; ?skirt re-enables)
   debugColor?: 'lod' | 'skirt' | 'morph'; // debug tint: LOD level / skirted leaves / morph progress
   debugLodMorph?: boolean; // ?lodmorphdebug: throttled [NMS morph] console line + balance metric
   debugAudit?: boolean; // ?lodaudit: SUPERSET — also [NMS audit] (seam/coverage/cadence/health)
+  debugSeamScan?: boolean; // ?seamscan: run the EXPENSIVE O(live²) seam + O(96·live) coverage scans.
+  // OFF by default even under ?lodaudit: at ~500 live leaves they cost ~250k fBm evals and were
+  // themselves a periodic main-thread spike (the diagnostics adding the lag they were measuring).
+  debugChurn?: boolean; // ?perf: count meshes created/disposed per second (churnPerSec)
 }
 
 export interface StreamStats {
@@ -135,12 +133,21 @@ export class QuadtreeManager {
   private readonly readyQueue: string[] = []; // meshed, awaiting GPU upload
   private readonly jobKey = new Map<number, string>();
   private wanted = new Set<string>();
+  // True while the reachable-frontier clamp is still holding the cut shallower than the screen-space
+  // target somewhere — i.e. the detail front has more levels to climb. Drives the recut-while-refining
+  // gate in scene.ts so generations keep firing even when the camera is stationary (a hard-zoom-then-stop
+  // would otherwise freeze one level in). False once every region has streamed to its target depth.
+  private frontierActive = false;
   private readonly workers: Worker[] = [];
   private readonly idle: Worker[] = [];
   private readonly heightMargin: number;
   private nextId = 1;
   private renderOrigin: [number, number, number] = [0, 0, 0];
   private avgMs = 0;
+  // ?perf churn: meshes created+disposed since the last churnPerSec() read, and the manager-clock
+  // timestamp of that read — high churn (live count thrashing) is the streaming cost behind the lag.
+  private churnAccum = 0;
+  private churnClockMs = 0;
   private lastStatLog = ''; // throttles the per-cut diagnostic log
   // ?lodmorphdebug state: a resume-safe clock (accumulated dtMs, no Date.now), upload
   // counter per cut, log throttle, last-measured cut imbalance, and the HUD summary.
@@ -165,13 +172,40 @@ export class QuadtreeManager {
   private bornMSum = 0;
   private bornMMin = 1;
   private bornMN = 0;
-  // CDLOD geomorph: one shared uniform = (viewportHeight/(2·tan(fovY/2)))/splitPx — the
-  // same projected-size constant selectCut uses, so the per-vertex distance morph band
-  // aligns with the split distance (set per frame by the render shell). The camera world
-  // position (render space) is mirrored on the CPU only to compute the leaf-CENTRE morph
-  // for ?lodmorphdebug/?morphcolor; the actual morph is per-vertex in TSL via cameraPosition.
-  private readonly kDistUniform = uniform(0);
-  private readonly uNowUniform = uniform(0); // manager clock (ms) for the per-leaf birth-ease
+  // ?lodaudit "[NMS step]" diagnostics — isolate WHICH mechanism makes detail appear in steps/generations
+  // on zoom-in. bornHist = born-morph buckets [≥.9/.7–.9/.3–.7/<.3] (B: late arrivals snap if mass is <.3).
+  // newByDepth/liveAtByDepth = per-depth go-live counts + last go-live clock (C: levels arriving in bursts).
+  // snapCount = live leaves whose DISPLAYED morph jumped >0.3 between frames; snapFloor = of those, how many
+  // were inside the birth-ease window (A: the birth floor releasing late = the snap). Reset where noted.
+  private readonly bornHist = [0, 0, 0, 0];
+  private readonly newByDepth: number[] = [];
+  private snapCount = 0;
+  private snapFloor = 0;
+  private floorWinsMaxWin = 0; // peak floorWins% across frames since the last [NMS step] log (A is a WAVE,
+  // not a per-frame snap — a batch held at the floor fades together — so a single log-tick snapshot can
+  // miss it; the window peak catches it).
+  // [NMS step] swap-delta (the decisive measurement): per REFINEMENT leaf going live, how far its morph=1
+  // surface departs from the parent leaf it replaces (swapDelta in /core). Accumulated max/avg over the
+  // window, reset at each log. Large ⇒ the morph target doesn't reproduce the parent (mesher fix); ≈0 ⇒
+  // the swap is clean and the visible step is the slope-band threshold (shader fix).
+  private swapDPosMax = 0;
+  private swapDNrmMax = 0;
+  private swapDPosSum = 0;
+  private swapDNrmSum = 0;
+  private swapN = 0;
+  // CDLOD geomorph: ONE shared material (createTerrainMaterial) carries the per-vertex distance
+  // morph; its kDist uniform = (viewportHeight/(2·tan(fovY/2)))/splitPx — the same projected-size
+  // constant selectCut uses, so the morph band aligns with the split distance (set per frame by the
+  // render shell). The camera world position (render space) is mirrored on the CPU only to compute
+  // the leaf-CENTRE morph for ?lodmorphdebug/?morphcolor; the actual morph is per-vertex in TSL.
+  private readonly sharedMat: Material;
+  private readonly kDistUniform: { value: number };
+  // Material world-origin uniforms (set on every floating-origin recenter): the FULL render origin
+  // (direction, for slope bands) and renderOrigin reduced mod L in double (the stable, float-precise
+  // base for the surface-detail coordinate). See terrainMaterial.ts.
+  private readonly matRenderOrigin: { value: Vector3 };
+  private readonly matDetailPhase: { value: Vector3 };
+  private readonly matNow: { value: number }; // manager clock → per-leaf birth-ease floor
   private kDist = 0;
   private camX = 0;
   private camY = 0;
@@ -189,14 +223,25 @@ export class QuadtreeManager {
 
   constructor(
     private readonly scene: Scene,
-    private readonly material: Material,
     private readonly recipe: TerrainRecipe,
     private readonly radius: number,
     private readonly opts: ManagerOpts,
   ) {
     this.heightMargin = recipe.height * 1.6;
+    // The ONE shared terrain material (per-leaf data rides in the `aLevel` attribute); its kDist
+    // uniform is updated each frame via setMorphParams.
+    const handle = createTerrainMaterial({ wireframe: opts.wireframe, slopePreset: opts.slopePreset, noDetail: opts.noDetail });
+    this.sharedMat = handle.material;
+    this.kDistUniform = handle.kDist;
+    this.matRenderOrigin = handle.renderOrigin;
+    this.matDetailPhase = handle.detailPhase;
+    this.matNow = handle.now;
     const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
-    const n = Math.max(1, Math.min(opts.workers ?? 6, cores - 1));
+    // Pool size. The descent bottleneck is meshing THROUGHPUT (real-GPU ?lodaudit showed reqLat ~700–870ms
+    // with busy6/6 saturated + a 100–170 request backlog on zoom-in), so default to 10 workers — still
+    // clamped by cores-1, which leaves a core for the main thread and only adds parallelism on machines
+    // that have the cores to spare (≤6-core machines are unaffected).
+    const n = Math.max(1, Math.min(opts.workers ?? 10, cores - 1));
     for (let i = 0; i < n; i++) {
       const w = new Worker(new URL('../workers/mesher.worker.ts', import.meta.url), {
         type: 'module',
@@ -207,9 +252,13 @@ export class QuadtreeManager {
     }
   }
 
-  /** Re-center the render frame; reposition all live meshes relative to it. */
+  /** Re-center the render frame; reposition all live meshes relative to it. Also feed the material's
+   *  world-origin uniforms so the surface detail stays anchored to absolute world space (no swim) and
+   *  precise (the detail phase is renderOrigin reduced mod L in double — the float shader can't). */
   setRenderOrigin(o: [number, number, number]): void {
     this.renderOrigin = o;
+    this.matRenderOrigin.value.set(o[0], o[1], o[2]);
+    detailPhaseOf(o[0], o[1], o[2], this.matDetailPhase.value);
     for (const e of this.entries.values()) {
       if (e.mesh) e.mesh.position.set(e.center[0] - o[0], e.center[1] - o[1], e.center[2] - o[2]);
     }
@@ -258,6 +307,7 @@ export class QuadtreeManager {
     this.bornMSum = 0;
     this.bornMMin = 1;
     this.bornMN = 0;
+    this.bornHist[0] = this.bornHist[1] = this.bornHist[2] = this.bornHist[3] = 0; // [NMS step] B window = since last recut
     this.prefetchM = prefetchM; // for ?lodmorphdebug readout
     if (this.opts.debugAudit) {
       // Recut cadence (the "detail arrives in waves" signal) + the view cone for the coverage/seam probes.
@@ -267,7 +317,28 @@ export class QuadtreeManager {
       if (camera.halfFov !== undefined) this.dbgHalfFov = camera.halfFov;
     }
     let leavesAdded = 0;
-    const cut = selectCut(camera, {
+    // GATED INCREMENTAL REFINEMENT + 2:1 BALANCE — clamp BEFORE balancing (the recut-cost fix).
+    // selectCut is the pure SSE decision: a full partition (its golden test is unchanged). We deliberately do
+    // NOT balance it first. A fast zoom makes the ideal cut span base→depth-11, and balancing THAT builds the
+    // entire 2→11 staircase only for the clamp to immediately truncate it back to live+1 — we'd pay to balance
+    // deep detail we throw away (the ~17 ms recut spike during zoom). Instead, in order:
+    //   1) clamp the raw ideal cut → caps every region at (deepest live covering leaf's depth)+1 (cheap
+    //      per-target truncation, no expansion). This is the zoom pop-in fix: the detail front descends ONE
+    //      level per recut generation — each shown transition is a single morphable level whose parent is
+    //      ALREADY live — and it self-paces to streaming (can't request N+1 until N is live, so it never
+    //      outruns the worker pool). No-op once a region reaches target depth (target-live ⇒ unchanged); never
+    //      gates merge-up/coarsening (smooth via the morph + deferred removal).
+    //   2) a SINGLE balanceCut on the shallow clamped cut → force-splits any leaf whose edge-neighbour is >1
+    //      level finer, so every cross-LOD step is exactly one level (the CDLOD morph hides it; no unmorphable
+    //      seam/pop, which ?lodaudit logged as maxNbrΔ up to 4). It also fills the depth-3 staircase ring
+    //      beside the always-live base. Because the clamped input is shallow (≤ live+1, not the ideal depth),
+    //      this is cheap.
+    // The final balanceCut guarantees the output is 2:1 balanced (maxNbrΔ≤1) regardless of input order, so
+    // clamping first loses no balance — it just skips building the discarded deep staircase. Pure /core
+    // decisions (selectCut/clampCutToReachableFrontier/balanceCut unchanged); render-side here only because
+    // the live set is render state. The recut-while-refining gate in scene.ts keeps generations firing.
+    const baseDepth = this.opts.baseDepth ?? 0;
+    const ideal = selectCut(camera, {
       radius: this.radius,
       heightMargin: this.heightMargin,
       splitPx: splitPx ?? this.opts.splitPx,
@@ -277,8 +348,20 @@ export class QuadtreeManager {
       prefetchM,
       // Always-resident coarse base — keep the whole sphere meshed at low detail so every
       // refinement has a real parent to morph from (no backdrop pop). 0 = off.
-      baseDepth: this.opts.baseDepth ?? 0,
+      baseDepth,
     });
+    const liveNodes: QuadNode[] = [];
+    for (const e of this.entries.values()) if (e.status === 'live') liveNodes.push(e.node);
+    const clamped = clampCutToReachableFrontier(ideal, liveNodes, baseDepth);
+    // Did the clamp hold anything back from its target depth? Truncation strictly reduces total path depth
+    // (and may dedup siblings), so a shallower clamped sum than the raw ideal ⇔ the front is still climbing.
+    // Equal ⇔ settled. Measured pre re-balance so it's a clean "more levels to reach" signal.
+    let idealDepth = 0;
+    for (const t of ideal) idealDepth += t.path.length;
+    let clampedDepth = 0;
+    for (const c of clamped) clampedDepth += c.path.length;
+    this.frontierActive = clampedDepth < idealDepth;
+    const cut = balanceCut(clamped, this.opts.maxDepth);
 
     const wanted = new Set<string>();
     for (const node of cut) {
@@ -333,9 +416,9 @@ export class QuadtreeManager {
     // state on their actual machine.
     let summary = `leaves=${wanted.size} skirted=${skirted} interior=${wanted.size - skirted} skirtsOpt=${!!this.opts.skirts} lod=${JSON.stringify(lodHist)}`;
     if (this.opts.debugLodMorph) {
-      // Cut imbalance: max LOD-level difference across any shared edge. >1 means a deep
-      // block abuts a much coarser leaf (a hard step) → CDLOD will need balanceCut.
-      this.maxNbrDelta = this.maxNeighborDelta();
+      // Cut imbalance: max LOD-level difference across any leaf EDGE (accurate fine-probe metric in
+      // core). With balanceCut applied above this should read ≤1; >1 would mean an unmorphable step.
+      this.maxNbrDelta = maxNeighborDeltaCore(cut, this.opts.maxDepth);
       summary += ` maxNbrΔ=${this.maxNbrDelta}`;
     }
     if (summary !== this.lastStatLog) {
@@ -380,6 +463,7 @@ export class QuadtreeManager {
       if (e.status !== 'live' || this.wanted.has(key)) continue;
       if (retainedShouldRemove(e.node, wantedArr)) {
         if (e.mesh) {
+          this.churnAccum++; // ?perf: a mesh was disposed this frame
           this.scene.remove(e.mesh);
           e.mesh.geometry.dispose();
         }
@@ -398,7 +482,7 @@ export class QuadtreeManager {
   tick(dtMs: number): void {
     if (this.entries.size === 0) return;
     this.clockMs += dtMs; // resume-safe clock (no Date.now) + the ?lodmorphdebug age base
-    this.uNowUniform.value = this.clockMs; // drive the per-leaf birth-ease (always, even when debug off)
+    this.matNow.value = this.clockMs; // drive the per-leaf birth-ease floor (always, even when debug off)
     const dbg = !!this.opts.debugLodMorph;
     const tintMorph = this.opts.debugColor === 'morph';
     if (!dbg && !tintMorph) return; // CDLOD morph is in-shader; nothing else to do
@@ -406,10 +490,19 @@ export class QuadtreeManager {
     // ?lodaudit morph histogram buckets: [m<.1, .1–.3, .3–.7, .7–.9, >.9]. Bimodal (full pile at
     // <.1 and >.9, few between) ⇒ steps at the transition ring; a smooth spread ⇒ graded morph.
     let h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0;
+    // [NMS step] Candidate A snapshot (THIS frame): how often the birth-ease floor is overriding the pure
+    // distance morph (holding a leaf at its parent against distance = the delayed-snap "generation").
+    let floorWins = 0, floorLiftSum = 0, floorAgeSum = 0;
     for (const e of this.entries.values()) {
       if (e.status !== 'live') continue;
       live++;
-      const m = this.centerMorph(e);
+      // Split centerMorph into its parts so the [NMS step] line can see the floor vs the pure distance
+      // morph (instead of only their max). m = displayed; dm = pure distance morph; bf = birth-ease floor.
+      const dm = this.distanceMorph(e);
+      let bf = 1 - (this.clockMs - e.liveAtMs) / BIRTH_MS;
+      if (bf < 0) bf = 0;
+      const m = dm > bf ? dm : bf;
+      const prev = e.morph; // last frame's DISPLAYED morph (set below) — for the per-frame snap detector
       e.morph = m;
       // ?morphcolor: green = full detail (near, m=0) → red = parent (far, m=1). A correct
       // CDLOD render shows a smooth concentric gradient, NOT per-leaf colour blocks.
@@ -422,7 +515,20 @@ export class QuadtreeManager {
           if (m > mx) mx = m;
         }
         if (m < 0.1) h0++; else if (m < 0.3) h1++; else if (m < 0.7) h2++; else if (m < 0.9) h3++; else h4++;
+        const ageMs = this.clockMs - e.liveAtMs;
+        if (bf > dm + 0.02) { floorWins++; floorLiftSum += bf - dm; floorAgeSum += ageMs; } // A: floor active
+        // Per-frame snap = a leaf whose DISPLAYED morph jumped >0.3 since last frame (a visible step).
+        // Skip just-born leaves (no valid prev). snapFloor = those still within the birth window ⇒ the
+        // birth-ease releasing is the step (A); snaps with no floor point at late geometry arrival (B).
+        if (ageMs > dtMs * 1.5 && Math.abs(m - prev) > 0.3) {
+          this.snapCount++;
+          if (ageMs < BIRTH_MS + 100) this.snapFloor++;
+        }
       }
+    }
+    if (dbg && live > 0) {
+      const fwPct = (100 * floorWins) / live;
+      if (fwPct > this.floorWinsMaxWin) this.floorWinsMaxWin = fwPct; // window peak (A), reset at log
     }
     if (dbg) {
       const avg = mid > 0 ? sum / mid : 0;
@@ -449,8 +555,15 @@ export class QuadtreeManager {
         // show-through; histM = morph distribution; cut[Δt,+N] = recut wave cadence; stream/busy =
         // worker health; pf/band = whether prefetch is meaningful at this altitude.
         if (this.opts.debugAudit) {
-          const seam = this.seamScan();
-          const cov = this.coverageScan();
+          // The seam + coverage scans are O(live²)/O(96·live) — at ~500 live leaves a periodic
+          // main-thread spike. Run them ONLY under ?seamscan so plain ?lodaudit/?perf measures
+          // without the diagnostics perturbing the timing; otherwise show placeholder "off".
+          const seam = this.opts.debugSeamScan
+            ? this.seamScan()
+            : { dEffMax: 0, dEffAvg: 0, gapMax: 0, worst: 'off' };
+          const cov = this.opts.debugSeamScan
+            ? this.coverageScan()
+            : { covered: 0, total: 0, holes: 0 };
           const s = this.stats();
           const busy = this.workers.length - this.idle.length;
           const band = this.nearLeafBandKm();
@@ -463,6 +576,47 @@ export class QuadtreeManager {
             `stream[p${s.pending} i${s.inflight} r${s.ready} L${s.live} busy${busy}/${this.workers.length} ${s.msPerLeaf.toFixed(0)}ms] ` +
             `pf=${pfKm.toFixed(1)}km band=${band.toFixed(1)}km pf/band=${band > 0 ? (pfKm / band).toFixed(3) : '-'}`;
           console.log('[NMS audit]', this.auditSummary);
+
+          // ── [NMS step] — one decisive signal per candidate cause of "detail appears in steps" ──
+          // A (birth-ease floor holding leaves at the parent against distance, then releasing = a snap):
+          //   floorWins% high + floorLift large during a smooth zoom. snap = per-window count of >0.3
+          //   displayed-morph jumps; snapFloor = of those, ones still inside the birth window (⇒ the floor
+          //   release IS the step). B (late arrivals): bornHist piled in <.3 and/or pfAdeq<1 (lead < the
+          //   distance the camera covers while a leaf streams). C (level bursts): newByDepth shows a whole
+          //   depth arriving at once. D (texture steps on its own schedule): see nearDetailStr — gA/gB jump
+          //   while mNear is smooth. E: histM (above) bimodal. One steady zoom-in run picks the culprit.
+          const fw = live > 0 ? (100 * floorWins) / live : 0;
+          const fl = floorWins > 0 ? floorLiftSum / floorWins : 0;
+          const fa = floorWins > 0 ? (floorAgeSum / floorWins) | 0 : 0;
+          const speedMS = Math.max(0, this.approachRate);
+          const needM = (speedMS * latAvg) / 1000; // m the camera covers during one stream latency
+          const pfAdeq = needM > 0 ? this.prefetchM / needM : Infinity;
+          const nbd = this.newByDepth
+            .map((c, d) => (c ? `${d}:${c}` : ''))
+            .filter(Boolean)
+            .join(',');
+          // swap-delta (decisive): the morph=1 child-vs-parent discontinuity over the refinements this
+          // window. dNrm large (≳ several °) and/or dPos large (≳ a few m) ⇒ the morph target doesn't
+          // reproduce the parent leaf → mesher fix; ≈0 ⇒ a clean swap, so the visible step is the
+          // slope-band shader threshold amplifying the per-leaf normal morph → shader fix.
+          const swDPosAvg = this.swapN > 0 ? this.swapDPosSum / this.swapN : 0;
+          const swDNrmAvg = this.swapN > 0 ? this.swapDNrmSum / this.swapN : 0;
+          console.log(
+            `[NMS step] A:floorWins=${fw.toFixed(0)}%(peak ${this.floorWinsMaxWin.toFixed(0)}%) lift=${fl.toFixed(2)} age=${fa}ms snap=${this.snapCount}(floor ${this.snapFloor}) | ` +
+              `B:bornHist[≥.9=${this.bornHist[0]}/.7=${this.bornHist[1]}/.3=${this.bornHist[2]}/<.3=${this.bornHist[3]}] ` +
+              `pf=${pfKm.toFixed(2)}km need=${(needM / 1000).toFixed(2)}km pfAdeq=${pfAdeq === Infinity ? '∞' : pfAdeq.toFixed(2)} | ` +
+              `C:new[${nbd || 'none'}] | D:${this.nearDetailStr()} | ` +
+              `swap[dPos=${this.swapDPosMax.toFixed(1)}m(avg ${swDPosAvg.toFixed(1)}) dNrm=${this.swapDNrmMax.toFixed(1)}°(avg ${swDNrmAvg.toFixed(1)}) n=${this.swapN}]`,
+          );
+          this.snapCount = 0;
+          this.snapFloor = 0;
+          this.floorWinsMaxWin = 0;
+          this.newByDepth.length = 0;
+          this.swapDPosMax = 0;
+          this.swapDNrmMax = 0;
+          this.swapDPosSum = 0;
+          this.swapDNrmSum = 0;
+          this.swapN = 0;
         }
       }
     }
@@ -485,16 +639,16 @@ export class QuadtreeManager {
     let t = (dist - e0) / (dParent - e0);
     if (t < 0) t = 0;
     else if (t > 1) t = 1;
-    return t * t * (3 - 2 * t); // smoothstep
+    return t * t * (3 - 2 * t); // smoothstep — PURE distance morph (no birth; this is the bornM signal)
   }
 
-  /** CDLOD morph at a leaf's CENTRE with the birth-ease floor (the value actually drawn). */
+  /** CDLOD morph at a leaf's CENTRE (0=full near .. 1=parent far) — CPU mirror of the DRAWN morph
+   *  (distance morph, floored by the short birth-ease while the leaf is fresh). ?lodmorphdebug/?morphcolor. */
   private centerMorph(e: Entry): number {
-    const distanceM = this.distanceMorph(e);
-    // Birth-ease floor (mirrors the shader): a fresh leaf reads m=1 (parent) then decays.
+    const m = this.distanceMorph(e);
     let birth = 1 - (this.clockMs - e.liveAtMs) / BIRTH_MS;
     if (birth < 0) birth = 0;
-    return distanceM > birth ? distanceM : birth;
+    return m > birth ? m : birth;
   }
 
   /** ?lodmorphdebug: the sub-camera leaf's depth, morph, distance, and fade band (km). */
@@ -514,6 +668,35 @@ export class QuadtreeManager {
     const dChild = 2 * lodBoundRadius(depth, this.radius) * this.kDist;
     const dParent = 2 * lodBoundRadius(depth > 0 ? depth - 1 : 0, this.radius) * (depth > 0 ? this.kDist : 2 * this.kDist);
     return `near[d=${depth} m=${this.centerMorph(best).toFixed(2)} dist=${(dist / 1000).toFixed(1)}km band=${(dChild / 1000).toFixed(1)}..${(dParent / 1000).toFixed(1)}km]`;
+  }
+
+  /** [NMS step] Candidate D: at the sub-camera leaf, the procedural-detail (texture) state — its geometry
+   *  morph `mNear`, the detail weight `wMorph=1−mNear`, and the two distance gates `gA`/`gB` (CPU mirror of
+   *  the shader smoothsteps). `gA`/`gB` are smooth functions of distance, so if the TEXTURE steps it must
+   *  be `wMorph` (= the morph) stepping — i.e. the SAME root as A/B, not an independent detail schedule. */
+  private nearDetailStr(): string {
+    const { face, u, v } = this.faceUVOf(this.camX, this.camY, this.camZ);
+    let best: Entry | null = null;
+    for (const e of this.entries.values()) {
+      if (e.status !== 'live' || e.node.face !== face) continue;
+      const r = uvRectFromPath(e.node.path);
+      if (u < r.u0 || u > r.u1 || v < r.v0 || v > r.v1) continue;
+      if (!best || e.node.path.length > best.node.path.length) best = e;
+    }
+    if (!best) return 'mNear=- (none)';
+    const dx = best.center[0] - this.camX, dy = best.center[1] - this.camY, dz = best.center[2] - this.camZ;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const mNear = this.centerMorph(best);
+    const wMorph = 1 - mNear;
+    const ss = (e0: number, e1: number, x: number): number => {
+      let t = (x - e0) / (e1 - e0);
+      if (t < 0) t = 0;
+      else if (t > 1) t = 1;
+      return t * t * (3 - 2 * t);
+    };
+    const gA = ss(DETAIL_A_FAR_M, DETAIL_A_NEAR_M, dist);
+    const gB = ss(DETAIL_B_FAR_M, DETAIL_B_NEAR_M, dist);
+    return `mNear=${mNear.toFixed(2)} wMorph=${wMorph.toFixed(2)} gA=${gA.toFixed(2)} gB=${gB.toFixed(2)} texW≈${(wMorph * gA).toFixed(2)}/${(wMorph * gB).toFixed(2)}`;
   }
 
   // ───────────────────────── ?lodaudit helpers (debug-only, throttled) ─────────────────────────
@@ -547,8 +730,8 @@ export class QuadtreeManager {
     return best;
   }
 
-  /** Rendered CDLOD morph (0..1, incl birth-ease) for leaf `e` at world point P — the SAME
-   *  formula the TSL shader applies per-vertex, evaluated on the CPU at an arbitrary point. */
+  /** Rendered CDLOD morph (0..1) for leaf `e` at world point P — the SAME formula the TSL shader
+   *  applies per-vertex, evaluated on the CPU at an arbitrary point (distance morph; no birth-ease). */
   private effMorphAt(e: Entry, px: number, py: number, pz: number): number {
     const dx = px - this.camX, dy = py - this.camY, dz = pz - this.camZ;
     const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
@@ -558,15 +741,10 @@ export class QuadtreeManager {
     const dChild = 2 * lodR * this.kDist;
     const dParent = 2 * parentR * this.kDist;
     const e0 = dChild + (dParent - dChild) * MORPH_START_FRAC;
-    let m = 0;
-    if (dParent > e0) {
-      let t = (dist - e0) / (dParent - e0);
-      if (t < 0) t = 0; else if (t > 1) t = 1;
-      m = t * t * (3 - 2 * t);
-    }
-    let birth = 1 - (this.clockMs - e.liveAtMs) / BIRTH_MS;
-    if (birth < 0) birth = 0;
-    return m > birth ? m : birth;
+    if (dParent <= e0) return 0;
+    let t = (dist - e0) / (dParent - e0);
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    return t * t * (3 - 2 * t);
   }
 
   /** Rendered radius (m) of leaf `e` at unit dir (dx,dy,dz): lerp(full surface, morph-target
@@ -668,57 +846,52 @@ export class QuadtreeManager {
       geometry.setAttribute('morphTarget', new BufferAttribute(m.morphTargets, 3));
       geometry.setAttribute('morphTargetNormal', new BufferAttribute(m.morphTargetNormals, 3));
       geometry.setIndex(new BufferAttribute(m.indices, 1));
-      const mat = this.material.clone();
-      if (this.opts.debugColor) {
-        const c = (mat as unknown as { color: Color }).color;
-        if (this.opts.debugColor === 'lod') c.setHSL((e.node.path.length * 0.13) % 1, 0.75, 0.5);
-        else if (this.opts.debugColor === 'morph') c.setHSL(0.33, 0.85, 0.5); // green=full (tick recolors by distance)
-        else c.copy(e.needsSkirt ? new Color(1, 0.15, 0.15) : new Color(0.16, 0.16, 0.2));
-      }
-      // CDLOD geomorph (per-vertex, in-shader): the vertex lerps full detail → the
-      // one-octave-coarser parent surface as a smooth function of CAMERA DISTANCE, reaching
-      // the parent exactly at this leaf's split distance (dParent). So detail fades in
-      // continuously across the whole view as you approach — no per-leaf time wave — and the
-      // edge stays matched to a coarser neighbour (which renders ITS full detail there). The
-      // band uses the SAME projected-size constants as selectCut (lodBoundRadius · kDist).
+      // Per-leaf CDLOD level (lodR, parentR) as a constant-per-leaf vertex attribute. The ONE shared
+      // material's morph graph (terrainMaterial.ts) reads `aLevel` to build this leaf's split/merge
+      // distances — so every leaf renders with the same material (no per-leaf clone / node-graph
+      // rebuild). lodBoundRadius matches selectCut's metric, so the per-vertex distance-morph band
+      // aligns with the cut's split distance exactly. dChild=2·lodR·kDist, dParent=2·parentR·kDist.
       const depth = e.node.path.length;
       const lodR = lodBoundRadius(depth, this.radius);
       const parentR = depth > 0 ? lodBoundRadius(depth - 1, this.radius) : lodR * 2;
-      const uLevel = uniform(new Vector2(lodR, parentR)); // .x = child bound, .y = parent bound
-      const dChild = uLevel.x.mul(2).mul(this.kDistUniform);
-      const dParent = uLevel.y.mul(2).mul(this.kDistUniform);
-      const e0 = mix(dChild, dParent, MORPH_START_FRAC);
-      const dist = positionWorld.distance(cameraPosition); // render space → small floats
-      const mFactor = smoothstep(e0, dParent, dist); // 0 near (full) → 1 far (parent)
-      // Birth-ease FLOOR: start at 1 (= the parent surface this leaf replaces → its appearance is
-      // invisible) and decay to the distance-morph over BIRTH_MS, so a refinement that streamed in
-      // LATE (camera already past its morph-start) fades up from the parent instead of snapping in
-      // already-detailed. uBirth is per-leaf (set once here); uNow is one global clock uniform.
-      const uBirth = uniform(this.clockMs);
-      const birthEase = this.uNowUniform.sub(uBirth).div(BIRTH_MS).oneMinus().clamp(0, 1);
-      const mFinal = mFactor.max(birthEase);
-      (mat as unknown as NodeMaterialLike).positionNode = mix(
-        positionLocal,
-        attribute('morphTarget', 'vec3'),
-        mFinal,
-      );
-      // Morph the NORMAL by the SAME factor — the other half of the geomorph. Without this,
-      // a leaf whose GEOMETRY has morphed smooth toward its parent still SHADES with the
-      // fine analytic normals, so the high-frequency detail stays lit across the morph zone
-      // and stops abruptly at the LOD boundary (the "highly textured square"). Blending to
-      // the parent-surface normal (morphTargetNormal) keeps shading in lockstep with the
-      // morphed surface → the boundary becomes a smooth gradient. Re-normalize after the mix.
-      (mat as unknown as NodeMaterialLike).normalNode = mix(
-        attribute('normal', 'vec3'),
-        attribute('morphTargetNormal', 'vec3'),
-        mFinal,
-      ).normalize();
-      // Bias the finer leaf toward the camera so it wins the depth test over a coarser
-      // ancestor still retained for the brief moment until purge (surfaces match there, so
-      // no morph divergence to fight — unlike the old 350 ms time morph).
-      mat.polygonOffset = true;
-      mat.polygonOffsetFactor = -1;
-      mat.polygonOffsetUnits = -1;
+      const vc = m.positions.length / 3;
+      geometry.setAttribute('aLodR', new BufferAttribute(new Float32Array(vc).fill(lodR), 1));
+      geometry.setAttribute('aParentR', new BufferAttribute(new Float32Array(vc).fill(parentR), 1));
+      // Per-leaf go-live clock (ms) for the birth-ease floor: a leaf born late fades up from the
+      // parent over BIRTH_MS instead of snapping in already-detailed (the bornM=0 pop). That ease is
+      // RIGHT for refinement & cold loads (a leaf appearing over a COARSER ancestor or the backdrop), but
+      // WRONG for a MERGE target — a leaf going live to replace FINER live descendants on zoom-out. The
+      // children it replaces are already morphing UP to THIS leaf's surface (their morph→1 == our surface,
+      // bit-identical via the parent-grid morph), so if the merge target also floored mFinal at 1 (= OUR
+      // parent, one level coarser) the swap would jump coarser then re-sharpen — exactly the "detail pops
+      // back in" on departure. So a merge target backdates its birth clock past BIRTH_MS: birthFloor is 0
+      // from frame one, it shows at its true distance morph (≈0 = our own surface) and seamlessly continues
+      // the children at morph 1. Detect it: any live STRICT descendant of this leaf on its face.
+      let mergeTarget = false;
+      for (const o of this.entries.values()) {
+        if (o.status !== 'live' || o.node.face !== e.node.face) continue;
+        if (o.node.path.length > depth && isPathPrefix(e.node.path, o.node.path)) {
+          mergeTarget = true;
+          break;
+        }
+      }
+      const birthClock = mergeTarget ? this.clockMs - BIRTH_MS : this.clockMs;
+      geometry.setAttribute('aBirthMs', new BufferAttribute(new Float32Array(vc).fill(birthClock), 1));
+      // Render with the shared material. Debug-tint modes (?lodcolor/?skirtcolor/?morphcolor) clone
+      // it and null its colorNode so a flat per-leaf colour shows (diagnostic + rare → clone cost is
+      // fine, and the cloned graph still carries the morph nodes so the geomorph is unaffected).
+      let mat = this.sharedMat;
+      let ownMat: Material | null = null;
+      if (this.opts.debugColor) {
+        const clone = this.sharedMat.clone();
+        (clone as unknown as { colorNode: unknown }).colorNode = null;
+        const c = (clone as unknown as { color: Color }).color;
+        if (this.opts.debugColor === 'lod') c.setHSL((depth * 0.13) % 1, 0.75, 0.5);
+        else if (this.opts.debugColor === 'morph') c.setHSL(0.33, 0.85, 0.5); // green=full (tick recolors by distance)
+        else c.copy(e.needsSkirt ? new Color(1, 0.15, 0.15) : new Color(0.16, 0.16, 0.2));
+        mat = clone;
+        ownMat = clone;
+      }
       const mesh = new Mesh(geometry, mat);
       mesh.position.set(
         m.origin[0] - this.renderOrigin[0],
@@ -738,8 +911,22 @@ export class QuadtreeManager {
             break;
           }
         }
-        if (covered) this.refineThisCut++;
-        else {
+        if (covered) {
+          this.refineThisCut++;
+          // [NMS step] swap-delta: only a REFINEMENT (live ancestor present) actually "swaps" a parent
+          // for a child at morph=1; measure that discontinuity. Gated to ?lodaudit (the [NMS step] line).
+          // It runs on the MAIN thread, so cap it: ≤8 leaves/window × perAxis 2 (4 samples) — enough for a
+          // representative max/avg without becoming the hitch it measures during a zoom-in refine burst
+          // (was up to 40 leaves × 16 samples per recut). Diagnostic only — no gameplay effect.
+          if (this.opts.debugAudit && depth > 0 && this.swapN < 8) {
+            const sd = swapDelta({ face: e.node.face, path: e.node.path, lod: depth }, this.recipe, this.radius, 2);
+            if (sd.dPosMax > this.swapDPosMax) this.swapDPosMax = sd.dPosMax;
+            if (sd.dNrmMaxDeg > this.swapDNrmMax) this.swapDNrmMax = sd.dNrmMaxDeg;
+            this.swapDPosSum += sd.dPosAvg;
+            this.swapDNrmSum += sd.dNrmAvgDeg;
+            this.swapN++;
+          }
+        } else {
           this.freshThisCut++;
           freshThisFrame++;
           if (depth < freshDepthMin) freshDepthMin = depth;
@@ -751,12 +938,12 @@ export class QuadtreeManager {
         if (lat > this.reqLatMax) this.reqLatMax = lat;
       }
       e.mesh = mesh;
-      e.mat = mat;
+      e.mat = ownMat; // only a per-leaf debug clone is owned; the shared material is never disposed per-leaf
       e.center = m.origin;
       e.ready = null;
       e.status = 'live';
       e.morph = 0;
-      e.liveAtMs = this.clockMs; // for ?lodmorphdebug age
+      e.liveAtMs = birthClock; // birth-ease clock (backdated for merge targets) — keeps centerMorph/?lodaudit honest
       if (dbg) {
         // "Born morph": the DISTANCE morph this leaf has the instant it goes live (before
         // birth-ease). ≈1 ⇒ born at the parent surface and will resolve gradually as the
@@ -766,18 +953,27 @@ export class QuadtreeManager {
         this.bornMSum += bm;
         this.bornMN++;
         if (bm < this.bornMMin) this.bornMMin = bm;
+        // [NMS step] B: born-morph distribution. Mass piling into the <.3 bucket ⇒ leaves arriving deep
+        // inside their morph band (prefetch too short) → they appear part-detailed = a step.
+        this.bornHist[bm >= 0.9 ? 0 : bm >= 0.7 ? 1 : bm >= 0.3 ? 2 : 3]++;
+        // [NMS step] C: per-depth go-live cadence. A whole depth arriving as one batch (big newByDepth[d]
+        // within one recut window, per the cut[Δt=…] interval) reads as a discrete "generation".
+        this.newByDepth[depth] = (this.newByDepth[depth] ?? 0) + 1;
       }
       if (this.opts.debugAudit && !this.wiringLogged) {
-        // One-time sanity: confirm the geomorph SHADING (Part 6) is actually wired on this build —
-        // geometry carries morphTargetNormal AND the material overrides both position & normal nodes.
+        // One-time sanity: confirm the geomorph is wired on this build — geometry carries the
+        // morph attributes (incl. the per-leaf aLevel + morphTargetNormal) AND the shared material
+        // overrides both position & normal nodes.
         this.wiringLogged = true;
-        const ml = mat as unknown as NodeMaterialLike;
+        const sm = this.sharedMat as unknown as { positionNode: unknown; normalNode: unknown };
         console.log(
           `[NMS audit] wiring: morphTargetNormal=${!!geometry.getAttribute('morphTargetNormal')} ` +
-            `positionNode=${!!ml.positionNode} normalNode=${!!ml.normalNode}`,
+            `aLodR=${!!geometry.getAttribute('aLodR')} ` +
+            `positionNode=${!!sm.positionNode} normalNode=${!!sm.normalNode}`,
         );
       }
       this.uploadedThisCut++;
+      this.churnAccum++; // ?perf: a mesh was created+uploaded this frame
       this.scene.add(mesh);
       n++;
     }
@@ -863,48 +1059,6 @@ export class QuadtreeManager {
       : this.morphSummary;
   }
 
-  /**
-   * Max LOD-level difference across any shared edge of the WANTED cut (?lodmorphdebug).
-   * For each wanted leaf, step a quarter-cell past each of its 4 edge midpoints and find
-   * the wanted leaf covering that direction; the largest |depthΔ| is the worst step. 0/1
-   * = balanced; >1 means CDLOD needs a balanceCut to avoid a visible boundary. Debug-only
-   * (O(leaves²) containment scan, run only on a cut while the flag is on).
-   */
-  private maxNeighborDelta(): number {
-    let maxD = 0;
-    for (const key of this.wanted) {
-      const e = this.entries.get(key)!;
-      const r = uvRectFromPath(e.node.path);
-      const um = (r.u0 + r.u1) / 2, vm = (r.v0 + r.v1) / 2;
-      const hw = (r.u1 - r.u0) * 0.25, hh = (r.v1 - r.v0) * 0.25;
-      const depth = e.node.path.length;
-      const probes: [number, number][] = [
-        [r.u1 + hw, vm], [r.u0 - hw, vm], [um, r.v1 + hh], [um, r.v0 - hh],
-      ];
-      for (const [pu, pv] of probes) {
-        const d = faceDirection(e.node.face, pu, pv);
-        const nd = this.depthUnderWanted(d[0], d[1], d[2]);
-        if (nd >= 0) { const diff = Math.abs(depth - nd); if (diff > maxD) maxD = diff; }
-      }
-    }
-    return maxD;
-  }
-
-  /** Depth of the wanted leaf covering a world direction (the cut tiles the sphere), or -1. */
-  private depthUnderWanted(wx: number, wy: number, wz: number): number {
-    const { face, u, v } = this.faceUVOf(wx, wy, wz);
-    let best = -1;
-    for (const key of this.wanted) {
-      const e = this.entries.get(key)!;
-      if (e.node.face !== face) continue;
-      const r = uvRectFromPath(e.node.path);
-      if (u < r.u0 || u > r.u1 || v < r.v0 || v > r.v1) continue;
-      const d = e.node.path.length;
-      if (d > best) best = d;
-    }
-    return best;
-  }
-
   stats(): StreamStats {
     let live = 0, pending = 0, inflight = 0;
     for (const e of this.entries.values()) {
@@ -915,6 +1069,24 @@ export class QuadtreeManager {
     return { live, pending, inflight, ready: this.readyQueue.length, msPerLeaf: this.avgMs };
   }
 
+  /** True while the detail front still has levels to climb toward the screen-space target (the clamp is
+   *  holding the cut shallower than the target somewhere). The render loop recuts every ~RECUT_MAX_MS
+   *  while this holds — even with the camera stationary — so a hard-zoom-then-stop keeps refining to full
+   *  detail one level per generation, then settles (returns false) and the forced recuts stop. */
+  isRefining(): boolean {
+    return this.frontierActive;
+  }
+
+  /** ?perf: meshes created+disposed per second since the last call (resets the accumulator). High =
+   *  the cut is thrashing (live count swinging) → GPU-buffer + geometry alloc/dispose churn = lag. */
+  churnPerSec(): number {
+    const dtS = (this.clockMs - this.churnClockMs) / 1000;
+    const rate = dtS > 0 ? this.churnAccum / dtS : 0;
+    this.churnAccum = 0;
+    this.churnClockMs = this.clockMs;
+    return Math.round(rate);
+  }
+
   dispose(): void {
     for (const w of this.workers) w.terminate();
     for (const e of this.entries.values()) {
@@ -922,8 +1094,9 @@ export class QuadtreeManager {
         this.scene.remove(e.mesh);
         e.mesh.geometry.dispose();
       }
-      e.mat?.dispose();
+      e.mat?.dispose(); // only per-leaf debug clones; the shared material is disposed once below
     }
+    this.sharedMat.dispose();
     this.entries.clear();
   }
 

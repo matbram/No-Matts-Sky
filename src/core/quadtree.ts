@@ -12,7 +12,7 @@
 // the render-side manager.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { faceDirection } from './cubesphere.ts';
+import { faceDirection, wrapFaceUV } from './cubesphere.ts';
 import { uvRectFromPath } from './chunk.ts';
 
 /** A quadtree node: a cube face + a path of quadrants (lod = path.length). */
@@ -92,6 +92,12 @@ export function isPathPrefix(a: number[], b: number[]): boolean {
  *   • the overlapping ancestor is live → the merge is ready;
  *   • all overlapping descendants live → the split is ready.
  * Otherwise keep x rendered so no hole (black flash) appears mid-transition.
+ *
+ * The "all descendants live" rule (a FULL one-level cohort, not just one child) is what makes a split
+ * pop-free — but it only fires correctly when the wanted cut refines x by exactly ONE level (its 4 direct
+ * children). The reachable-frontier clamp (`clampCutToReachableFrontier`) guarantees that: it never lets
+ * the cut jump x straight to grandchildren, so the overlapping wanted leaves here are always x's own
+ * children and this predicate holds x until the complete replacement cohort is on screen.
  */
 export function retainedShouldRemove(
   x: QuadNode,
@@ -117,6 +123,133 @@ export function retainedShouldRemove(
   }
   if (!anyOverlap) return true; // x's region is gone from the cut → remove
   return descCount > 0 && descCount === descLive; // all split children live → remove
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// clampCutToReachableFrontier — gated incremental refinement (the zoom pop-in fix)
+//
+// The CDLOD vertex morph blends a leaf to its ONE-level-coarser baked parent surface; it can only hide
+// a single-level transition, and only once the finer leaf is LIVE before the camera crosses its morph
+// band. A plain screen-space cut, on a hard zoom, jumps a region from the resident base (depth 2) STRAIGHT
+// to depth 6+ in one recut and requests all those deep leaves at once. The intermediate levels (3,4,5) are
+// never built, so the deep leaf arrives over a 4-levels-coarser surface — an unmorphable jump = the pop.
+//
+// This clamp paces refinement to streaming: it caps the REQUESTED depth of every target leaf so the detail
+// front descends ONE level per generation. A region may go no deeper than (its deepest live covering leaf's
+// depth) + 1. Once that cohort goes live, the next recut admits the next level, and so on — so every
+// transition shown is exactly one level (morphable) and its morph parent is always already live. Refinement
+// self-paces (it cannot request level N+1 until N is live), so it never outruns the worker pool.
+//
+// Direction matters and is asymmetric:
+//   • REFINING (target deeper than live coverage): gate to liveAncestorDepth + 1.
+//   • MERGING UP / steady (the region ALREADY holds live detail at ≥ target depth): allow the target depth
+//     directly — coarsening is made smooth by the morph + deferred removal (retainedShouldRemove), and
+//     gating it would collapse detail to the base and re-climb (a zoom-out flicker). Near the camera the
+//     coarse ancestors have been purged, so a deepest-live-ANCESTOR walk alone would miss this and wrongly
+//     force the base; we detect "region contains live detail" via a live descendant-or-equal instead.
+//   • COLD (no live coverage at all — first load, a region not yet streamed): request the base depth first,
+//     so the always-resident base lands as the morph parent before anything finer (no fresh-over-backdrop).
+//
+// PURE + deterministic (a function of the target cut, the live leaf set, and baseDepth — no Three.js, no
+// render state passed by value). selectCut/balanceCut are untouched, so their golden tests are unaffected;
+// this gets its own test. Applied render-side AFTER balanceCut (truncation only coarsens, so it cannot
+// create a >1-level neighbour step that balance didn't already tolerate).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Packed-integer region key — the recut-cost fix.
+//
+// The hot recut Sets (balanceCut's cut + per-probe coveringDepth lookups, clamp's liveLeaf/coverRegion)
+// were keyed by freshly-concatenated STRINGS — at 400+ leaves that's ~10^5 string allocations per recut
+// (the ~9–12 ms zoom spike). Pack a region (face 0–5, quadrant path of digits 0–3, depth = path length)
+// into a single JS-safe integer instead, so the same Sets become Set<number> with zero per-probe
+// allocation. The regions/cuts produced are byte-identical — only the internal key representation changes
+// — so the quadtree golden tests must pass UNCHANGED.
+//
+// Layout (disjoint fields, key < 2^37 ≪ 2^53 so it's an exact JS integer):
+//   pathBits  bits 0..29  — digits packed 2 bits each, MSB-first (pathBits < 4^depth ≤ 4^15 = 2^30)
+//   depth     bits 30..33 — 0..15 (distinguishes [] vs [0] vs [0,0]; injective ⇒ no collisions)
+//   face      bits 34..36 — 0..5
+// MUST hold maxDepth ≤ MAX_REGION_DEPTH; assertMaxDepth guards it so a future MAX_DEPTH bump fails loudly
+// instead of silently overflowing pathBits into the depth field.
+const REGION_DEPTH_UNIT = 2 ** 30; // depth field multiplier (pathBits occupies the low 30 bits)
+const REGION_FACE_UNIT = 2 ** 34; // face field multiplier (depth occupies bits 30..33)
+const MAX_REGION_DEPTH = 15;
+
+function assertRegionDepth(maxDepth: number): void {
+  if (maxDepth > MAX_REGION_DEPTH) {
+    throw new Error(
+      `quadtree region key supports depth ≤ ${MAX_REGION_DEPTH}; got maxDepth=${maxDepth}. ` +
+        `Widen the packed-key fields (and re-check the 2^53 budget) before raising MAX_DEPTH.`,
+    );
+  }
+}
+
+/** Packed integer key for region (face + the first `len` quadrant digits of `path`). Prefixes nest by
+ *  encoding depth explicitly. Equal keys ⟺ same face, same depth, same digits (injective). */
+function packRegion(face: number, path: number[], len: number): number {
+  let pathBits = 0;
+  for (let i = 0; i < len; i++) pathBits = pathBits * 4 + path[i]!;
+  return face * REGION_FACE_UNIT + len * REGION_DEPTH_UNIT + pathBits;
+}
+
+/** Recover the quadrant digits from a packed key's pathBits + depth (inverse of packRegion's packing). */
+function unpackPath(pathBits: number, depth: number): number[] {
+  const path: number[] = new Array(depth);
+  for (let i = depth - 1; i >= 0; i--) {
+    path[i] = pathBits % 4;
+    pathBits = Math.floor(pathBits / 4);
+  }
+  return path;
+}
+
+/**
+ * Clamp a desired cut so no leaf is requested more than one level deeper than the region's current live
+ * coverage — the core of pop-free, streaming-paced LOD (see block comment above). `live` is the set of
+ * currently-rendered (live) leaves. `baseDepth` is the always-resident coarse floor a cold region loads
+ * first. Returns the clamped, de-duplicated cut (many deep targets collapse onto a shared shallow ancestor).
+ */
+export function clampCutToReachableFrontier(
+  targets: ReadonlyArray<QuadNode>,
+  live: ReadonlyArray<QuadNode>,
+  baseDepth: number,
+): QuadNode[] {
+  // Two lookups built once from the live set (packed-integer keys — see packRegion):
+  //  • liveLeaf: exact key of each live LEAF — to find the deepest live ANCESTOR of a target.
+  //  • coverRegion: key of EVERY prefix (incl. self) of every live leaf — so coverRegion.has(P)
+  //    ⟺ some live leaf has P as a prefix ⟺ region P contains live detail at depth ≥ |P| (a descendant).
+  const liveLeaf = new Set<number>();
+  const coverRegion = new Set<number>();
+  for (const lf of live) {
+    liveLeaf.add(packRegion(lf.face, lf.path, lf.path.length));
+    for (let d = 0; d <= lf.path.length; d++) coverRegion.add(packRegion(lf.face, lf.path, d));
+  }
+
+  const out: QuadNode[] = [];
+  const seen = new Set<number>();
+  for (const t of targets) {
+    const D = t.path.length;
+    let allowed: number;
+    if (coverRegion.has(packRegion(t.face, t.path, D))) {
+      // Region already holds live detail at ≥ D (target itself live, or a live descendant → merge-up/steady).
+      allowed = D;
+    } else {
+      // No detail at this depth yet → refining or cold. Find the deepest live LEAF ancestor (d < D).
+      let La = -1;
+      for (let d = D - 1; d >= baseDepth; d--) {
+        if (liveLeaf.has(packRegion(t.face, t.path, d))) {
+          La = d;
+          break;
+        }
+      }
+      allowed = La >= 0 ? La + 1 : Math.min(D, baseDepth); // refine one level past live, else load the base
+    }
+    const key = packRegion(t.face, t.path, allowed);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ face: t.face, path: t.path.slice(0, allowed) });
+  }
+  return out;
 }
 
 // Conservative bounding-radius factor per quadtree depth. A depth-d face quadrant
@@ -302,11 +435,11 @@ export function selectCut(camera: CameraView, opts: SelectOpts): QuadNode[] {
   // would show through = the very pop we're removing. Backfill any base cell not covered by
   // a leaf with a resident leaf, so the whole sphere is guaranteed tiled at baseDepth.
   if (baseDepth > 0) {
-    const covered = new Set<string>();
-    for (const lf of leaves) covered.add(`${lf.face}/${lf.path.slice(0, baseDepth).join(',')}`);
+    const covered = new Set<number>();
+    for (const lf of leaves) covered.add(packRegion(lf.face, lf.path, baseDepth)); // prefix of length baseDepth
     for (let f = 0; f < 6; f++) {
       for (const path of baseCellPaths(baseDepth)) {
-        if (!covered.has(`${f}/${path.join(',')}`)) leaves.push({ face: f, path: path.slice() });
+        if (!covered.has(packRegion(f, path, baseDepth))) leaves.push({ face: f, path: path.slice() });
       }
     }
   }
@@ -323,4 +456,141 @@ function baseCellPaths(depth: number): number[][] {
     paths = next;
   }
   return paths;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// balanceCut — 2:1 restricted quadtree (CDLOD's morph hides only a ONE-level step)
+//
+// CDLOD blends a leaf toward its PARENT at the shared edge, so a coarse leaf meeting a leaf exactly
+// one level finer is seamless. A step of 2+ levels (e.g. a depth-2 base leaf abutting a depth-6 leaf
+// with no 3/4/5 between — ?lodaudit logged exactly this: maxNbrΔ=4, lod={2,4,5,6}) is UNMORPHABLE
+// and shows as a hard seam / pop. balanceCut force-splits any leaf whose edge-neighbour is >1 level
+// finer, to a fixpoint, so every cross-LOD edge is exactly one level. Pure + deterministic (a
+// function of the leaf set + maxDepth); applied AFTER selectCut, so selectCut's golden test is
+// unchanged and this gets its own test.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Depth of the cut leaf covering face-(u,v): walk the quadtree from the root, return the depth of
+ * the first prefix present in `cut` (the cut is a partition, so that's THE covering leaf). -1 if
+ * uncovered (e.g. a culled far side when baseDepth=0) → caller treats as "no constraint". The
+ * quadrant test matches uvRectFromPath exactly (bit0 = upper-u half, bit1 = upper-v half). Builds the
+ * packed-integer region key incrementally as it descends — no per-level string/array allocation. This
+ * is the hot probe (12× per leaf per balance pass), so its allocation-freeness is the recut-cost win.
+ */
+function coveringDepth(cut: Set<number>, face: number, u: number, v: number, maxDepth: number): number {
+  const faceBits = face * REGION_FACE_UNIT;
+  if (cut.has(faceBits)) return 0; // root: depth 0, pathBits 0
+  let u0 = -1, u1 = 1, v0 = -1, v1 = 1;
+  let pathBits = 0;
+  for (let d = 1; d <= maxDepth; d++) {
+    const um = (u0 + u1) / 2, vm = (v0 + v1) / 2;
+    let q = 0;
+    if (u >= um) { q |= 1; u0 = um; } else u1 = um;
+    if (v >= vm) { q |= 2; v0 = vm; } else v1 = vm;
+    pathBits = pathBits * 4 + q;
+    if (cut.has(faceBits + d * REGION_DEPTH_UNIT + pathBits)) return d; // == packRegion(face, path, d)
+  }
+  return -1;
+}
+
+/**
+ * Max depth of any edge-neighbour of leaf (face,path) in the cut. Probes just past each of the 4
+ * edges at several along-edge fractions (so a finer neighbour anywhere along the edge is caught);
+ * `wrapFaceUV` maps an overshoot across a cube edge onto the neighbour face (the same watertight
+ * convention the mesher's apron uses), so cross-face neighbours resolve correctly. Catching a
+ * 2-levels-finer neighbour is enough — deeper ones are caught after the first split, by the fixpoint.
+ */
+function maxNeighborDepth(cut: Set<number>, face: number, path: number[], maxDepth: number): number {
+  const r = uvRectFromPath(path);
+  const eps = (r.u1 - r.u0) * 0.02; // just past the edge; r is square so u/v spans match
+  const fr = [0.25, 0.5, 0.75];
+  let maxNd = -1;
+  const probe = (pu: number, pv: number): void => {
+    const w = wrapFaceUV(face, pu, pv);
+    const nd = coveringDepth(cut, w.face, w.u, w.v, maxDepth);
+    if (nd > maxNd) maxNd = nd;
+  };
+  for (const t of fr) {
+    const v = r.v0 + (r.v1 - r.v0) * t;
+    probe(r.u1 + eps, v); // +u edge
+    probe(r.u0 - eps, v); // −u edge
+    const u = r.u0 + (r.u1 - r.u0) * t;
+    probe(u, r.v1 + eps); // +v edge
+    probe(u, r.v0 - eps); // −v edge
+  }
+  return maxNd;
+}
+
+/**
+ * Force-split any leaf whose edge-neighbour is >1 level finer, to a fixpoint, so the returned cut is
+ * 2:1 balanced (`maxNbrΔ ≤ 1`) and every cross-LOD step is morphable (no seam pop). Balancing only
+ * adds the intermediate transition leaves (it never coarsens), so the count grows modestly when the
+ * input cut is already near-balanced. `maxLeaves` is a defensive growth cap.
+ */
+export function balanceCut(leaves: QuadNode[], maxDepth: number, maxLeaves = 8192): QuadNode[] {
+  assertRegionDepth(maxDepth);
+  const cut = new Set<number>();
+  for (const lf of leaves) cut.add(packRegion(lf.face, lf.path, lf.path.length));
+  // Each pass only splits (deepens) leaves, bounded by maxDepth, so it converges in ≤ maxDepth
+  // passes; the guard is a touch higher for safety.
+  for (let pass = 0; pass <= maxDepth + 2; pass++) {
+    let changed = false;
+    for (const k of [...cut]) {
+      if (!cut.has(k)) continue; // already split away earlier this pass
+      const face = Math.floor(k / REGION_FACE_UNIT);
+      const depth = Math.floor((k - face * REGION_FACE_UNIT) / REGION_DEPTH_UNIT);
+      if (depth >= maxDepth) continue;
+      const pathBits = k - face * REGION_FACE_UNIT - depth * REGION_DEPTH_UNIT;
+      const path = unpackPath(pathBits, depth);
+      if (maxNeighborDepth(cut, face, path, maxDepth) - depth >= 2) {
+        cut.delete(k);
+        for (let q = 0; q < 4; q++) cut.add(packRegion(face, [...path, q], depth + 1));
+        changed = true;
+        if (cut.size >= maxLeaves) break;
+      }
+    }
+    if (!changed || cut.size >= maxLeaves) break;
+  }
+  const out: QuadNode[] = [];
+  for (const k of cut) {
+    const face = Math.floor(k / REGION_FACE_UNIT);
+    const depth = Math.floor((k - face * REGION_FACE_UNIT) / REGION_DEPTH_UNIT);
+    const pathBits = k - face * REGION_FACE_UNIT - depth * REGION_DEPTH_UNIT;
+    out.push({ face, path: unpackPath(pathBits, depth) });
+  }
+  return out;
+}
+
+/**
+ * Largest LOD-level difference across any leaf's EDGE (the true 2:1-balance metric; ≤1 means every
+ * cross-LOD step is morphable). Uses the SAME fine edge probe as balanceCut — a small offset just
+ * past the edge so it samples the IMMEDIATE neighbour. (The old render-side metric probed a quarter
+ * of a cell past the edge, which for a coarse leaf overshoots several fine cells deep and reports a
+ * NON-adjacent leaf's depth — that false inflation is what logged "maxNbrΔ=4" on cuts that were in
+ * fact balanced, and its O(leaves²) scan was a recut spike.) Cheap: O(leaves · maxDepth). Debug-only.
+ */
+export function maxNeighborDelta(leaves: QuadNode[], maxDepth: number): number {
+  assertRegionDepth(maxDepth);
+  const cut = new Set<number>();
+  for (const lf of leaves) cut.add(packRegion(lf.face, lf.path, lf.path.length));
+  let maxD = 0;
+  for (const lf of leaves) {
+    const r = uvRectFromPath(lf.path);
+    const eps = (r.u1 - r.u0) * 0.02;
+    const d = lf.path.length;
+    for (const t of [0.25, 0.5, 0.75]) {
+      const v = r.v0 + (r.v1 - r.v0) * t;
+      const u = r.u0 + (r.u1 - r.u0) * t;
+      const probes: ReadonlyArray<readonly [number, number]> = [
+        [r.u1 + eps, v], [r.u0 - eps, v], [u, r.v1 + eps], [u, r.v0 - eps],
+      ];
+      for (const [pu, pv] of probes) {
+        const w = wrapFaceUV(lf.face, pu, pv);
+        const nd = coveringDepth(cut, w.face, w.u, w.v, maxDepth);
+        if (nd >= 0) { const diff = Math.abs(nd - d); if (diff > maxD) maxD = diff; }
+      }
+    }
+  }
+  return maxD;
 }
