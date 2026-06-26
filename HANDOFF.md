@@ -58,7 +58,8 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
 | `/src/render` (Three.js) | role |
 |---|---|
 | `scene.ts` | render shell: WebGPU renderer, camera presets, floating-origin recentre, recut logic, prefetch/telemetry, all `?`-flags |
-| `quadtreeManager.ts` | streaming state machine (pending→inflight→ready→live→purged), worker pool, per-frame GPU upload budget, TSL `positionNode`/`normalNode` morph wiring, all `[NMS …]` logging |
+| `terrainMaterial.ts` | the **ONE shared** terrain material (`createTerrainMaterial`): per-vertex CDLOD geomorph (position+normal, from `aLodR`/`aParentR` attrs + shared `kDist`) **and** distance-faded surface detail (slope bands + procedural `mx_noise` detail, faded by `1−mFinal`); `detailPhaseOf` = renderOrigin mod L (double) for swim-free, precise detail coords |
+| `quadtreeManager.ts` | streaming state machine (pending→inflight→ready→live→purged), worker pool, per-frame GPU upload budget; fills per-leaf `aLodR`/`aParentR` + renders every leaf with the shared material (clones only for debug tints), feeds the material's origin/detail-phase uniforms, all `[NMS …]` logging |
 | `player.ts` | character controller: walk/fly, ground collision via analytic `surfaceAt` probe |
 | `stats.ts` | FPS / frame-time overlay (turns red < 55 fps) |
 | `main.ts` | entry: WebGPU gate + animation loop |
@@ -77,6 +78,19 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
   neighbour (killed the bright "square"); **time-based recut floor** so slow descents track continuously;
   **`?lodaudit`** diagnostics. ✅ (commits `8116239`, `2e0205a`, `b9d5dec`, `257c825`, `b7d8e02`, `d231820`,
   `e13cdf7`, `2227974`.)
+- **Gradual visual-transition pass ("plane approaching Earth" — this session, branch
+  `claude/lod-visual-transition-audit-jeq2fz`):** (1) tuned for continuity — `MORPH_START_FRAC` 0.55→0.30
+  (wider fade band), `RECUT_MAX_MS` 400→200 (leaves trickle, not batch), `PREFETCH_S` 0.7→1.0 (born at the
+  parent surface); (2) **one shared material** (`terrainMaterial.ts`) — the per-leaf morph node-graph clone is
+  gone (per-leaf data → `aLodR`/`aParentR` attrs), and the **time-based birth-ease was removed** (it faded a
+  recut's batch in as a synchronized "wave"; the per-vertex distance morph alone carries leaves in now); (3)
+  **distance-faded surface detail** — slope material bands + procedural `mx_noise` detail (coarse ~40 m, fine
+  ~6 m) whose strength fades in with proximity on the morph's own schedule (`1−mFinal`) + per-octave
+  anti-alias gates, so the surface gets *clearer* as you descend (no more flat grey) with no discrete
+  arrival/shimmer. Detail coord = render-space pos + `renderOrigin mod 100 km` (double) → swim-free + precise.
+  Render-only (no core/golden change); typecheck + 76 tests + build green; headless WebGL2 renders the planet
+  seamlessly. ⚠️ **Visual tuning of detail strengths/colours/ranges is a real-GPU pass (headless is too dark to
+  judge);** confirm the §7 visual gates on WebGPU. (commits `b05989d`, `86077dc`, `17c554d`.)
 
 Measured-good on WebGPU (build the user ran): orbit→surface descent holds 60 fps / ~16.8 ms,
 `cov=96/96 holes=0` throughout, `fresh=0 refine=N` (sharpen-in-place, no pop), `bornM≈1.0`, largest cut ~466
@@ -122,8 +136,11 @@ leaves (no spike), no rAF `[Violation]` stalls.
 - `[NMS pop] fresh=N depth=a..b` — fires when leaves appear over the backdrop (the residual pop).
 
 Key tunables in `scene.ts`: `BASE_DEPTH=2`, `PREFETCH_MAX_FRAC=0.35`, `PREFETCH_FLOOR_M=3000`,
-`PREFETCH_CEIL_M=200000`, `PREFETCH_S=0.7`, `RECUT_MAX_MS=400`, `RECUT_MIN_MOVE_M=1`, `MORPH_START_FRAC=0.55`,
-`maxDepth=15` (~9.5 m cells). Debug flags (URL query): `?lodaudit ?lodmorphdebug ?morphcolor ?wire ?lodcolor
+`PREFETCH_CEIL_M=200000`, `PREFETCH_S=1.0`, `RECUT_MAX_MS=200`, `RECUT_MIN_MOVE_M=1`, `maxDepth=15`
+(~9.5 m cells). In `terrainMaterial.ts`: `MORPH_START_FRAC=0.30` (the CDLOD fade-band start, shared by the
+TSL graph + the CPU mirror), and the detail dials — `DETAIL_PHASE_MOD_M=100000`, `DETAIL_A_SCALE_M=40`
+(coarse mottle, fades ~50 km→1 km), `DETAIL_B_SCALE_M=6` (fine grain, fades ~6 km→200 m), plus the `SAND`/
+`ROCK` band palette. Debug flags (URL query): `?lodaudit ?lodmorphdebug ?morphcolor ?wire ?lodcolor
 ?skirt ?skirtcolor ?noback ?dark ?webgl ?clipdebug ?nolog ?revz`.
 
 ## 8. Guardrails (from CLAUDE.md §4 — do not break)
