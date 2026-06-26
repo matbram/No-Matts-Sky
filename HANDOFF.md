@@ -173,6 +173,29 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
   `?perf` looking at / zooming the planet → `worstDt < 16.67 ms`, buttery (tune sharpness with `?dpr`); and
   zoom OUT → detail blurs out gradually with no "pops back in."
 
+- **Locked-60 follow-up — noise-skip branch + clamp-before-balance (same session/branch):** the user's
+  real-GPU `?perf` after the above showed a flat **~17.5 ms** (big improvement, but ~57 fps not locked 60)
+  with two residual costs the log pinpointed. (a) **Idle fill-rate floor ~17.5 ms** at orbit: the one
+  remaining `mx_noise_vec3` was still evaluated for every fragment even where its weight `wA=0`. The TSL
+  `Fn`/`If` branch is now **unblocked** (an Explore of the r0.184 source confirmed `If` only needs an active
+  `Fn` build stack — the earlier top-level failure was just the missing stack; the compiler emits a real WGSL
+  `if`, so the noise is genuinely skipped). Gated the noise behind
+  `Fn(() => { const out = vec3(0).toVar(); If(wA.greaterThan(0.001), () => out.assign(mx_noise_vec3(…))); return out; })()`
+  — coherent per-leaf, negligible divergence; at orbit `wA≈0` everywhere → noise skipped → idle floor drops
+  below budget. Render-only, goldens unchanged. (commit `9439567`.) (b) **Recut CPU spike ~10–17 ms during
+  zoom** (the 19–20 ms frames while moving, at 360–427 leaves): the cut was
+  `balanceCut(clamp(balanceCut(selectCut())))` — the FIRST `balanceCut` built the full ideal 2→11 staircase
+  that the clamp then truncated to live+1, so we paid to balance discarded depth every recut. **Reordered to
+  clamp-before-balance**: `clamped = clampCutToReachableFrontier(selectCut(), live); cut = balanceCut(clamped)`
+  — the clamp truncates each region to live+1 independent of balance, and the single final `balanceCut`
+  guarantees 2:1 balance regardless, so clamping first loses no balance and the single balance runs on a
+  shallow (≤ live+1) cut. Pure core funcs unchanged (only the call order in `update()`); all 91 goldens
+  unchanged. Headless `?lodaudit`: `maxNbrΔ=1` on every cut line, the front still climbs one level per
+  generation `{2,3}→…→{2,3,4,5,6,7,8}`, `fresh=0` — gated incremental refinement fully preserved, just
+  cheaper. (commit `8c3ef1f`.) ⚠️ **Real-GPU confirm:** `?perf` at orbit → `worstDt < 16.67 ms` (idle floor,
+  C1); zooming in/out → no more 19–20 ms `recut` spikes (C2). If still short of locked 60, the deferred
+  levers are numeric region keys in `balanceCut`/`coveringDepth` and moving cut-selection to a worker.
+
 Measured-good on WebGPU (build the user ran): orbit→surface descent holds 60 fps / ~16.8 ms,
 `cov=96/96 holes=0` throughout, `fresh=0 refine=N` (sharpen-in-place, no pop), `bornM≈1.0`, largest cut ~466
 leaves (no spike), no rAF `[Violation]` stalls.
