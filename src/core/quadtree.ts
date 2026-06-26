@@ -430,3 +430,35 @@ export function balanceCut(leaves: QuadNode[], maxDepth: number, maxLeaves = 819
   }
   return out;
 }
+
+/**
+ * Largest LOD-level difference across any leaf's EDGE (the true 2:1-balance metric; ≤1 means every
+ * cross-LOD step is morphable). Uses the SAME fine edge probe as balanceCut — a small offset just
+ * past the edge so it samples the IMMEDIATE neighbour. (The old render-side metric probed a quarter
+ * of a cell past the edge, which for a coarse leaf overshoots several fine cells deep and reports a
+ * NON-adjacent leaf's depth — that false inflation is what logged "maxNbrΔ=4" on cuts that were in
+ * fact balanced, and its O(leaves²) scan was a recut spike.) Cheap: O(leaves · maxDepth). Debug-only.
+ */
+export function maxNeighborDelta(leaves: QuadNode[], maxDepth: number): number {
+  const cut = new Set<string>();
+  for (const lf of leaves) cut.add(balanceKey(lf.face, lf.path));
+  let maxD = 0;
+  for (const lf of leaves) {
+    const r = uvRectFromPath(lf.path);
+    const eps = (r.u1 - r.u0) * 0.02;
+    const d = lf.path.length;
+    for (const t of [0.25, 0.5, 0.75]) {
+      const v = r.v0 + (r.v1 - r.v0) * t;
+      const u = r.u0 + (r.u1 - r.u0) * t;
+      const probes: ReadonlyArray<readonly [number, number]> = [
+        [r.u1 + eps, v], [r.u0 - eps, v], [u, r.v1 + eps], [u, r.v0 - eps],
+      ];
+      for (const [pu, pv] of probes) {
+        const w = wrapFaceUV(lf.face, pu, pv);
+        const nd = coveringDepth(cut, w.face, w.u, w.v, maxDepth);
+        if (nd >= 0) { const diff = Math.abs(nd - d); if (diff > maxD) maxD = diff; }
+      }
+    }
+  }
+  return maxD;
+}

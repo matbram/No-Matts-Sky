@@ -18,6 +18,7 @@ import { Scene, Mesh, BufferGeometry, BufferAttribute, Color, Vector3, type Mate
 import {
   selectCut,
   balanceCut,
+  maxNeighborDelta as maxNeighborDeltaCore,
   nodeBounds,
   lodBoundRadius,
   retainedShouldRemove,
@@ -28,7 +29,7 @@ import {
 import { chunkKey, uvRectFromPath, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
 import { faceDirection, wrapFaceUV, CUBE_FACES } from '../core/cubesphere.ts';
 import { lodOctaves, terrainAt, type TerrainRecipe } from '../core/density.ts';
-import { createTerrainMaterial, detailPhaseOf, MORPH_START_FRAC } from './terrainMaterial.ts';
+import { createTerrainMaterial, detailPhaseOf, MORPH_START_FRAC, BIRTH_MS } from './terrainMaterial.ts';
 
 type Status = 'pending' | 'inflight' | 'ready' | 'live';
 interface Entry {
@@ -166,6 +167,7 @@ export class QuadtreeManager {
   // base for the surface-detail coordinate). See terrainMaterial.ts.
   private readonly matRenderOrigin: { value: Vector3 };
   private readonly matDetailPhase: { value: Vector3 };
+  private readonly matNow: { value: number }; // manager clock → per-leaf birth-ease floor
   private kDist = 0;
   private camX = 0;
   private camY = 0;
@@ -195,6 +197,7 @@ export class QuadtreeManager {
     this.kDistUniform = handle.kDist;
     this.matRenderOrigin = handle.renderOrigin;
     this.matDetailPhase = handle.detailPhase;
+    this.matNow = handle.now;
     const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
     const n = Math.max(1, Math.min(opts.workers ?? 6, cores - 1));
     for (let i = 0; i < n; i++) {
@@ -344,9 +347,9 @@ export class QuadtreeManager {
     // state on their actual machine.
     let summary = `leaves=${wanted.size} skirted=${skirted} interior=${wanted.size - skirted} skirtsOpt=${!!this.opts.skirts} lod=${JSON.stringify(lodHist)}`;
     if (this.opts.debugLodMorph) {
-      // Cut imbalance: max LOD-level difference across any shared edge. >1 means a deep
-      // block abuts a much coarser leaf (a hard step) → CDLOD will need balanceCut.
-      this.maxNbrDelta = this.maxNeighborDelta();
+      // Cut imbalance: max LOD-level difference across any leaf EDGE (accurate fine-probe metric in
+      // core). With balanceCut applied above this should read ≤1; >1 would mean an unmorphable step.
+      this.maxNbrDelta = maxNeighborDeltaCore(cut, this.opts.maxDepth);
       summary += ` maxNbrΔ=${this.maxNbrDelta}`;
     }
     if (summary !== this.lastStatLog) {
@@ -410,6 +413,7 @@ export class QuadtreeManager {
   tick(dtMs: number): void {
     if (this.entries.size === 0) return;
     this.clockMs += dtMs; // resume-safe clock (no Date.now) + the ?lodmorphdebug age base
+    this.matNow.value = this.clockMs; // drive the per-leaf birth-ease floor (always, even when debug off)
     const dbg = !!this.opts.debugLodMorph;
     const tintMorph = this.opts.debugColor === 'morph';
     if (!dbg && !tintMorph) return; // CDLOD morph is in-shader; nothing else to do
@@ -503,13 +507,16 @@ export class QuadtreeManager {
     let t = (dist - e0) / (dParent - e0);
     if (t < 0) t = 0;
     else if (t > 1) t = 1;
-    return t * t * (3 - 2 * t); // smoothstep
+    return t * t * (3 - 2 * t); // smoothstep — PURE distance morph (no birth; this is the bornM signal)
   }
 
-  /** CDLOD morph at a leaf's CENTRE (0=full near .. 1=parent far) — CPU mirror of the drawn morph.
-   *  Now the distance morph alone (the time-based birth-ease was removed). ?lodmorphdebug/?morphcolor. */
+  /** CDLOD morph at a leaf's CENTRE (0=full near .. 1=parent far) — CPU mirror of the DRAWN morph
+   *  (distance morph, floored by the short birth-ease while the leaf is fresh). ?lodmorphdebug/?morphcolor. */
   private centerMorph(e: Entry): number {
-    return this.distanceMorph(e);
+    const m = this.distanceMorph(e);
+    let birth = 1 - (this.clockMs - e.liveAtMs) / BIRTH_MS;
+    if (birth < 0) birth = 0;
+    return m > birth ? m : birth;
   }
 
   /** ?lodmorphdebug: the sub-camera leaf's depth, morph, distance, and fade band (km). */
@@ -689,6 +696,9 @@ export class QuadtreeManager {
       const vc = m.positions.length / 3;
       geometry.setAttribute('aLodR', new BufferAttribute(new Float32Array(vc).fill(lodR), 1));
       geometry.setAttribute('aParentR', new BufferAttribute(new Float32Array(vc).fill(parentR), 1));
+      // Per-leaf go-live clock (ms) for the birth-ease floor: a leaf born late fades up from the
+      // parent over BIRTH_MS instead of snapping in already-detailed (the bornM=0 pop).
+      geometry.setAttribute('aBirthMs', new BufferAttribute(new Float32Array(vc).fill(this.clockMs), 1));
       // Render with the shared material. Debug-tint modes (?lodcolor/?skirtcolor/?morphcolor) clone
       // it and null its colorNode so a flat per-leaf colour shows (diagnostic + rare → clone cost is
       // fine, and the cloned graph still carries the morph nodes so the geomorph is unaffected).
@@ -849,48 +859,6 @@ export class QuadtreeManager {
     return this.opts.debugAudit && this.auditSummary
       ? `${this.morphSummary}\n${this.auditSummary}`
       : this.morphSummary;
-  }
-
-  /**
-   * Max LOD-level difference across any shared edge of the WANTED cut (?lodmorphdebug).
-   * For each wanted leaf, step a quarter-cell past each of its 4 edge midpoints and find
-   * the wanted leaf covering that direction; the largest |depthΔ| is the worst step. 0/1
-   * = balanced; >1 means CDLOD needs a balanceCut to avoid a visible boundary. Debug-only
-   * (O(leaves²) containment scan, run only on a cut while the flag is on).
-   */
-  private maxNeighborDelta(): number {
-    let maxD = 0;
-    for (const key of this.wanted) {
-      const e = this.entries.get(key)!;
-      const r = uvRectFromPath(e.node.path);
-      const um = (r.u0 + r.u1) / 2, vm = (r.v0 + r.v1) / 2;
-      const hw = (r.u1 - r.u0) * 0.25, hh = (r.v1 - r.v0) * 0.25;
-      const depth = e.node.path.length;
-      const probes: [number, number][] = [
-        [r.u1 + hw, vm], [r.u0 - hw, vm], [um, r.v1 + hh], [um, r.v0 - hh],
-      ];
-      for (const [pu, pv] of probes) {
-        const d = faceDirection(e.node.face, pu, pv);
-        const nd = this.depthUnderWanted(d[0], d[1], d[2]);
-        if (nd >= 0) { const diff = Math.abs(depth - nd); if (diff > maxD) maxD = diff; }
-      }
-    }
-    return maxD;
-  }
-
-  /** Depth of the wanted leaf covering a world direction (the cut tiles the sphere), or -1. */
-  private depthUnderWanted(wx: number, wy: number, wz: number): number {
-    const { face, u, v } = this.faceUVOf(wx, wy, wz);
-    let best = -1;
-    for (const key of this.wanted) {
-      const e = this.entries.get(key)!;
-      if (e.node.face !== face) continue;
-      const r = uvRectFromPath(e.node.path);
-      if (u < r.u0 || u > r.u1 || v < r.v0 || v > r.v1) continue;
-      const d = e.node.path.length;
-      if (d > best) best = d;
-    }
-    return best;
   }
 
   stats(): StreamStats {

@@ -6,6 +6,7 @@ import {
   lodBoundRadius,
   selectCut,
   balanceCut,
+  maxNeighborDelta,
   isPathPrefix,
   retainedShouldRemove,
   type CameraView,
@@ -265,6 +266,12 @@ describe('balanceCut (2:1 restricted quadtree)', () => {
     const balanced = balanceCut(cut, MAXD);
     expect(maxNbrDelta(balanced)).toBeLessThanOrEqual(1); // output is 2:1 balanced → morphable
     expect(balanced.length).toBeGreaterThan(cut.length); // only ADDED transition leaves
+
+    // The exported metric agrees with the independent dense checker: >1 before, ≤1 after. (This is
+    // the ACCURATE fine-probe metric that replaced the render-side quarter-cell overshoot probe,
+    // which falsely reported maxNbrΔ up to 4 on cuts that were in fact already edge-balanced.)
+    expect(maxNeighborDelta(cut, MAXD)).toBeGreaterThan(1);
+    expect(maxNeighborDelta(balanced, MAXD)).toBeLessThanOrEqual(1);
   });
 
   it('is deterministic and never coarsens (every input region stays at ≥ its depth)', () => {

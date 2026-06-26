@@ -52,6 +52,17 @@ import {
  */
 export const MORPH_START_FRAC = 0.3;
 
+/**
+ * Birth-ease (ms): a newly-live leaf's morph is floored at 1 (the parent surface it replaces) and
+ * decays to its true distance-morph over this long, so a leaf that streamed in LATE — past its morph
+ * band, so its distance-morph is already ≈0 = full detail (?lodaudit logged bornM=0 during motion) —
+ * fades up from the parent instead of SNAPPING in (a pop). Kept SHORT (vs the old 300 ms) so even a
+ * batch arriving together resolves quickly rather than as a slow synchronized "wave"; with balanceCut
+ * + tamed prefetch keeping most leaves born at the parent (bornM≈1), this floor rarely does visible
+ * work — it only catches the late stragglers. Mirrored on the CPU in the manager's centerMorph.
+ */
+export const BIRTH_MS = 150;
+
 // Detail-phase modulus (m): renderOrigin is reduced mod this (in double) so the detail coordinate
 // stays small enough for float precision (~1 cm at L=100 km) while tracking the absolute world
 // position continuously through every floating-origin recenter. Large enough that a wrap (the only
@@ -94,6 +105,8 @@ export interface TerrainMaterialHandle {
   /** renderOrigin reduced modulo DETAIL_PHASE_MOD_M IN DOUBLE (set with renderOrigin). Added back to
    *  render-space positionWorld to give a stable, float-precise absolute coordinate for the detail. */
   detailPhase: { value: Vector3 };
+  /** Manager clock (ms). Set `.value` every frame; drives the per-leaf birth-ease floor. */
+  now: { value: number };
 }
 
 /**
@@ -105,6 +118,7 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
   const kDist = uniform(0);
   const uRenderOrigin = uniform(new Vector3());
   const uDetailPhase = uniform(new Vector3());
+  const uNow = uniform(0); // manager clock (ms), for the per-leaf birth-ease floor
   const mat = new MeshStandardNodeMaterial({
     color: 0x9a8c7a,
     roughness: 0.92,
@@ -122,7 +136,13 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
   const dParent = parentR.mul(2).mul(kDist);
   const e0 = mix(dChild, dParent, MORPH_START_FRAC);
   const dist = positionWorld.distance(cameraPosition); // render space → small floats (origin cancels)
-  const mFinal = smoothstep(e0, dParent, dist); // 0 near (full detail) → 1 far (parent surface)
+  const mFactor = smoothstep(e0, dParent, dist); // 0 near (full detail) → 1 far (parent surface)
+  // Birth-ease FLOOR: a freshly-live leaf starts at 1 (= the parent it replaced → invisible) and
+  // decays to its distance-morph over BIRTH_MS, so a late arrival (mFactor already ≈0) fades up
+  // instead of snapping. aBirthMs is constant per leaf (set at upload = the go-live clock).
+  const birthMs = float(attribute<'float'>('aBirthMs', 'float'));
+  const birthFloor = uNow.sub(birthMs).div(BIRTH_MS).clamp(0, 1).oneMinus();
+  const mFinal = mFactor.max(birthFloor); // 0 near (full) → 1 far (parent), floored while fresh
 
   // Geometry: lerp full detail → the one-octave-coarser parent surface by distance.
   mat.positionNode = mix(positionLocal, attribute('morphTarget', 'vec3'), mFinal);
@@ -178,6 +198,7 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     kDist: kDist as unknown as { value: number },
     renderOrigin: uRenderOrigin as unknown as { value: Vector3 },
     detailPhase: uDetailPhase as unknown as { value: Vector3 },
+    now: uNow as unknown as { value: number },
   };
 }
 
