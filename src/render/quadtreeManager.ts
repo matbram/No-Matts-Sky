@@ -861,8 +861,25 @@ export class QuadtreeManager {
       geometry.setAttribute('aLodR', new BufferAttribute(new Float32Array(vc).fill(lodR), 1));
       geometry.setAttribute('aParentR', new BufferAttribute(new Float32Array(vc).fill(parentR), 1));
       // Per-leaf go-live clock (ms) for the birth-ease floor: a leaf born late fades up from the
-      // parent over BIRTH_MS instead of snapping in already-detailed (the bornM=0 pop).
-      geometry.setAttribute('aBirthMs', new BufferAttribute(new Float32Array(vc).fill(this.clockMs), 1));
+      // parent over BIRTH_MS instead of snapping in already-detailed (the bornM=0 pop). That ease is
+      // RIGHT for refinement & cold loads (a leaf appearing over a COARSER ancestor or the backdrop), but
+      // WRONG for a MERGE target — a leaf going live to replace FINER live descendants on zoom-out. The
+      // children it replaces are already morphing UP to THIS leaf's surface (their morph→1 == our surface,
+      // bit-identical via the parent-grid morph), so if the merge target also floored mFinal at 1 (= OUR
+      // parent, one level coarser) the swap would jump coarser then re-sharpen — exactly the "detail pops
+      // back in" on departure. So a merge target backdates its birth clock past BIRTH_MS: birthFloor is 0
+      // from frame one, it shows at its true distance morph (≈0 = our own surface) and seamlessly continues
+      // the children at morph 1. Detect it: any live STRICT descendant of this leaf on its face.
+      let mergeTarget = false;
+      for (const o of this.entries.values()) {
+        if (o.status !== 'live' || o.node.face !== e.node.face) continue;
+        if (o.node.path.length > depth && isPathPrefix(e.node.path, o.node.path)) {
+          mergeTarget = true;
+          break;
+        }
+      }
+      const birthClock = mergeTarget ? this.clockMs - BIRTH_MS : this.clockMs;
+      geometry.setAttribute('aBirthMs', new BufferAttribute(new Float32Array(vc).fill(birthClock), 1));
       // Render with the shared material. Debug-tint modes (?lodcolor/?skirtcolor/?morphcolor) clone
       // it and null its colorNode so a flat per-leaf colour shows (diagnostic + rare → clone cost is
       // fine, and the cloned graph still carries the morph nodes so the geomorph is unaffected).
@@ -929,7 +946,7 @@ export class QuadtreeManager {
       e.ready = null;
       e.status = 'live';
       e.morph = 0;
-      e.liveAtMs = this.clockMs; // for ?lodmorphdebug age
+      e.liveAtMs = birthClock; // birth-ease clock (backdated for merge targets) — keeps centerMorph/?lodaudit honest
       if (dbg) {
         // "Born morph": the DISTANCE morph this leaf has the instant it goes live (before
         // birth-ease). ≈1 ⇒ born at the parent surface and will resolve gradually as the
