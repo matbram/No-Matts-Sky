@@ -2,6 +2,10 @@
 
 > Read **`CLAUDE.md`** first (it's the build spec + guardrails). This file is the companion: **what is
 > actually built right now, how to run/verify it, and what's next.** Last updated at commit `2227974`.
+>
+> **Authority:** the law lives in **`/design`** (7 docs). When they disagree, the order is
+> **Constitution → master plan → slice spec** (`CLAUDE.md` §1). This handoff describes the *build state*;
+> it never overrides those docs.
 
 ## 1. TL;DR — where we are
 A real-scale (Earth = 6,371 km) procedurally-generated planet you can fly from orbit to the surface and
@@ -43,7 +47,7 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
 | `hash.ts` | PCG `pcg/pcg2d/pcg3d/pcg4d`, bit-identical determinism |
 | `seedchain.ts` | coordinate → seed chain (MASTER_SEED + per-purpose salts) |
 | `noise.ts` | gradient noise + fBm with **analytic derivatives** → `[value, dx, dy, dz]` |
-| `density.ts` | `D(p) = R − |p| + fBm(dir·scale)`; returns D **and** ∇D in one pass |
+| `density.ts` | `D(p) = R − |p| + fBm(dir·scale)·height` (+1 domain-warp); returns D **and** ∇D in one pass |
 | `cubesphere.ts` | cube→sphere projection (6 faces), `wrapFaceUV` cross-face neighbour math |
 | `quadtree.ts` | **`selectCut`** — LOD decision: split-by-projected-px, horizon/cone cull, `baseDepth` pin, prefetch, backfill |
 | `surfacenets.ts` | Surface Nets mesher: 1 vertex/sign-changed cell, analytic normals, **morph targets + morph normals** |
@@ -66,7 +70,7 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
 - **Step 2** quadtree LOD across the whole sphere, apron kills same-LOD cracks. ✅
 - **Step 3** async streaming: worker pool + per-frame GPU upload budget + generate-ahead. ✅
 - **Step 4** floating origin + walking: character controller, ground collision, creative fly. ✅
-- **LOD-quality pass (Parts 5–7):** CDLOD per-vertex **distance morph** (replaces time morph); **birth-ease**
+- **LOD-quality pass (post-Step-4 polish — NOT slice Steps 5/6):** CDLOD per-vertex **distance morph** (replaces time morph); **birth-ease**
   so late-arriving leaves fade up from the parent; **speed-aware + altitude-relative prefetch** so detail
   leads its band at any height; **always-resident coarse base** (depth-2, 96 leaves, never culled) so nothing
   pops over the backdrop; **analytic morph-target normals** so a fully-morphed leaf shades like its coarse
@@ -77,6 +81,12 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
 Measured-good on WebGPU (build the user ran): orbit→surface descent holds 60 fps / ~16.8 ms,
 `cov=96/96 holes=0` throughout, `fresh=0 refine=N` (sharpen-in-place, no pop), `bornM≈1.0`, largest cut ~466
 leaves (no spike), no rAF `[Violation]` stalls.
+
+> **Gate honesty:** the determinism half (golden tests, typecheck, build) is verified headless in CI; the
+> *visual* gates — seamless sphere, no-jitter walk far from spawn, locked 60 fps, reload→identical planet —
+> are confirmed in a real **WebGPU** browser, not headless (software WebGPU/WebGL2 only checks correctness).
+> The ✅ above means "implemented + confirmed in this build's session"; re-confirm the visual gates on a real
+> GPU after any change.
 
 ## 6. What's NEXT (pick up here)
 1. **GATED: residual cross-LOD seam.** A one-level (`maxNbrΔ=1`) T-junction where the always-resident depth-2
