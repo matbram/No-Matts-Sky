@@ -4,6 +4,8 @@ You are starting work on a real-scale, real-physics, procedurally-generated spac
 
 There is a complete design corpus (seven documents, ~2,300 lines) in this repo's `/design` folder. **You do not need to build everything in it now — and you must not try.** The corpus describes the whole universe; your job right now is the **vertical slice** (one planet, real scale, fly from orbit to surface, walk, real rotation + orbit, 60fps). Everything else is a later ring grown onto that proven core.
 
+> **For the *current* state of the build (what's already done, how to run/verify it, and what's next), read [`HANDOFF.md`](HANDOFF.md) first.** This file (CLAUDE.md) is the forward-looking spec; HANDOFF.md is the backward-looking status companion.
+
 ---
 
 ## 0. The prime directive: ruthless scope
