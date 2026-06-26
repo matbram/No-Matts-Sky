@@ -69,7 +69,7 @@ interface MeshResult {
  * matches the coarser neighbour exactly at the shared LOD boundary. Used identically in the
  * TSL shader (per-vertex) and `centerMorph` (CPU, for ?lodmorphdebug/?morphcolor).
  */
-const MORPH_START_FRAC = 0.55;
+const MORPH_START_FRAC = 0.3;
 
 /**
  * Birth-ease (ms): a newly-live leaf starts at morph=1 (= the parent surface it replaces, so its

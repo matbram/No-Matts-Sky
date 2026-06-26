@@ -76,7 +76,7 @@ const RECUT_ROT_COS = Math.cos((20 * Math.PI) / 180);
 // keeps the leaf set tracking continuously (the per-vertex morph is already per-frame; this
 // just keeps the SET fresh). Gated on actual movement so a still camera never recuts (and the
 // headless settle check still settles). Fast motion crosses recutDist first → this is a no-op.
-const RECUT_MAX_MS = 400;
+const RECUT_MAX_MS = 200;
 const RECUT_MIN_MOVE_M = 1;
 // Walk-mode split threshold (px). Wider than fly's 300 so the now-graded LOD (which
 // places ~150 leaves per level) stays within budget at the finer MAX_DEPTH: the
@@ -107,7 +107,7 @@ const LOOKAHEAD_FRAMES = 30;
 // resolve gradually from the parent surface instead of snapping in late. ~0 at rest /
 // lateral motion (no wasted leaves); kicks in on a plunge. [T] dial up if pops persist,
 // down if a fast descent dips below 60 fps.
-const PREFETCH_S = 0.7;
+const PREFETCH_S = 1.0;
 // ALTITUDE-RELATIVE prefetch cap (replaces the old flat 6 km). The CDLOD morph band scales
 // with altitude (thousands of km at orbit, hundreds near the surface), so a flat-metres lead
 // was negligible at altitude — ?lodaudit showed pf/band≈0.001, i.e. detail still arrived in
