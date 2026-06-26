@@ -150,6 +150,29 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
   2 low-contrast / 3 soft) — render-only slope-band presets in `terrainMaterial.ts` to A/B the speckle look
   live and pick one. 91 tests + typecheck + build green.
 
+- **Descent choppiness = GPU fill-rate, + zoom-out pop (same session/branch):** the close-up choppiness was
+  *not* meshing throughput — a `?perf` vet (new `gpu/other` frame-budget breakdown) proved it: `gpu/other`
+  was the whole frame, and **`?dpr=1`, `?nolog`, and `?nodetail` were each independently buttery** → the
+  shader sits at the fragment/fill-rate cliff and any one reduction clears it. Two zero-quality-cost levers:
+  (a) **terrain shader dropped to ONE procedural detail octave** — the two `mx_noise_vec3` evals (each per
+  on-screen terrain pixel) were the bottleneck; the fine ~6 m octave only shows within ~6 km of the surface,
+  so removing it halves the noise cost everywhere for a band rarely on screen (the ~40 m mottle stays). A
+  per-fragment branch to skip noise at range needs TSL `Fn`/`If` (no build stack at material-construction
+  time → "Cannot read properties of null (reading 'If')") — deferred; the unconditional halving is the robust
+  win. (b) **default pixel-ratio cap 2→1.5** (`scene.ts`) — ~44% fewer fragments on a Retina display, sharp;
+  1× displays unaffected; `?dpr=2` restores full sharpness, `?dpr=1` max perf. (commit `c04d178`.)
+  Separately, **zoom-OUT was popping detail back in** instead of blurring out: a coarsening **merge target** (a
+  leaf going live to replace finer live descendants) was getting the **birth-ease floor** like a fresh leaf,
+  so it appeared at morph=1 — its own parent surface, one level *coarser* than the children it replaces —
+  then re-sharpened over `BIRTH_MS`. Fix: detect a merge target (any live STRICT descendant on its face) and
+  **backdate its birth clock past `BIRTH_MS`** so it shows at its true distance morph (≈0 = its own surface),
+  seamlessly continuing the children at morph 1; refinement/cold loads keep the ease (the zoom-IN onset). The
+  cut-level *symmetric coarsen gate* I'd planned was **dropped** — `clampCutToReachableFrontier` explicitly
+  rejects gating coarsening (collapses to base + re-climbs = a worse flicker); coarsening stays morph +
+  deferred-removal smoothed. Render-only, goldens unchanged. (commit `8f2b07c`.) ⚠️ **Real-GPU confirm:**
+  `?perf` looking at / zooming the planet → `worstDt < 16.67 ms`, buttery (tune sharpness with `?dpr`); and
+  zoom OUT → detail blurs out gradually with no "pops back in."
+
 Measured-good on WebGPU (build the user ran): orbit→surface descent holds 60 fps / ~16.8 ms,
 `cov=96/96 holes=0` throughout, `fresh=0 refine=N` (sharpen-in-place, no pop), `bornM≈1.0`, largest cut ~466
 leaves (no spike), no rAF `[Violation]` stalls.
