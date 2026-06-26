@@ -99,6 +99,10 @@ export interface ManagerOpts {
   debugColor?: 'lod' | 'skirt' | 'morph'; // debug tint: LOD level / skirted leaves / morph progress
   debugLodMorph?: boolean; // ?lodmorphdebug: throttled [NMS morph] console line + balance metric
   debugAudit?: boolean; // ?lodaudit: SUPERSET — also [NMS audit] (seam/coverage/cadence/health)
+  debugSeamScan?: boolean; // ?seamscan: run the EXPENSIVE O(live²) seam + O(96·live) coverage scans.
+  // OFF by default even under ?lodaudit: at ~500 live leaves they cost ~250k fBm evals and were
+  // themselves a periodic main-thread spike (the diagnostics adding the lag they were measuring).
+  debugChurn?: boolean; // ?perf: count meshes created/disposed per second (churnPerSec)
 }
 
 export interface StreamStats {
@@ -121,6 +125,10 @@ export class QuadtreeManager {
   private nextId = 1;
   private renderOrigin: [number, number, number] = [0, 0, 0];
   private avgMs = 0;
+  // ?perf churn: meshes created+disposed since the last churnPerSec() read, and the manager-clock
+  // timestamp of that read — high churn (live count thrashing) is the streaming cost behind the lag.
+  private churnAccum = 0;
+  private churnClockMs = 0;
   private lastStatLog = ''; // throttles the per-cut diagnostic log
   // ?lodmorphdebug state: a resume-safe clock (accumulated dtMs, no Date.now), upload
   // counter per cut, log throttle, last-measured cut imbalance, and the HUD summary.
@@ -375,6 +383,7 @@ export class QuadtreeManager {
       if (e.status !== 'live' || this.wanted.has(key)) continue;
       if (retainedShouldRemove(e.node, wantedArr)) {
         if (e.mesh) {
+          this.churnAccum++; // ?perf: a mesh was disposed this frame
           this.scene.remove(e.mesh);
           e.mesh.geometry.dispose();
         }
@@ -443,8 +452,15 @@ export class QuadtreeManager {
         // show-through; histM = morph distribution; cut[Δt,+N] = recut wave cadence; stream/busy =
         // worker health; pf/band = whether prefetch is meaningful at this altitude.
         if (this.opts.debugAudit) {
-          const seam = this.seamScan();
-          const cov = this.coverageScan();
+          // The seam + coverage scans are O(live²)/O(96·live) — at ~500 live leaves a periodic
+          // main-thread spike. Run them ONLY under ?seamscan so plain ?lodaudit/?perf measures
+          // without the diagnostics perturbing the timing; otherwise show placeholder "off".
+          const seam = this.opts.debugSeamScan
+            ? this.seamScan()
+            : { dEffMax: 0, dEffAvg: 0, gapMax: 0, worst: 'off' };
+          const cov = this.opts.debugSeamScan
+            ? this.coverageScan()
+            : { covered: 0, total: 0, holes: 0 };
           const s = this.stats();
           const busy = this.workers.length - this.idle.length;
           const band = this.nearLeafBandKm();
@@ -741,6 +757,7 @@ export class QuadtreeManager {
         );
       }
       this.uploadedThisCut++;
+      this.churnAccum++; // ?perf: a mesh was created+uploaded this frame
       this.scene.add(mesh);
       n++;
     }
@@ -876,6 +893,16 @@ export class QuadtreeManager {
       else if (e.status === 'inflight') inflight++;
     }
     return { live, pending, inflight, ready: this.readyQueue.length, msPerLeaf: this.avgMs };
+  }
+
+  /** ?perf: meshes created+disposed per second since the last call (resets the accumulator). High =
+   *  the cut is thrashing (live count swinging) → GPU-buffer + geometry alloc/dispose churn = lag. */
+  churnPerSec(): number {
+    const dtS = (this.clockMs - this.churnClockMs) / 1000;
+    const rate = dtS > 0 ? this.churnAccum / dtS : 0;
+    this.churnAccum = 0;
+    this.churnClockMs = this.clockMs;
+    return Math.round(rate);
   }
 
   dispose(): void {
