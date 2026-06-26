@@ -117,6 +117,9 @@ export interface ManagerOpts {
   // OFF by default even under ?lodaudit: at ~500 live leaves they cost ~250k fBm evals and were
   // themselves a periodic main-thread spike (the diagnostics adding the lag they were measuring).
   debugChurn?: boolean; // ?perf: count meshes created/disposed per second (churnPerSec)
+  receiveShadow?: boolean; // Step 5: terrain leaves receive the moon's cast shadow (set per mesh). ⚠ the
+  // shared material overrides positionNode (CDLOD morph) + is DoubleSide — confirm the WebGPU shadow-depth
+  // pass reproduces the morphed surface on a real GPU (analytic sun-occlusion is the fallback).
 }
 
 export interface StreamStats {
@@ -893,6 +896,7 @@ export class QuadtreeManager {
         ownMat = clone;
       }
       const mesh = new Mesh(geometry, mat);
+      if (this.opts.receiveShadow) mesh.receiveShadow = true; // Step 5: catch the moon's cast shadow
       mesh.position.set(
         m.origin[0] - this.renderOrigin[0],
         m.origin[1] - this.renderOrigin[1],

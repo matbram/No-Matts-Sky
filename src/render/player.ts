@@ -10,12 +10,16 @@
 // (core `surfaceAt`), so you stand on the true surface even before fine leaves
 // stream in — no physics engine, no tunneling (slice spec §6, Step 4).
 //
-// STEP 5 SEAM: the planet is static here. `spinAngle()` is identity (0); Step 5
-// makes it `(spinRate·t) mod 2π` (double→float) and inserts a body→world rotation
-// in the render shell. Everything below is spin-invariant (the spin axis passes
-// through the center, so radial up / gravity / collision are unchanged), so only
-// that one function and the shell's body→world step change. This file is DOM-free
-// and Three.js-only (no /core import except the pure `surfaceAt`).
+// STEP 5 (now live in the render shell): real spin/orbit is implemented in scene.ts —
+// it advances a game clock, computes the spin angle via `core/orbits.spinAngle`
+// (`(spinRate·t) mod 2π`, double→float at the GPU), and produces day/night by rotating
+// the SUN DIRECTION into the body frame (no body→world mesh rotation needed). Everything
+// here stays SPIN-INVARIANT (the spin axis passes through the center, so radial up /
+// gravity / collision are unchanged), and the render frame is kept planet-centered, so a
+// surface→orbit launch can't make the planet "rocket away". The local `spinAngle()` below
+// therefore stays identity — kept only as the seam for any FUTURE surface-fixed object that
+// must rotate with the planet. This file is DOM-free + Three.js-only (no /core import except
+// the pure `surfaceAt`).
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Vector3, Quaternion, Matrix4 } from 'three';
@@ -67,10 +71,13 @@ const FLY_BOOST = 4; // Shift multiplier in fly
 // quantify how far the surface moves per LOD level (the geomorph/streaming transient).
 const DEBUG_OCTAVES = [14, 12, 10, 4] as const;
 
-/** Spin angle of the planet at the current time. Step 4: identity. Step 5 seam. */
+/**
+ * Spin angle of the planet at the player's position. Identity (0) by design: the body-fixed
+ * player is spin-invariant, and Step 5's day/night is produced in the render shell (scene.ts)
+ * by rotating the sun direction — see `core/orbits.spinAngle`. Kept as the seam for a future
+ * surface-fixed object that must rotate with the planet (then it returns spinAngle(rate, t)).
+ */
 function spinAngle(): number {
-  // Step 5: return ((planet.spinRate * gameTimeSeconds) % (2*Math.PI)) computed in
-  // double, then cast to float at the GPU boundary (CLAUDE.md §4). Identity for now.
   return 0;
 }
 

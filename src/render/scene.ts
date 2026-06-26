@@ -23,13 +23,18 @@ import {
   HemisphereLight,
   Color,
   Vector3,
+  Quaternion,
   Raycaster,
   DoubleSide,
   ACESFilmicToneMapping,
 } from 'three';
-import { WebGPURenderer, MeshStandardNodeMaterial } from 'three/webgpu';
+import { WebGPURenderer, MeshStandardNodeMaterial, MeshBasicNodeMaterial } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { EARTH_RADIUS_M } from '../core/constants.ts';
+import {
+  EARTH_RADIUS_M, MOON_RADIUS_M, SUN_RADIUS_M,
+  EARTH_SIDEREAL_DAY_S, EARTH_AXIAL_TILT_RAD, TIME_COMPRESSION,
+} from '../core/constants.ts';
+import { sliceEarthOrbit, sliceMoonOrbit, orbitalPosition, spinAngle } from '../core/orbits.ts';
 import { buildCubeSphere } from '../core/cubesphere.ts';
 import { sliceTerrainRecipe, surfaceAt, lodOctaves } from '../core/density.ts';
 import { sliceFacts } from '../core/facts.ts';
@@ -174,6 +179,15 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   //   themselves added lag). Off by default now so ?perf/?lodaudit measure WITHOUT perturbing.
   const perf = params.has('perf');
   const seamScan = params.has('seamscan');
+  // Step 5 (real spin/orbit): ?timescale=N overrides the base game-time multiplier (how fast a
+  // day/orbit passes while testing); ?notime freezes the clock for A/B; ?noshadow disables the
+  // moon's cast shadow (so a shadow-path issue can't block the rest of Step 5).
+  const timeScale = (() => {
+    const v = parseFloat(params.get('timescale') ?? '');
+    return Number.isFinite(v) && v >= 0 ? v : TIME_COMPRESSION;
+  })();
+  const noTime = params.has('notime');
+  const noShadow = params.has('noshadow');
   const renderer = new WebGPURenderer({
     canvas,
     antialias: true,
@@ -223,6 +237,9 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     perf, // ?perf: per-frame cost breakdown + approach/prefetch/churn ([NMS perf])
     seamscan: seamScan, // ?seamscan: opt-in the O(live²) seam/coverage scans (off by default)
     dark: params.has('dark'),
+    timeScale, // Step 5: game-time multiplier (?timescale=N; TIME_COMPRESSION default)
+    noTime, // ?notime: freeze the spin/orbit clock
+    noShadow, // ?noshadow: disable the moon's cast shadow
   });
 
   const R = EARTH_RADIUS_M;
@@ -289,6 +306,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     debugAudit: lodAudit,
     debugSeamScan: seamScan, // the O(live²) seam + coverage scans only run when ?seamscan is set
     debugChurn: perf, // count meshes created/disposed per second for the [NMS perf] line
+    receiveShadow: !noShadow, // Step 5: terrain leaves receive the moon's cast shadow (real-GPU confirm)
   });
 
   // No-black backdrop: a single smooth sphere INSET below the deepest terrain
@@ -313,6 +331,98 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const backdrop = new Mesh(backdropGeo, backdropMaterial);
   backdrop.visible = !params.has('noback'); // debug: hide → do the lines become black gaps?
   scene.add(backdrop);
+
+  // ── Step 5: real spin + orbit (day/night, moving sun, moon, optional cast shadow) ──
+  // The RENDER frame stays PLANET-CENTERED (terrain/player body-fixed, planet at the origin, NEVER
+  // translated — so no AU-scale double reaches the GPU, and the planet can't "rocket away" on launch:
+  // the launch handoff is satisfied by construction). Day/night + the sun's seasonal drift come from the
+  // SUN DIRECTION only: heliocentric planet position → planet→sun direction in the inertial/ecliptic
+  // frame, rotated into the body frame by the INVERSE spin about the tilted axis. As the spin angle
+  // advances the sun sweeps the sky (real day/night, NOT a moved light); as the planet orbits over the
+  // year that direction drifts (the sun "moves over the orbit"). The Sun/Moon are rendered as proxies
+  // along their true body-frame directions (the real bodies are AU / 3.8e8 m away, beyond any far plane).
+  const earthEl = sliceEarthOrbit();
+  const moonEl = sliceMoonOrbit();
+  const EARTH_SPIN_RATE = (2 * Math.PI) / EARTH_SIDEREAL_DAY_S; // rad/s (sidereal)
+  // Spin axis in the inertial/ecliptic frame: the pole tilted by the obliquity (in the x–y plane).
+  const spinAxis = new Vector3(Math.sin(EARTH_AXIAL_TILT_RAD), Math.cos(EARTH_AXIAL_TILT_RAD), 0).normalize();
+  let gameTimeS = 0;
+  const SUN_PROXY_DIST = 5000; // render-space distance for the Sol billboard + light direction
+  const MOON_PROXY_DIST = 4000; // render-space distance for the Moon proxy (between sun light + terrain)
+  const _planetPos = new Float64Array(3);
+  const _moonPos = new Float64Array(3);
+  const _sunDirBody = new Vector3();
+  const _moonDirBody = new Vector3();
+  const _spinQ = new Quaternion();
+  const _skyV = new Vector3();
+
+  const skyGeo = (radius: number): BufferGeometry => {
+    const s = buildCubeSphere(8, radius);
+    const g = new BufferGeometry();
+    g.setAttribute('position', new BufferAttribute(s.positions, 3));
+    g.setAttribute('normal', new BufferAttribute(s.normals, 3));
+    g.setIndex(new BufferAttribute(s.indices, 1));
+    return g;
+  };
+  // Sol disc — unlit emissive billboard, drawn behind terrain (depthTest off + renderOrder −2) so it
+  // reads as a sky element and is occluded by the horizon; scaled per frame to the sun's real angular size.
+  const sunDiscGeo = skyGeo(1);
+  const sunDiscMat = new MeshBasicNodeMaterial({ color: 0xfff4e6 });
+  sunDiscMat.depthTest = false;
+  const sunDisc = new Mesh(sunDiscGeo, sunDiscMat);
+  sunDisc.renderOrder = -2;
+  sunDisc.frustumCulled = false;
+  scene.add(sunDisc);
+  // Moon — a lit sphere along the true Moon direction; castShadow so it can eclipse the terrain
+  // (the Step 5 "real cast shadow" gate). Gated by !noShadow.
+  const moonGeo = skyGeo(1);
+  const moonMat = new MeshStandardNodeMaterial({ color: 0x9a9a9a, roughness: 1, metalness: 0 });
+  const moon = new Mesh(moonGeo, moonMat);
+  moon.frustumCulled = false;
+  moon.castShadow = !noShadow;
+  scene.add(moon);
+
+  // Cast-shadow setup (?noshadow disables). ⚠ NEEDS REAL-GPU CONFIRM: the terrain material overrides
+  // positionNode (CDLOD morph) + is DoubleSide, so the shadow-depth pass may not match the rendered
+  // surface; the analytic sun-occlusion fallback is plan B. The proxy distances put the moon (4 km)
+  // between the sun light (5 km) and the terrain (origin), so an eclipse casts a real umbra near the player.
+  if (!noShadow) {
+    renderer.shadowMap.enabled = true;
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    const sc = sun.shadow.camera;
+    sc.near = 1;
+    sc.far = SUN_PROXY_DIST * 2;
+    sc.left = -8000;
+    sc.right = 8000;
+    sc.top = 8000;
+    sc.bottom = -8000;
+    sun.shadow.bias = -0.0005;
+  }
+
+  // Advance the clock + place the sun/moon each frame (driven from render()).
+  function updateSky(dtMs: number): void {
+    if (!noTime) gameTimeS += (dtMs / 1000) * timeScale;
+    const theta = spinAngle(EARTH_SPIN_RATE, gameTimeS);
+    _spinQ.setFromAxisAngle(spinAxis, -theta); // inertial → body (the planet spins under the sky)
+
+    // Sun: heliocentric planet position → planet→sun direction (Sol at the system origin).
+    orbitalPosition(earthEl, gameTimeS, _planetPos);
+    const sunDist = Math.hypot(_planetPos[0]!, _planetPos[1]!, _planetPos[2]!) || 1;
+    _skyV.set(-_planetPos[0]!, -_planetPos[1]!, -_planetPos[2]!);
+    if (_skyV.lengthSq() < 1e-12) _skyV.set(1, 0, 0);
+    _sunDirBody.copy(_skyV).normalize().applyQuaternion(_spinQ);
+    sun.position.copy(_sunDirBody).multiplyScalar(SUN_PROXY_DIST);
+    sunDisc.position.copy(sun.position);
+    sunDisc.scale.setScalar(Math.max(8, SUN_PROXY_DIST * (SUN_RADIUS_M / sunDist))); // real angular size
+
+    // Moon: geocentric position → direction in the body frame; proxy clamped into the frustum.
+    orbitalPosition(moonEl, gameTimeS, _moonPos);
+    const moonDist = Math.hypot(_moonPos[0]!, _moonPos[1]!, _moonPos[2]!) || 1;
+    _moonDirBody.set(_moonPos[0]!, _moonPos[1]!, _moonPos[2]!).normalize().applyQuaternion(_spinQ);
+    moon.position.copy(_moonDirBody).multiplyScalar(MOON_PROXY_DIST);
+    moon.scale.setScalar(Math.max(4, MOON_PROXY_DIST * (MOON_RADIUS_M / moonDist))); // real angular size
+  }
 
   // ── Camera presets (the gate's "static camera positions") ──────────────────
   const surf = SURFACE_DIR.clone().multiplyScalar(R);
@@ -585,6 +695,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       const dt = now - lastFrame;
       lastFrame = now;
 
+      updateSky(dt); // Step 5: advance the clock + place the sun/moon (day/night from real spin)
+
       if ((mode === 'walk' || mode === 'creative') && player) {
         // Drive the camera from the player's body-fixed position (walk = gravity+collision,
         // creative = free-fly); keep the floating origin near it so GPU floats stay tiny.
@@ -789,7 +901,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     streamInfo(): string {
       const s = manager.stats();
       const morph = lodMorphDebug ? `\n${manager.morphInfo()}` : ''; // ?lodmorphdebug HUD line (all modes)
-      const base = `leaves ${s.live}  queue ${s.pending + s.ready}  busy ${s.inflight}  ${s.msPerLeaf.toFixed(0)} ms/leaf${morph}`;
+      // Step 5 time readout: elapsed game-days, time-of-day from the spin angle (h), orbit fraction (%).
+      const days = gameTimeS / 86_400;
+      const dayH = (spinAngle(EARTH_SPIN_RATE, gameTimeS) / (2 * Math.PI)) * 24;
+      const yearPct = ((gameTimeS / earthEl.period) % 1) * 100;
+      const sky = `sky  t ${days.toFixed(2)}d  spin ${dayH.toFixed(1)}h  orbit ${yearPct.toFixed(1)}%${noTime ? ' (frozen)' : ''}`;
+      const base = `leaves ${s.live}  queue ${s.pending + s.ready}  busy ${s.inflight}  ${s.msPerLeaf.toFixed(0)} ms/leaf${morph}\n${sky}`;
       if (mode === 'walk' && player) {
         const dbg = clipDebug ? `  [${lastClip}]` : '';
         return `WALK  alt ${player.altitude().toFixed(1)} m  spd ${player.speed().toFixed(1)} m/s  (G: fly · click: look · 1/2/3: exit)${dbg}\n${base}`;
@@ -815,6 +932,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       controls.dispose();
       backdropGeo.dispose();
       backdropMaterial.dispose();
+      sunDiscGeo.dispose();
+      sunDiscMat.dispose();
+      moonGeo.dispose();
+      moonMat.dispose();
       renderer.dispose();
     },
   };

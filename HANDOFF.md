@@ -240,6 +240,23 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
   contradiction, the §6 dials, `aLevel`→`aLodR`/`aParentR`, seven→eight docs) and the `salt=0` structural-descent
   convention documented + frozen. typecheck + 119 tests + build green.
 
+- **Step 5 — real spin + orbit (render integration; same branch).** `core/orbits.ts` (Kepler/NR e≤0.8,
+  `orbitalPosition`/`orbitalVelocity`, `spinAngle`, real Earth/Moon elements + frozen golden) is wired into
+  `scene.ts`: a game clock (`TIME_COMPRESSION`, `?timescale=N`, `?notime`) drives **day/night from REAL spin**
+  — each frame the heliocentric planet→sun direction is rotated into the body frame by the inverse spin about
+  the tilted axis (23.44°) and set as the `DirectionalLight` direction (NOT a moved light), so the terminator
+  sweeps as the planet rotates and drifts as it orbits. The **render frame stays planet-centered** (no AU-scale
+  double to the GPU; the surface→orbit **launch can't rocket the planet away** — gate satisfied by construction;
+  full inertial flight model deferred). A **Sol disc** (unlit billboard, real angular size, behind terrain) and
+  a **Moon proxy** (along its true direction) are rendered; the Moon's **cast shadow** is wired
+  (`renderer.shadowMap` + `sun.castShadow` + terrain `receiveShadow` via the new `ManagerOpts.receiveShadow`)
+  behind **`?noshadow`**. HUD shows game-day / time-of-day / orbit %. **Headless-confirmed:** `?webgl` renders the
+  day/night terminator cleanly (shadows on AND off), typecheck + 129 tests (render-only, no golden change) +
+  build green. ⚠ **Real-GPU confirm:** terminator ADVANCES over time; sun drifts over an orbit; the moon's cast
+  shadow lands during an eclipse (`?noshadow` to A/B — the terrain material overrides `positionNode` + is
+  `DoubleSide`, so the shadow-depth pass must reproduce the morphed surface; analytic sun-occlusion is the
+  fallback); 60 fps holds. (commits `dbd2d51`, `500175b`, + this Step-5 render commit.)
+
 Measured-good on WebGPU (build the user ran): orbit→surface descent holds 60 fps / ~16.8 ms,
 `cov=96/96 holes=0` throughout, `fresh=0 refine=N` (sharpen-in-place, no pop), `bornM≈1.0`, largest cut ~466
 leaves (no spike), no rAF `[Violation]` stalls.
@@ -270,11 +287,18 @@ leaves (no spike), no rAF `[Violation]` stalls.
    (or add an explicit corner-neighbour pass), then it force-splits like any other edge. The watertight
    edge-lock fallback (per-vertex `edgeMask` + `effMorph=0` on boundary verts; conditioned skirts behind
    `?skirt`) remains available if a sub-pixel `gap` line shows at the one-level T-junctions.
-2. **Step 5 — real spin/orbit** (CLAUDE.md §5/§7): planet rotates (day/night from real spin), orbits a visible
-   Sol (sun moves over the orbit), Moon casts a **real shadow**, and surface→orbit launch **inherits the
-   planet's velocity** (it doesn't rocket away). Compute spin/orbit angles in **double, mod 2π, then cast to
-   float**; Kepler via Newton–Raphson, eccentricity capped 0.8. See master plan Parts 4 & 5.
-3. **Step 6 — atmosphere LUT + triplanar materials + lock 60fps** end-to-end (all of CLAUDE.md §7 at once).
+2. **Step 5 — real spin/orbit: IMPLEMENTED (render integration in `scene.ts` + `core/orbits.ts`); REMAINING =
+   real-GPU confirmation + the moon-shadow visual.** Done: day/night from real spin (headless-confirmed
+   terminator), sun drifts over the orbit, Sol disc + Moon proxy, planet-locked launch (no rocket-away),
+   double→mod 2π→float, Kepler/NR e≤0.8, frozen orbits golden. **To pick up:** (a) on a real WebGPU GPU confirm
+   the terminator ADVANCES, the sun drifts over a (time-compressed) orbit, and **the moon's cast shadow lands
+   during an eclipse** (`?noshadow` to A/B; the terrain material overrides `positionNode` + is `DoubleSide`, so
+   verify the shadow-depth pass reproduces the morphed surface — else switch to the analytic sun-occlusion
+   fallback or a `?moonscale` demonstrative size); (b) optional: the full inertial flight model (currently the
+   planet-locked frame satisfies the no-rocket-away gate). Tunables: `TIME_COMPRESSION` (constants.ts),
+   `?timescale=N`/`?notime`/`?noshadow`, `SUN_PROXY_DIST`/`MOON_PROXY_DIST` (scene.ts).
+3. **Step 6 — atmosphere LUT + triplanar materials + lock 60fps** end-to-end (all of CLAUDE.md §7 at once). Also
+   fold in the audit's per-leaf constant-attribute fix (`aLodR`/`aParentR`/`aBirthMs` → per-mesh uniforms) here.
 
 ## 7. Reading the diagnostics (`?lodaudit`) — how to judge LOD health
 - `[NMS] cut: leaves=N lod={depth:count} maxNbrΔ=k` — the live cut. **`maxNbrΔ>1`** = a >1-level edge step →
