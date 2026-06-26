@@ -53,15 +53,18 @@ import {
 export const MORPH_START_FRAC = 0.3;
 
 /**
- * Birth-ease (ms): a newly-live leaf's morph is floored at 1 (the parent surface it replaces) and
- * decays to its true distance-morph over this long, so a leaf that streamed in LATE — past its morph
- * band, so its distance-morph is already ≈0 = full detail (?lodaudit logged bornM=0 during motion) —
- * fades up from the parent instead of SNAPPING in (a pop). Kept SHORT (vs the old 300 ms) so even a
- * batch arriving together resolves quickly rather than as a slow synchronized "wave"; with balanceCut
- * + tamed prefetch keeping most leaves born at the parent (bornM≈1), this floor rarely does visible
- * work — it only catches the late stragglers. Mirrored on the CPU in the manager's centerMorph.
+ * Birth-ease (ms): a newly-live leaf's morph is floored at 1 (the parent surface it replaces) and decays
+ * to its true distance-morph over this long, so the one extra octave a child carries over its parent FADES
+ * UP instead of switching on the instant the mesh arrives. With gated incremental refinement
+ * (clampCutToReachableFrontier) every leaf now replaces its DIRECT parent (a one-level, single-octave step,
+ * never a multi-level jump), so this ease is the final smoothing pass: as the detail front descends one
+ * level per generation, each level's octave dissolves in over BIRTH_MS, reading as continuous "getting
+ * clearer" rather than discrete arrivals. Lengthened from the old 150 ms now that a cohort is a single
+ * level over a SMALL region (so a longer ease is gentle, not the synchronized full-screen "wave" the short
+ * value was guarding against), and consecutive generations' eases overlap into one continuous sharpening.
+ * Mirrored on the CPU in the manager's centerMorph (same constant, so they stay in lockstep).
  */
-export const BIRTH_MS = 150;
+export const BIRTH_MS = 500;
 
 // Detail-phase modulus (m): renderOrigin is reduced mod this (in double) so the detail coordinate
 // stays small enough for float precision (~1 cm at L=100 km) while tracking the absolute world

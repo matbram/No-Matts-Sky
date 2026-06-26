@@ -92,6 +92,12 @@ export function isPathPrefix(a: number[], b: number[]): boolean {
  *   • the overlapping ancestor is live → the merge is ready;
  *   • all overlapping descendants live → the split is ready.
  * Otherwise keep x rendered so no hole (black flash) appears mid-transition.
+ *
+ * The "all descendants live" rule (a FULL one-level cohort, not just one child) is what makes a split
+ * pop-free — but it only fires correctly when the wanted cut refines x by exactly ONE level (its 4 direct
+ * children). The reachable-frontier clamp (`clampCutToReachableFrontier`) guarantees that: it never lets
+ * the cut jump x straight to grandchildren, so the overlapping wanted leaves here are always x's own
+ * children and this predicate holds x until the complete replacement cohort is on screen.
  */
 export function retainedShouldRemove(
   x: QuadNode,
@@ -117,6 +123,93 @@ export function retainedShouldRemove(
   }
   if (!anyOverlap) return true; // x's region is gone from the cut → remove
   return descCount > 0 && descCount === descLive; // all split children live → remove
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// clampCutToReachableFrontier — gated incremental refinement (the zoom pop-in fix)
+//
+// The CDLOD vertex morph blends a leaf to its ONE-level-coarser baked parent surface; it can only hide
+// a single-level transition, and only once the finer leaf is LIVE before the camera crosses its morph
+// band. A plain screen-space cut, on a hard zoom, jumps a region from the resident base (depth 2) STRAIGHT
+// to depth 6+ in one recut and requests all those deep leaves at once. The intermediate levels (3,4,5) are
+// never built, so the deep leaf arrives over a 4-levels-coarser surface — an unmorphable jump = the pop.
+//
+// This clamp paces refinement to streaming: it caps the REQUESTED depth of every target leaf so the detail
+// front descends ONE level per generation. A region may go no deeper than (its deepest live covering leaf's
+// depth) + 1. Once that cohort goes live, the next recut admits the next level, and so on — so every
+// transition shown is exactly one level (morphable) and its morph parent is always already live. Refinement
+// self-paces (it cannot request level N+1 until N is live), so it never outruns the worker pool.
+//
+// Direction matters and is asymmetric:
+//   • REFINING (target deeper than live coverage): gate to liveAncestorDepth + 1.
+//   • MERGING UP / steady (the region ALREADY holds live detail at ≥ target depth): allow the target depth
+//     directly — coarsening is made smooth by the morph + deferred removal (retainedShouldRemove), and
+//     gating it would collapse detail to the base and re-climb (a zoom-out flicker). Near the camera the
+//     coarse ancestors have been purged, so a deepest-live-ANCESTOR walk alone would miss this and wrongly
+//     force the base; we detect "region contains live detail" via a live descendant-or-equal instead.
+//   • COLD (no live coverage at all — first load, a region not yet streamed): request the base depth first,
+//     so the always-resident base lands as the morph parent before anything finer (no fresh-over-backdrop).
+//
+// PURE + deterministic (a function of the target cut, the live leaf set, and baseDepth — no Three.js, no
+// render state passed by value). selectCut/balanceCut are untouched, so their golden tests are unaffected;
+// this gets its own test. Applied render-side AFTER balanceCut (truncation only coarsens, so it cannot
+// create a >1-level neighbour step that balance didn't already tolerate).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Region key (face + quadrant path) — NOT keyed by lod, so prefixes nest. Paths are single digits 0..3. */
+function regionKey(face: number, path: number[], len: number): string {
+  let s = face + ':';
+  for (let i = 0; i < len; i++) s += path[i];
+  return s;
+}
+
+/**
+ * Clamp a desired cut so no leaf is requested more than one level deeper than the region's current live
+ * coverage — the core of pop-free, streaming-paced LOD (see block comment above). `live` is the set of
+ * currently-rendered (live) leaves. `baseDepth` is the always-resident coarse floor a cold region loads
+ * first. Returns the clamped, de-duplicated cut (many deep targets collapse onto a shared shallow ancestor).
+ */
+export function clampCutToReachableFrontier(
+  targets: ReadonlyArray<QuadNode>,
+  live: ReadonlyArray<QuadNode>,
+  baseDepth: number,
+): QuadNode[] {
+  // Two lookups built once from the live set:
+  //  • liveLeaf: exact "face:path" of each live LEAF — to find the deepest live ANCESTOR of a target.
+  //  • coverRegion: "face:prefix" for EVERY prefix (incl. self) of every live leaf — so coverRegion.has(P)
+  //    ⟺ some live leaf has P as a prefix ⟺ region P contains live detail at depth ≥ |P| (a descendant).
+  const liveLeaf = new Set<string>();
+  const coverRegion = new Set<string>();
+  for (const lf of live) {
+    liveLeaf.add(regionKey(lf.face, lf.path, lf.path.length));
+    for (let d = 0; d <= lf.path.length; d++) coverRegion.add(regionKey(lf.face, lf.path, d));
+  }
+
+  const out: QuadNode[] = [];
+  const seen = new Set<string>();
+  for (const t of targets) {
+    const D = t.path.length;
+    let allowed: number;
+    if (coverRegion.has(regionKey(t.face, t.path, D))) {
+      // Region already holds live detail at ≥ D (target itself live, or a live descendant → merge-up/steady).
+      allowed = D;
+    } else {
+      // No detail at this depth yet → refining or cold. Find the deepest live LEAF ancestor (d < D).
+      let La = -1;
+      for (let d = D - 1; d >= baseDepth; d--) {
+        if (liveLeaf.has(regionKey(t.face, t.path, d))) {
+          La = d;
+          break;
+        }
+      }
+      allowed = La >= 0 ? La + 1 : Math.min(D, baseDepth); // refine one level past live, else load the base
+    }
+    const key = regionKey(t.face, t.path, allowed);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ face: t.face, path: t.path.slice(0, allowed) });
+  }
+  return out;
 }
 
 // Conservative bounding-radius factor per quadtree depth. A depth-d face quadrant

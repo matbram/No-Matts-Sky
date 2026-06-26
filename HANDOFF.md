@@ -91,6 +91,28 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
   Render-only (no core/golden change); typecheck + 76 tests + build green; headless WebGL2 renders the planet
   seamlessly. ⚠️ **Visual tuning of detail strengths/colours/ranges is a real-GPU pass (headless is too dark to
   judge);** confirm the §7 visual gates on WebGPU. (commits `b05989d`, `86077dc`, `17c554d`.)
+- **Root-cause pop fix — gated incremental refinement (same session/branch):** the residual zoom pop was
+  architectural, not a tuning miss. The cut was computed atomically from the instantaneous camera distance and
+  ALL deep leaves requested at once, so a hard zoom jumped a region depth-2→depth-6+ in one recut with the
+  intermediate levels (3,4,5) never built — the deep leaf then arrived over a 4-levels-coarser surface, an
+  unmorphable jump the per-vertex CDLOD morph (one-level only) can't hide = the pop. Fix:
+  **`clampCutToReachableFrontier`** (pure, `core/quadtree.ts`) caps the *requested* cut so no region goes deeper
+  than `(deepest live covering leaf)+1`; the detail front then descends ONE level per recut generation — every
+  shown transition is a single morphable level whose parent is already live, and refinement self-paces to
+  streaming (can't request N+1 until N is live). It gates only *refinement*; merge-up/coarsening is detected
+  (a live descendant-or-equal exists) and passed through unclamped (else zoom-out flickers to base and
+  re-climbs). Wired in `quadtreeManager.update()` as `balanceCut(clamp(balanceCut(selectCut(…))))` — the second
+  balance fills the depth-3 staircase ring the clamp leaves beside the always-live base (one-past-base =
+  in-frontier, appears over a live ancestor). A **recut-while-refining gate** (`manager.isRefining()` →
+  `refineRecut` in `scene.ts`) keeps generations firing while the front climbs even when the camera is
+  stationary (a hard-zoom-then-stop would otherwise freeze one level in), and stops once settled. `BIRTH_MS`
+  150→**500** so each level's added octave fades up (continuous "getting clearer") instead of switching on.
+  Headless `?lodaudit` on an instant orbit→surface jump: cut climbs `2→3→4→5→6→7` incrementally, **`fresh=0`**
+  (no backdrop pops, was the symptom), `churn≈2/s`, draws bounded ~110. Pure-core clamp has its own golden/
+  unit tests (8 cases); 87 tests + typecheck + build green. ⚠️ Real-GPU confirm: zoom in AND zoom-then-stop —
+  detail should sharpen continuously with no pop or "generations." One known **transient `maxNbrΔ=2`** at a
+  cube-face *corner* during the fastest climb (a `balanceCut` cross-face corner-probe limitation, pre-existing,
+  not fixable by the re-balance; the 500 ms birth-ease masks it to ~1 level) — tiny/transient, not the pop.
 
 Measured-good on WebGPU (build the user ran): orbit→surface descent holds 60 fps / ~16.8 ms,
 `cov=96/96 holes=0` throughout, `fresh=0 refine=N` (sharpen-in-place, no pop), `bornM≈1.0`, largest cut ~466
@@ -103,18 +125,17 @@ leaves (no spike), no rAF `[Violation]` stalls.
 > GPU after any change.
 
 ## 6. What's NEXT (pick up here)
-1. **GATED: residual cross-LOD seam.** A one-level (`maxNbrΔ=1`) T-junction where the always-resident depth-2
-   base meets a depth-3 cell shows `seam[gap≈21 m @f4d2·d3]` — sub-pixel from altitude, so it's **gated on
-   actually seeing a thin line on WebGPU**. If visible, the planned watertight fix (NOT yet implemented):
-   - **`balanceCut`** in `core/quadtree.ts`: force-split any leaf whose edge-neighbour (incl. cross-face via
-     `wrapFaceUV`) is >1 level coarser, to a fixpoint → every cross-LOD edge is exactly one level.
-   - **per-vertex `edgeMask`** in `surfacenets.ts`/`chunk.ts`: flag which boundary rows a vertex lies on
-     (account for the apron). *(Golden mesher digests will regenerate — expected; re-run determinism guards.)*
-   - **edge-locked morph** uniform in `quadtreeManager.ts`: force `effMorph=0` on those edge verts so they sit
-     on the coarse neighbour's edge line (watertight under 2:1 balance), updatable without re-meshing.
-   - Cheap fallback: flip conditioned skirts on by default (currently behind `?skirt`).
-   - Hooks already present: `maxNeighborDelta()` measures imbalance; a code comment notes "CDLOD will need
-     balanceCut".
+1. **GATED: cube-face-corner `maxNbrΔ=2` transient.** With gated incremental refinement + the 2:1 `balanceCut`
+   (both now implemented), the cut is `maxNbrΔ≤1` in steady state and through almost every transition. The one
+   exception is a **transient `maxNbrΔ=2` at a cube-face corner** during a fast climb: `balanceCut`'s
+   cross-face neighbour probe (`maxNeighborDepth`/`coveringDepth` via `wrapFaceUV`) doesn't catch the
+   3-faces-meet corner adjacency, so a lone depth-4 leaf can momentarily abut the depth-2 base there. It's
+   tiny, lasts one generation, appears over a live ancestor (not the backdrop), and the 500 ms birth-ease
+   renders the deep leaf as its parent surface initially (masking it to ~1 level). **Gated on actually seeing
+   it on WebGPU.** If visible, the fix is to make `maxNeighborDepth` probe the face *corners* consistently
+   (or add an explicit corner-neighbour pass), then it force-splits like any other edge. The watertight
+   edge-lock fallback (per-vertex `edgeMask` + `effMorph=0` on boundary verts; conditioned skirts behind
+   `?skirt`) remains available if a sub-pixel `gap` line shows at the one-level T-junctions.
 2. **Step 5 — real spin/orbit** (CLAUDE.md §5/§7): planet rotates (day/night from real spin), orbits a visible
    Sol (sun moves over the orbit), Moon casts a **real shadow**, and surface→orbit launch **inherits the
    planet's velocity** (it doesn't rocket away). Compute spin/orbit angles in **double, mod 2π, then cast to
@@ -146,10 +167,14 @@ leaves (no spike), no rAF `[Violation]` stalls.
 Key tunables in `scene.ts`: `BASE_DEPTH=2`, `PREFETCH_MAX_FRAC=0.35`, `PREFETCH_FLOOR_M=3000`,
 `PREFETCH_CEIL_M=20000`, `PREFETCH_S=0.7`, `APPROACH_MAX_MPS=5000` (clamps the per-frame closing rate so
 an orbit zoom can't pin prefetch), `APPROACH_DT_MAX_MS=100`, `RECUT_MAX_MS=300`, `RECUT_MIN_MOVE_M=1`,
-`maxDepth=15` (~9.5 m cells). In `terrainMaterial.ts`: `MORPH_START_FRAC=0.30`, `BIRTH_MS=150` (late-leaf
-fade-up floor), and the detail dials — `DETAIL_PHASE_MOD_M=100000`, `DETAIL_A_SCALE_M=40` (coarse mottle,
+`maxDepth=15` (~9.5 m cells). In `terrainMaterial.ts`: `MORPH_START_FRAC=0.30`, `BIRTH_MS=500` (per-level
+octave fade-up — each one-level cohort dissolves in over this window, so detail sharpens continuously rather
+than switching on), and the detail dials — `DETAIL_PHASE_MOD_M=100000`, `DETAIL_A_SCALE_M=40` (coarse mottle,
 fades ~50 km→1 km), `DETAIL_B_SCALE_M=6` (fine grain, fades ~6 km→200 m), plus the `SAND`/`ROCK` band
-palette. `core/quadtree.ts` adds `balanceCut` (2:1 restrict) + `maxNeighborDelta` (accurate metric).
+palette. `core/quadtree.ts` adds `clampCutToReachableFrontier` (gated incremental refinement — caps the
+requested cut at live+1 per region; pure, unit-tested), `balanceCut` (2:1 restrict) + `maxNeighborDelta`
+(accurate metric); `quadtreeManager.isRefining()` + `scene.ts refineRecut` keep generations firing while the
+front climbs (even stationary), then settle.
 Debug flags (URL query): `?perf ?seamscan ?lodaudit ?lodmorphdebug ?morphcolor ?wire ?lodcolor
 ?skirt ?skirtcolor ?noback ?dark ?webgl ?clipdebug ?nolog ?revz`. **`?seamscan`** is now required for the
 expensive O(live²) seam + O(96·live) coverage scans (off by default even under `?lodaudit`, since at

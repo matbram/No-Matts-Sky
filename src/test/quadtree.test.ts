@@ -7,6 +7,7 @@ import {
   selectCut,
   balanceCut,
   maxNeighborDelta,
+  clampCutToReachableFrontier,
   isPathPrefix,
   retainedShouldRemove,
   type CameraView,
@@ -289,3 +290,102 @@ describe('balanceCut (2:1 restricted quadtree)', () => {
     }
   });
 });
+
+describe('clampCutToReachableFrontier (gated incremental refinement)', () => {
+  const BASE = 2;
+  const n = (face: number, path: number[]): QuadNode => ({ face, path });
+  const depthOf = (cut: QuadNode[], face: number, path: number[]): number => {
+    // depth at which `cut` covers the region (face,path): the clamped leaf is an ancestor-or-equal of it.
+    for (const lf of cut) if (lf.face === face && isPathPrefix(lf.path, path)) return lf.path.length;
+    return -1;
+  };
+
+  it('cold start (no live coverage) requests only the base depth', () => {
+    const target = n(0, [0, 0, 0, 0, 0, 0]); // depth 6
+    const out = clampCutToReachableFrontier([target], [], BASE);
+    expect(out).toEqual([n(0, [0, 0])]); // clamped to baseDepth, nothing deeper
+  });
+
+  it('refines exactly one level past the deepest live ancestor', () => {
+    const target = n(0, [0, 0, 0, 0, 0, 0]); // wants depth 6
+    // Live coverage is the depth-2 base leaf only → admit depth 3, never the deep target.
+    let out = clampCutToReachableFrontier([target], [n(0, [0, 0])], BASE);
+    expect(out).toEqual([n(0, [0, 0, 0])]);
+    // Once depth 3 is live, the next generation admits depth 4 — the front advances one level.
+    out = clampCutToReachableFrontier([target], [n(0, [0, 0, 0])], BASE);
+    expect(out).toEqual([n(0, [0, 0, 0, 0])]);
+  });
+
+  it('does NOT coarsen on merge-up: a region holding finer live detail keeps the target depth', () => {
+    // Camera pulling back: wants depth 4, but the 4 depth-5 children are live (and the coarse ancestors
+    // have been purged near the camera). The clamp must request depth 4 directly — gating here would
+    // collapse to the base and re-climb (a zoom-out flicker). Retention/morph make the merge smooth.
+    const target = n(0, [0, 0, 0, 0]); // depth 4
+    const liveChildren = [0, 1, 2, 3].map((q) => n(0, [0, 0, 0, 0, q])); // depth-5 detail, no live ancestor
+    const out = clampCutToReachableFrontier([target], liveChildren, BASE);
+    expect(out).toEqual([n(0, [0, 0, 0, 0])]); // target depth preserved, NOT forced to baseDepth
+  });
+
+  it('is idempotent once the target itself is live (the settled state)', () => {
+    const target = n(0, [0, 0, 0]);
+    const out = clampCutToReachableFrontier([target], [n(0, [0, 0, 0])], BASE);
+    expect(out).toEqual([target]);
+  });
+
+  it('de-duplicates many deep targets that collapse onto a shared shallow ancestor', () => {
+    // Four depth-5 targets sharing the prefix [0,0,0]; only the depth-2 base is live, so each clamps to
+    // its deepest-live-ancestor (depth 2) + 1 = depth 3 = [0,0,0]. All four collapse to one leaf.
+    const deepTargets = [0, 1, 2, 3].map((q) => n(0, [0, 0, 0, q, 0])); // depth-5, common prefix [0,0,0]
+    const out = clampCutToReachableFrontier(deepTargets, [n(0, [0, 0])], BASE);
+    expect(out).toEqual([n(0, [0, 0, 0])]); // one deduped depth-3 leaf, not four
+  });
+
+  it('is deterministic (same inputs → identical output)', () => {
+    const targets = [n(0, [0, 0, 0, 0]), n(1, [1, 1, 1]), n(3, [2, 0, 1, 3, 2])];
+    const live = [n(0, [0, 0]), n(1, [1]), n(3, [2, 0, 1])];
+    const a = clampCutToReachableFrontier(targets, live, BASE);
+    const b = clampCutToReachableFrontier(targets, live, BASE);
+    expect(a).toEqual(b);
+  });
+
+  it('every output is in [baseDepth, liveAncestorDepth+1] and never deeper than its target', () => {
+    const targets: QuadNode[] = [];
+    for (let f = 0; f < 6; f++)
+      for (let q = 0; q < 4; q++) targets.push(...refineToDepth(n(f, [q]), 7));
+    const live = [n(0, [0, 0]), n(0, [0, 1]), n(2, [3, 1, 0])]; // mixed live depths
+    const out = clampCutToReachableFrontier(targets, live, BASE);
+    for (const o of out) {
+      expect(o.path.length).toBeGreaterThanOrEqual(BASE); // base floor honored
+      expect(o.path.length).toBeLessThanOrEqual(7); // never deeper than the target
+    }
+    // The refined live regions advance exactly one level; the rest sit at the base floor.
+    expect(depthOf(out, 0, [0, 0, 0])).toBe(3); // live depth-2 → admit depth 3
+    expect(depthOf(out, 2, [3, 1, 0, 0])).toBe(4); // live depth-3 → admit depth 4
+    expect(depthOf(out, 5, [0, 0])).toBe(BASE); // cold region → base floor
+  });
+
+  it('keeps the clamped cut 2:1-balanced (morphable) when live coverage is balanced', () => {
+    // Backs the "clamp AFTER balanceCut" trap: clamping a uniform-deep target against a BALANCED live set
+    // adds at most one level per region, so adjacent regions stay ≤1 level apart → the morph still hides
+    // every seam. Build a balanced live set, request everything deep, clamp, and re-check the delta.
+    const MAXD = 9;
+    const bkey = (q: QuadNode): string => `${q.face}/${q.path.join('')}`;
+    const imbalanced: QuadNode[] = [];
+    for (let f = 0; f < 6; f++) for (let q = 0; q < 4; q++) imbalanced.push(n(f, [q]));
+    imbalanced.splice(imbalanced.findIndex((l) => l.face === 0 && l.path[0] === 0), 1);
+    imbalanced.push(...refineToDepth(n(0, [0]), 4)); // one deep patch
+    const live = balanceCut(imbalanced, MAXD); // guaranteed ≤1-balanced
+    expect(maxNeighborDelta(live, MAXD)).toBeLessThanOrEqual(1);
+
+    const targets: QuadNode[] = [];
+    for (let f = 0; f < 6; f++) for (let q = 0; q < 4; q++) targets.push(...refineToDepth(n(f, [q]), 7));
+    const clamped = clampCutToReachableFrontier(targets, live, BASE);
+    expect(new Set(clamped.map(bkey)).size).toBe(clamped.length); // a proper (deduped) cut
+    expect(maxNeighborDelta(clamped, MAXD)).toBeLessThanOrEqual(1); // still morphable
+  });
+});
+
+/** Uniformly refine a node down to `depth` (test helper, mirrors balanceCut's local refineTo). */
+function refineToDepth(node: QuadNode, depth: number): QuadNode[] {
+  return node.path.length >= depth ? [node] : childrenOf(node).flatMap((c) => refineToDepth(c, depth));
+}

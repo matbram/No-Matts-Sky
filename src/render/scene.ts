@@ -650,7 +650,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // Time-based recut floor: keep the leaf set tracking a slow descent continuously when
       // recutDist (huge at altitude) wouldn't trip for many seconds. Only while actually moving.
       const timeRecut = moved > RECUT_MIN_MOVE_M && now - lastCutTime > RECUT_MAX_MS;
-      if (forceCut || moved > recutDist || turned || timeRecut) {
+      // Recut-while-refining: gated incremental refinement admits only ONE level deeper than what's live
+      // per recut, so after a hard zoom (or zoom-then-STOP, where moved≈0 and timeRecut never trips) the
+      // detail front would freeze one level in. Keep firing recuts every RECUT_MAX_MS while the manager
+      // reports the front is still climbing; it stops on its own once the cut reaches its target depth.
+      const refineRecut = manager.isRefining() && now - lastCutTime > RECUT_MAX_MS;
+      if (forceCut || moved > recutDist || turned || timeRecut || refineRecut) {
         let halfFov: number;
         let splitPxOverride: number | undefined;
         if (ctrlMode) {

@@ -18,6 +18,7 @@ import { Scene, Mesh, BufferGeometry, BufferAttribute, Color, Vector3, type Mate
 import {
   selectCut,
   balanceCut,
+  clampCutToReachableFrontier,
   maxNeighborDelta as maxNeighborDeltaCore,
   nodeBounds,
   lodBoundRadius,
@@ -121,6 +122,11 @@ export class QuadtreeManager {
   private readonly readyQueue: string[] = []; // meshed, awaiting GPU upload
   private readonly jobKey = new Map<number, string>();
   private wanted = new Set<string>();
+  // True while the reachable-frontier clamp is still holding the cut shallower than the screen-space
+  // target somewhere — i.e. the detail front has more levels to climb. Drives the recut-while-refining
+  // gate in scene.ts so generations keep firing even when the camera is stationary (a hard-zoom-then-stop
+  // would otherwise freeze one level in). False once every region has streamed to its target depth.
+  private frontierActive = false;
   private readonly workers: Worker[] = [];
   private readonly idle: Worker[] = [];
   private readonly heightMargin: number;
@@ -278,7 +284,8 @@ export class QuadtreeManager {
     // so every cross-LOD step is exactly one level → the CDLOD morph can hide it (no unmorphable
     // seam/pop, which ?lodaudit logged as maxNbrΔ up to 4). selectCut stays the pure SSE decision
     // (its golden test is unchanged); balanceCut is a separate pure pass applied on top.
-    const cut = balanceCut(
+    const baseDepth = this.opts.baseDepth ?? 0;
+    const balanced = balanceCut(
       selectCut(camera, {
         radius: this.radius,
         heightMargin: this.heightMargin,
@@ -289,10 +296,38 @@ export class QuadtreeManager {
         prefetchM,
         // Always-resident coarse base — keep the whole sphere meshed at low detail so every
         // refinement has a real parent to morph from (no backdrop pop). 0 = off.
-        baseDepth: this.opts.baseDepth ?? 0,
+        baseDepth,
       }),
       this.opts.maxDepth,
     );
+    // GATED INCREMENTAL REFINEMENT — the zoom pop-in fix. Cap the requested cut so no region is ever
+    // requested deeper than (its deepest live covering leaf's depth) + 1. The detail front then descends
+    // ONE level per recut generation: each shown transition is a single morphable level whose parent is
+    // ALREADY live, so a hard zoom no longer jumps a region depth-2→depth-6 over a 4-levels-coarser surface
+    // the morph can't hide (the pop). Refinement self-paces to streaming — it can't request level N+1 until
+    // N is live — so it never outruns the worker pool. Pure /core decision (clampCutToReachableFrontier);
+    // render-side here only because the live set is render state. No-op once a region reaches its target
+    // depth (target-live ⇒ clamp returns it unchanged), and it never gates merge-up/coarsening (smooth via
+    // the morph + deferred removal). The recut-while-refining gate in scene.ts keeps generations firing.
+    const liveNodes: QuadNode[] = [];
+    for (const e of this.entries.values()) if (e.status === 'live') liveNodes.push(e.node);
+    const clamped = clampCutToReachableFrontier(balanced, liveNodes, baseDepth);
+    // Did the clamp hold anything back from its target depth? Truncation strictly reduces total path depth
+    // (and may dedup siblings), so a shallower clamped sum ⇔ the front is still climbing. Equal ⇔ settled.
+    // Measured on the raw clamp (pre re-balance) so it's a clean "more levels to reach" signal.
+    let balDepth = 0;
+    for (const b of balanced) balDepth += b.path.length;
+    let clampedDepth = 0;
+    for (const c of clamped) clampedDepth += c.path.length;
+    this.frontierActive = clampedDepth < balDepth;
+    // Re-balance the clamped cut: the clamp caps the deep centre at live+1 but leaves its lateral base
+    // neighbours at their (shallow) target depth, so a fast-climbing centre can briefly abut the depth-2
+    // base with the depth-3 staircase ring missing (?lodaudit logged maxNbrΔ=2 transients). Re-balancing
+    // fills that ring — and the leaves it adds are one level past the ALWAYS-LIVE base (depth-2 → depth-3),
+    // so they sit within the frontier and appear over a live ancestor (refine, never a backdrop pop). The
+    // rings then climb in lockstep one generation behind the centre, so every cross-LOD step stays one level
+    // (morphable) all the way down. Cheap (the cut is ~100–150 leaves).
+    const cut = balanceCut(clamped, this.opts.maxDepth);
 
     const wanted = new Set<string>();
     for (const node of cut) {
@@ -869,6 +904,14 @@ export class QuadtreeManager {
       else if (e.status === 'inflight') inflight++;
     }
     return { live, pending, inflight, ready: this.readyQueue.length, msPerLeaf: this.avgMs };
+  }
+
+  /** True while the detail front still has levels to climb toward the screen-space target (the clamp is
+   *  holding the cut shallower than the target somewhere). The render loop recuts every ~RECUT_MAX_MS
+   *  while this holds — even with the camera stationary — so a hard-zoom-then-stop keeps refining to full
+   *  detail one level per generation, then settles (returns false) and the forced recuts stop. */
+  isRefining(): boolean {
+    return this.frontierActive;
   }
 
   /** ?perf: meshes created+disposed per second since the last call (resets the accumulator). High =
