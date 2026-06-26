@@ -78,11 +78,11 @@ const DETAIL_PHASE_MOD_M = 100_000;
 // gate (smoothstep far→near) is also its anti-alias guard: it reaches 0 before the feature projects
 // below ~1 px, so the finest detail never shimmers. [T] tune.
 const DETAIL_A_SCALE_M = 40; // coarse mottle (~40 m features)
-const DETAIL_A_NEAR_M = 1_000;
-const DETAIL_A_FAR_M = 50_000;
+export const DETAIL_A_NEAR_M = 1_000;
+export const DETAIL_A_FAR_M = 50_000;
 const DETAIL_B_SCALE_M = 6; // fine grain (~6 m features)
-const DETAIL_B_NEAR_M = 200;
-const DETAIL_B_FAR_M = 6_000;
+export const DETAIL_B_NEAR_M = 200;
+export const DETAIL_B_FAR_M = 6_000;
 
 // One archetype's palette (barren): flatter ground reads as light regolith, steeper faces as darker
 // rock. Cosmetic floats (render-only — NOT canonical, no determinism constraint; master plan §5.8).

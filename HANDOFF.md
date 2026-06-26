@@ -160,6 +160,13 @@ leaves (no spike), no rAF `[Violation]` stalls.
   the four stage times say WHICH main-thread step spiked (`recut`=update/selectCut/balanceCut,
   `upload`=GPU upload, `tick`, `gpu/other`=dt minus measured = GPU/vsync). `live=Ndraws` = leaf count =
   draw calls (aim well under the cut ballooning); `churn` = meshes created+disposed/s (high = thrash).
+- `[NMS step]` (under `?lodaudit`) — diagnoses WHICH mechanism makes detail appear in discrete
+  steps/"generations" on a zoom: **A** `floorWins%(peak)/lift/snap(floor N)` = the birth-ease floor holding
+  a batch at the parent against distance, fading together = a wave (peak is the windowed max so a snapshot
+  can't miss it); **B** `bornHist[≥.9/.7/.3/<.3]` + `pfAdeq` = leaves arriving late (mass in `<.3`, lead <
+  need) → snap in part-detailed; **C** `new[depth:count]` = a whole LOD level arriving in one recut burst;
+  **D** `mNear/wMorph/gA/gB` = whether the surface texture steps independently of the geometry morph (gA/gB
+  are smooth in distance, so if texture steps it's `wMorph` = the morph, i.e. the same root as A/B).
 - **The HUD overlay** now also shows `worst <ms>` + a `⚠ N jank` count and goes RED on any hitch — the
   smoothed "fps" alone hid the stutter. **`maxNbrΔ`** is now the ACCURATE fine-probe metric (the old
   quarter-cell probe over-reported, e.g. `=4` on cuts that were already 2:1 balanced).

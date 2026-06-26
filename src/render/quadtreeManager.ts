@@ -30,7 +30,16 @@ import {
 import { chunkKey, uvRectFromPath, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
 import { faceDirection, wrapFaceUV, CUBE_FACES } from '../core/cubesphere.ts';
 import { lodOctaves, terrainAt, type TerrainRecipe } from '../core/density.ts';
-import { createTerrainMaterial, detailPhaseOf, MORPH_START_FRAC, BIRTH_MS } from './terrainMaterial.ts';
+import {
+  createTerrainMaterial,
+  detailPhaseOf,
+  MORPH_START_FRAC,
+  BIRTH_MS,
+  DETAIL_A_NEAR_M,
+  DETAIL_A_FAR_M,
+  DETAIL_B_NEAR_M,
+  DETAIL_B_FAR_M,
+} from './terrainMaterial.ts';
 
 type Status = 'pending' | 'inflight' | 'ready' | 'live';
 interface Entry {
@@ -161,6 +170,18 @@ export class QuadtreeManager {
   private bornMSum = 0;
   private bornMMin = 1;
   private bornMN = 0;
+  // ?lodaudit "[NMS step]" diagnostics — isolate WHICH mechanism makes detail appear in steps/generations
+  // on zoom-in. bornHist = born-morph buckets [≥.9/.7–.9/.3–.7/<.3] (B: late arrivals snap if mass is <.3).
+  // newByDepth/liveAtByDepth = per-depth go-live counts + last go-live clock (C: levels arriving in bursts).
+  // snapCount = live leaves whose DISPLAYED morph jumped >0.3 between frames; snapFloor = of those, how many
+  // were inside the birth-ease window (A: the birth floor releasing late = the snap). Reset where noted.
+  private readonly bornHist = [0, 0, 0, 0];
+  private readonly newByDepth: number[] = [];
+  private snapCount = 0;
+  private snapFloor = 0;
+  private floorWinsMaxWin = 0; // peak floorWins% across frames since the last [NMS step] log (A is a WAVE,
+  // not a per-frame snap — a batch held at the floor fades together — so a single log-tick snapshot can
+  // miss it; the window peak catches it).
   // CDLOD geomorph: ONE shared material (createTerrainMaterial) carries the per-vertex distance
   // morph; its kDist uniform = (viewportHeight/(2·tan(fovY/2)))/splitPx — the same projected-size
   // constant selectCut uses, so the morph band aligns with the split distance (set per frame by the
@@ -271,6 +292,7 @@ export class QuadtreeManager {
     this.bornMSum = 0;
     this.bornMMin = 1;
     this.bornMN = 0;
+    this.bornHist[0] = this.bornHist[1] = this.bornHist[2] = this.bornHist[3] = 0; // [NMS step] B window = since last recut
     this.prefetchM = prefetchM; // for ?lodmorphdebug readout
     if (this.opts.debugAudit) {
       // Recut cadence (the "detail arrives in waves" signal) + the view cone for the coverage/seam probes.
@@ -456,10 +478,19 @@ export class QuadtreeManager {
     // ?lodaudit morph histogram buckets: [m<.1, .1–.3, .3–.7, .7–.9, >.9]. Bimodal (full pile at
     // <.1 and >.9, few between) ⇒ steps at the transition ring; a smooth spread ⇒ graded morph.
     let h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0;
+    // [NMS step] Candidate A snapshot (THIS frame): how often the birth-ease floor is overriding the pure
+    // distance morph (holding a leaf at its parent against distance = the delayed-snap "generation").
+    let floorWins = 0, floorLiftSum = 0, floorAgeSum = 0;
     for (const e of this.entries.values()) {
       if (e.status !== 'live') continue;
       live++;
-      const m = this.centerMorph(e);
+      // Split centerMorph into its parts so the [NMS step] line can see the floor vs the pure distance
+      // morph (instead of only their max). m = displayed; dm = pure distance morph; bf = birth-ease floor.
+      const dm = this.distanceMorph(e);
+      let bf = 1 - (this.clockMs - e.liveAtMs) / BIRTH_MS;
+      if (bf < 0) bf = 0;
+      const m = dm > bf ? dm : bf;
+      const prev = e.morph; // last frame's DISPLAYED morph (set below) — for the per-frame snap detector
       e.morph = m;
       // ?morphcolor: green = full detail (near, m=0) → red = parent (far, m=1). A correct
       // CDLOD render shows a smooth concentric gradient, NOT per-leaf colour blocks.
@@ -472,7 +503,20 @@ export class QuadtreeManager {
           if (m > mx) mx = m;
         }
         if (m < 0.1) h0++; else if (m < 0.3) h1++; else if (m < 0.7) h2++; else if (m < 0.9) h3++; else h4++;
+        const ageMs = this.clockMs - e.liveAtMs;
+        if (bf > dm + 0.02) { floorWins++; floorLiftSum += bf - dm; floorAgeSum += ageMs; } // A: floor active
+        // Per-frame snap = a leaf whose DISPLAYED morph jumped >0.3 since last frame (a visible step).
+        // Skip just-born leaves (no valid prev). snapFloor = those still within the birth window ⇒ the
+        // birth-ease releasing is the step (A); snaps with no floor point at late geometry arrival (B).
+        if (ageMs > dtMs * 1.5 && Math.abs(m - prev) > 0.3) {
+          this.snapCount++;
+          if (ageMs < BIRTH_MS + 100) this.snapFloor++;
+        }
       }
+    }
+    if (dbg && live > 0) {
+      const fwPct = (100 * floorWins) / live;
+      if (fwPct > this.floorWinsMaxWin) this.floorWinsMaxWin = fwPct; // window peak (A), reset at log
     }
     if (dbg) {
       const avg = mid > 0 ? sum / mid : 0;
@@ -520,6 +564,35 @@ export class QuadtreeManager {
             `stream[p${s.pending} i${s.inflight} r${s.ready} L${s.live} busy${busy}/${this.workers.length} ${s.msPerLeaf.toFixed(0)}ms] ` +
             `pf=${pfKm.toFixed(1)}km band=${band.toFixed(1)}km pf/band=${band > 0 ? (pfKm / band).toFixed(3) : '-'}`;
           console.log('[NMS audit]', this.auditSummary);
+
+          // ── [NMS step] — one decisive signal per candidate cause of "detail appears in steps" ──
+          // A (birth-ease floor holding leaves at the parent against distance, then releasing = a snap):
+          //   floorWins% high + floorLift large during a smooth zoom. snap = per-window count of >0.3
+          //   displayed-morph jumps; snapFloor = of those, ones still inside the birth window (⇒ the floor
+          //   release IS the step). B (late arrivals): bornHist piled in <.3 and/or pfAdeq<1 (lead < the
+          //   distance the camera covers while a leaf streams). C (level bursts): newByDepth shows a whole
+          //   depth arriving at once. D (texture steps on its own schedule): see nearDetailStr — gA/gB jump
+          //   while mNear is smooth. E: histM (above) bimodal. One steady zoom-in run picks the culprit.
+          const fw = live > 0 ? (100 * floorWins) / live : 0;
+          const fl = floorWins > 0 ? floorLiftSum / floorWins : 0;
+          const fa = floorWins > 0 ? (floorAgeSum / floorWins) | 0 : 0;
+          const speedMS = Math.max(0, this.approachRate);
+          const needM = (speedMS * latAvg) / 1000; // m the camera covers during one stream latency
+          const pfAdeq = needM > 0 ? this.prefetchM / needM : Infinity;
+          const nbd = this.newByDepth
+            .map((c, d) => (c ? `${d}:${c}` : ''))
+            .filter(Boolean)
+            .join(',');
+          console.log(
+            `[NMS step] A:floorWins=${fw.toFixed(0)}%(peak ${this.floorWinsMaxWin.toFixed(0)}%) lift=${fl.toFixed(2)} age=${fa}ms snap=${this.snapCount}(floor ${this.snapFloor}) | ` +
+              `B:bornHist[≥.9=${this.bornHist[0]}/.7=${this.bornHist[1]}/.3=${this.bornHist[2]}/<.3=${this.bornHist[3]}] ` +
+              `pf=${pfKm.toFixed(2)}km need=${(needM / 1000).toFixed(2)}km pfAdeq=${pfAdeq === Infinity ? '∞' : pfAdeq.toFixed(2)} | ` +
+              `C:new[${nbd || 'none'}] | D:${this.nearDetailStr()}`,
+          );
+          this.snapCount = 0;
+          this.snapFloor = 0;
+          this.floorWinsMaxWin = 0;
+          this.newByDepth.length = 0;
         }
       }
     }
@@ -571,6 +644,35 @@ export class QuadtreeManager {
     const dChild = 2 * lodBoundRadius(depth, this.radius) * this.kDist;
     const dParent = 2 * lodBoundRadius(depth > 0 ? depth - 1 : 0, this.radius) * (depth > 0 ? this.kDist : 2 * this.kDist);
     return `near[d=${depth} m=${this.centerMorph(best).toFixed(2)} dist=${(dist / 1000).toFixed(1)}km band=${(dChild / 1000).toFixed(1)}..${(dParent / 1000).toFixed(1)}km]`;
+  }
+
+  /** [NMS step] Candidate D: at the sub-camera leaf, the procedural-detail (texture) state — its geometry
+   *  morph `mNear`, the detail weight `wMorph=1−mNear`, and the two distance gates `gA`/`gB` (CPU mirror of
+   *  the shader smoothsteps). `gA`/`gB` are smooth functions of distance, so if the TEXTURE steps it must
+   *  be `wMorph` (= the morph) stepping — i.e. the SAME root as A/B, not an independent detail schedule. */
+  private nearDetailStr(): string {
+    const { face, u, v } = this.faceUVOf(this.camX, this.camY, this.camZ);
+    let best: Entry | null = null;
+    for (const e of this.entries.values()) {
+      if (e.status !== 'live' || e.node.face !== face) continue;
+      const r = uvRectFromPath(e.node.path);
+      if (u < r.u0 || u > r.u1 || v < r.v0 || v > r.v1) continue;
+      if (!best || e.node.path.length > best.node.path.length) best = e;
+    }
+    if (!best) return 'mNear=- (none)';
+    const dx = best.center[0] - this.camX, dy = best.center[1] - this.camY, dz = best.center[2] - this.camZ;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const mNear = this.centerMorph(best);
+    const wMorph = 1 - mNear;
+    const ss = (e0: number, e1: number, x: number): number => {
+      let t = (x - e0) / (e1 - e0);
+      if (t < 0) t = 0;
+      else if (t > 1) t = 1;
+      return t * t * (3 - 2 * t);
+    };
+    const gA = ss(DETAIL_A_FAR_M, DETAIL_A_NEAR_M, dist);
+    const gB = ss(DETAIL_B_FAR_M, DETAIL_B_NEAR_M, dist);
+    return `mNear=${mNear.toFixed(2)} wMorph=${wMorph.toFixed(2)} gA=${gA.toFixed(2)} gB=${gB.toFixed(2)} texW≈${(wMorph * gA).toFixed(2)}/${(wMorph * gB).toFixed(2)}`;
   }
 
   // ───────────────────────── ?lodaudit helpers (debug-only, throttled) ─────────────────────────
@@ -796,6 +898,12 @@ export class QuadtreeManager {
         this.bornMSum += bm;
         this.bornMN++;
         if (bm < this.bornMMin) this.bornMMin = bm;
+        // [NMS step] B: born-morph distribution. Mass piling into the <.3 bucket ⇒ leaves arriving deep
+        // inside their morph band (prefetch too short) → they appear part-detailed = a step.
+        this.bornHist[bm >= 0.9 ? 0 : bm >= 0.7 ? 1 : bm >= 0.3 ? 2 : 3]++;
+        // [NMS step] C: per-depth go-live cadence. A whole depth arriving as one batch (big newByDepth[d]
+        // within one recut window, per the cut[Δt=…] interval) reads as a discrete "generation".
+        this.newByDepth[depth] = (this.newByDepth[depth] ?? 0) + 1;
       }
       if (this.opts.debugAudit && !this.wiringLogged) {
         // One-time sanity: confirm the geomorph is wired on this build — geometry carries the
