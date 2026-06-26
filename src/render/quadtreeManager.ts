@@ -14,16 +14,7 @@
 // altitude (full per-frame floating origin is Step 4).
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { Scene, Mesh, BufferGeometry, BufferAttribute, Color, Vector2, type Material } from 'three';
-import {
-  uniform,
-  mix,
-  attribute,
-  positionLocal,
-  positionWorld,
-  cameraPosition,
-  smoothstep,
-} from 'three/tsl';
+import { Scene, Mesh, BufferGeometry, BufferAttribute, Color, type Material } from 'three';
 import {
   selectCut,
   nodeBounds,
@@ -36,12 +27,7 @@ import {
 import { chunkKey, uvRectFromPath, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
 import { faceDirection, wrapFaceUV, CUBE_FACES } from '../core/cubesphere.ts';
 import { lodOctaves, terrainAt, type TerrainRecipe } from '../core/density.ts';
-
-/** Node materials expose positionNode/normalNode; the base is typed as plain Material here. */
-interface NodeMaterialLike {
-  positionNode: unknown;
-  normalNode: unknown;
-}
+import { createTerrainMaterial, MORPH_START_FRAC } from './terrainMaterial.ts';
 
 type Status = 'pending' | 'inflight' | 'ready' | 'live';
 interface Entry {
@@ -49,7 +35,8 @@ interface Entry {
   status: Status;
   center: [number, number, number];
   mesh: Mesh | null;
-  mat: Material | null; // per-leaf material clone (carries the leaf's own CDLOD level uniform)
+  mat: Material | null; // OWNED per-leaf material: null in normal mode (uses the shared material);
+  // a clone only in debug-tint modes (?lodcolor/?skirtcolor/?morphcolor). Disposed iff non-null.
   ready: ChunkMesh | null;
   morph: number; // CDLOD morph at the leaf CENTER (0=full near .. 1=parent far) — debug/HUD only
   needsSkirt: boolean; // does any edge lack a same-LOD neighbour in the cut?
@@ -62,22 +49,14 @@ interface MeshResult {
   ms: number;
 }
 
-/**
- * CDLOD morph region: a leaf shows full detail until the camera recedes to this fraction of
- * the way from its split distance to its merge (parent) distance, then morphs to the parent
- * surface by the merge distance — so detail fades continuously with distance and a leaf
- * matches the coarser neighbour exactly at the shared LOD boundary. Used identically in the
- * TSL shader (per-vertex) and `centerMorph` (CPU, for ?lodmorphdebug/?morphcolor).
- */
-const MORPH_START_FRAC = 0.3;
-
-/**
- * Birth-ease (ms): a newly-live leaf starts at morph=1 (= the parent surface it replaces, so its
- * appearance is invisible) and eases to its true distance-morph over this long. Hides late-streaming
- * refinements (which would otherwise snap in already-detailed past their morph-start distance) by
- * fading them up from the parent. At normal speed distanceMorph≈1 at birth too, so it's a no-op.
- */
-const BIRTH_MS = 300;
+// MORPH_START_FRAC (the CDLOD fade-band start) lives in terrainMaterial.ts so the TSL graph and
+// this file's CPU mirror (`distanceMorph`, for ?lodmorphdebug/?morphcolor) stay in lockstep.
+//
+// The old time-based "birth-ease" (a newly-live leaf eased up from the parent over 300 ms) was
+// REMOVED: with speed-aware prefetch keeping leaves born at the parent surface (bornM≈1), it was
+// redundant, and because a recut's batch of new leaves all share a birth instant it faded them in
+// as one synchronized front — a visible "wave." The per-vertex distance morph alone now carries
+// every leaf in continuously, independent of when it streamed in.
 
 // Skirt depth (m) at a LOD transition, sized to the cross-LOD SURFACE mismatch — NOT
 // the old km-scale "cover everything" curtain that was the visible boundary grid.
@@ -114,6 +93,7 @@ export interface ManagerOpts {
   // fresh-over-backdrop pop when a region rotates/streams in. 0 = off. See SelectOpts.baseDepth.
   baseDepth?: number;
   workers?: number; // pool size (default: min(6, cores-1))
+  wireframe?: boolean; // debug: render the shared terrain material as wireframe (?wire)
   skirts?: boolean; // enable LOD-transition skirts (default OFF — the apron already covers
   // holes at LOD transitions, and the skirts were the visible boundary grid; ?skirt re-enables)
   debugColor?: 'lod' | 'skirt' | 'morph'; // debug tint: LOD level / skirted leaves / morph progress
@@ -165,13 +145,13 @@ export class QuadtreeManager {
   private bornMSum = 0;
   private bornMMin = 1;
   private bornMN = 0;
-  // CDLOD geomorph: one shared uniform = (viewportHeight/(2·tan(fovY/2)))/splitPx — the
-  // same projected-size constant selectCut uses, so the per-vertex distance morph band
-  // aligns with the split distance (set per frame by the render shell). The camera world
-  // position (render space) is mirrored on the CPU only to compute the leaf-CENTRE morph
-  // for ?lodmorphdebug/?morphcolor; the actual morph is per-vertex in TSL via cameraPosition.
-  private readonly kDistUniform = uniform(0);
-  private readonly uNowUniform = uniform(0); // manager clock (ms) for the per-leaf birth-ease
+  // CDLOD geomorph: ONE shared material (createTerrainMaterial) carries the per-vertex distance
+  // morph; its kDist uniform = (viewportHeight/(2·tan(fovY/2)))/splitPx — the same projected-size
+  // constant selectCut uses, so the morph band aligns with the split distance (set per frame by the
+  // render shell). The camera world position (render space) is mirrored on the CPU only to compute
+  // the leaf-CENTRE morph for ?lodmorphdebug/?morphcolor; the actual morph is per-vertex in TSL.
+  private readonly sharedMat: Material;
+  private readonly kDistUniform: { value: number };
   private kDist = 0;
   private camX = 0;
   private camY = 0;
@@ -189,12 +169,16 @@ export class QuadtreeManager {
 
   constructor(
     private readonly scene: Scene,
-    private readonly material: Material,
     private readonly recipe: TerrainRecipe,
     private readonly radius: number,
     private readonly opts: ManagerOpts,
   ) {
     this.heightMargin = recipe.height * 1.6;
+    // The ONE shared terrain material (per-leaf data rides in the `aLevel` attribute); its kDist
+    // uniform is updated each frame via setMorphParams.
+    const handle = createTerrainMaterial({ wireframe: opts.wireframe });
+    this.sharedMat = handle.material;
+    this.kDistUniform = handle.kDist;
     const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
     const n = Math.max(1, Math.min(opts.workers ?? 6, cores - 1));
     for (let i = 0; i < n; i++) {
@@ -398,7 +382,6 @@ export class QuadtreeManager {
   tick(dtMs: number): void {
     if (this.entries.size === 0) return;
     this.clockMs += dtMs; // resume-safe clock (no Date.now) + the ?lodmorphdebug age base
-    this.uNowUniform.value = this.clockMs; // drive the per-leaf birth-ease (always, even when debug off)
     const dbg = !!this.opts.debugLodMorph;
     const tintMorph = this.opts.debugColor === 'morph';
     if (!dbg && !tintMorph) return; // CDLOD morph is in-shader; nothing else to do
@@ -488,13 +471,10 @@ export class QuadtreeManager {
     return t * t * (3 - 2 * t); // smoothstep
   }
 
-  /** CDLOD morph at a leaf's CENTRE with the birth-ease floor (the value actually drawn). */
+  /** CDLOD morph at a leaf's CENTRE (0=full near .. 1=parent far) — CPU mirror of the drawn morph.
+   *  Now the distance morph alone (the time-based birth-ease was removed). ?lodmorphdebug/?morphcolor. */
   private centerMorph(e: Entry): number {
-    const distanceM = this.distanceMorph(e);
-    // Birth-ease floor (mirrors the shader): a fresh leaf reads m=1 (parent) then decays.
-    let birth = 1 - (this.clockMs - e.liveAtMs) / BIRTH_MS;
-    if (birth < 0) birth = 0;
-    return distanceM > birth ? distanceM : birth;
+    return this.distanceMorph(e);
   }
 
   /** ?lodmorphdebug: the sub-camera leaf's depth, morph, distance, and fade band (km). */
@@ -547,8 +527,8 @@ export class QuadtreeManager {
     return best;
   }
 
-  /** Rendered CDLOD morph (0..1, incl birth-ease) for leaf `e` at world point P — the SAME
-   *  formula the TSL shader applies per-vertex, evaluated on the CPU at an arbitrary point. */
+  /** Rendered CDLOD morph (0..1) for leaf `e` at world point P — the SAME formula the TSL shader
+   *  applies per-vertex, evaluated on the CPU at an arbitrary point (distance morph; no birth-ease). */
   private effMorphAt(e: Entry, px: number, py: number, pz: number): number {
     const dx = px - this.camX, dy = py - this.camY, dz = pz - this.camZ;
     const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
@@ -558,15 +538,10 @@ export class QuadtreeManager {
     const dChild = 2 * lodR * this.kDist;
     const dParent = 2 * parentR * this.kDist;
     const e0 = dChild + (dParent - dChild) * MORPH_START_FRAC;
-    let m = 0;
-    if (dParent > e0) {
-      let t = (dist - e0) / (dParent - e0);
-      if (t < 0) t = 0; else if (t > 1) t = 1;
-      m = t * t * (3 - 2 * t);
-    }
-    let birth = 1 - (this.clockMs - e.liveAtMs) / BIRTH_MS;
-    if (birth < 0) birth = 0;
-    return m > birth ? m : birth;
+    if (dParent <= e0) return 0;
+    let t = (dist - e0) / (dParent - e0);
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    return t * t * (3 - 2 * t);
   }
 
   /** Rendered radius (m) of leaf `e` at unit dir (dx,dy,dz): lerp(full surface, morph-target
@@ -668,57 +643,32 @@ export class QuadtreeManager {
       geometry.setAttribute('morphTarget', new BufferAttribute(m.morphTargets, 3));
       geometry.setAttribute('morphTargetNormal', new BufferAttribute(m.morphTargetNormals, 3));
       geometry.setIndex(new BufferAttribute(m.indices, 1));
-      const mat = this.material.clone();
-      if (this.opts.debugColor) {
-        const c = (mat as unknown as { color: Color }).color;
-        if (this.opts.debugColor === 'lod') c.setHSL((e.node.path.length * 0.13) % 1, 0.75, 0.5);
-        else if (this.opts.debugColor === 'morph') c.setHSL(0.33, 0.85, 0.5); // green=full (tick recolors by distance)
-        else c.copy(e.needsSkirt ? new Color(1, 0.15, 0.15) : new Color(0.16, 0.16, 0.2));
-      }
-      // CDLOD geomorph (per-vertex, in-shader): the vertex lerps full detail → the
-      // one-octave-coarser parent surface as a smooth function of CAMERA DISTANCE, reaching
-      // the parent exactly at this leaf's split distance (dParent). So detail fades in
-      // continuously across the whole view as you approach — no per-leaf time wave — and the
-      // edge stays matched to a coarser neighbour (which renders ITS full detail there). The
-      // band uses the SAME projected-size constants as selectCut (lodBoundRadius · kDist).
+      // Per-leaf CDLOD level (lodR, parentR) as a constant-per-leaf vertex attribute. The ONE shared
+      // material's morph graph (terrainMaterial.ts) reads `aLevel` to build this leaf's split/merge
+      // distances — so every leaf renders with the same material (no per-leaf clone / node-graph
+      // rebuild). lodBoundRadius matches selectCut's metric, so the per-vertex distance-morph band
+      // aligns with the cut's split distance exactly. dChild=2·lodR·kDist, dParent=2·parentR·kDist.
       const depth = e.node.path.length;
       const lodR = lodBoundRadius(depth, this.radius);
       const parentR = depth > 0 ? lodBoundRadius(depth - 1, this.radius) : lodR * 2;
-      const uLevel = uniform(new Vector2(lodR, parentR)); // .x = child bound, .y = parent bound
-      const dChild = uLevel.x.mul(2).mul(this.kDistUniform);
-      const dParent = uLevel.y.mul(2).mul(this.kDistUniform);
-      const e0 = mix(dChild, dParent, MORPH_START_FRAC);
-      const dist = positionWorld.distance(cameraPosition); // render space → small floats
-      const mFactor = smoothstep(e0, dParent, dist); // 0 near (full) → 1 far (parent)
-      // Birth-ease FLOOR: start at 1 (= the parent surface this leaf replaces → its appearance is
-      // invisible) and decay to the distance-morph over BIRTH_MS, so a refinement that streamed in
-      // LATE (camera already past its morph-start) fades up from the parent instead of snapping in
-      // already-detailed. uBirth is per-leaf (set once here); uNow is one global clock uniform.
-      const uBirth = uniform(this.clockMs);
-      const birthEase = this.uNowUniform.sub(uBirth).div(BIRTH_MS).oneMinus().clamp(0, 1);
-      const mFinal = mFactor.max(birthEase);
-      (mat as unknown as NodeMaterialLike).positionNode = mix(
-        positionLocal,
-        attribute('morphTarget', 'vec3'),
-        mFinal,
-      );
-      // Morph the NORMAL by the SAME factor — the other half of the geomorph. Without this,
-      // a leaf whose GEOMETRY has morphed smooth toward its parent still SHADES with the
-      // fine analytic normals, so the high-frequency detail stays lit across the morph zone
-      // and stops abruptly at the LOD boundary (the "highly textured square"). Blending to
-      // the parent-surface normal (morphTargetNormal) keeps shading in lockstep with the
-      // morphed surface → the boundary becomes a smooth gradient. Re-normalize after the mix.
-      (mat as unknown as NodeMaterialLike).normalNode = mix(
-        attribute('normal', 'vec3'),
-        attribute('morphTargetNormal', 'vec3'),
-        mFinal,
-      ).normalize();
-      // Bias the finer leaf toward the camera so it wins the depth test over a coarser
-      // ancestor still retained for the brief moment until purge (surfaces match there, so
-      // no morph divergence to fight — unlike the old 350 ms time morph).
-      mat.polygonOffset = true;
-      mat.polygonOffsetFactor = -1;
-      mat.polygonOffsetUnits = -1;
+      const vc = m.positions.length / 3;
+      geometry.setAttribute('aLodR', new BufferAttribute(new Float32Array(vc).fill(lodR), 1));
+      geometry.setAttribute('aParentR', new BufferAttribute(new Float32Array(vc).fill(parentR), 1));
+      // Render with the shared material. Debug-tint modes (?lodcolor/?skirtcolor/?morphcolor) clone
+      // it and null its colorNode so a flat per-leaf colour shows (diagnostic + rare → clone cost is
+      // fine, and the cloned graph still carries the morph nodes so the geomorph is unaffected).
+      let mat = this.sharedMat;
+      let ownMat: Material | null = null;
+      if (this.opts.debugColor) {
+        const clone = this.sharedMat.clone();
+        (clone as unknown as { colorNode: unknown }).colorNode = null;
+        const c = (clone as unknown as { color: Color }).color;
+        if (this.opts.debugColor === 'lod') c.setHSL((depth * 0.13) % 1, 0.75, 0.5);
+        else if (this.opts.debugColor === 'morph') c.setHSL(0.33, 0.85, 0.5); // green=full (tick recolors by distance)
+        else c.copy(e.needsSkirt ? new Color(1, 0.15, 0.15) : new Color(0.16, 0.16, 0.2));
+        mat = clone;
+        ownMat = clone;
+      }
       const mesh = new Mesh(geometry, mat);
       mesh.position.set(
         m.origin[0] - this.renderOrigin[0],
@@ -751,7 +701,7 @@ export class QuadtreeManager {
         if (lat > this.reqLatMax) this.reqLatMax = lat;
       }
       e.mesh = mesh;
-      e.mat = mat;
+      e.mat = ownMat; // only a per-leaf debug clone is owned; the shared material is never disposed per-leaf
       e.center = m.origin;
       e.ready = null;
       e.status = 'live';
@@ -768,13 +718,15 @@ export class QuadtreeManager {
         if (bm < this.bornMMin) this.bornMMin = bm;
       }
       if (this.opts.debugAudit && !this.wiringLogged) {
-        // One-time sanity: confirm the geomorph SHADING (Part 6) is actually wired on this build —
-        // geometry carries morphTargetNormal AND the material overrides both position & normal nodes.
+        // One-time sanity: confirm the geomorph is wired on this build — geometry carries the
+        // morph attributes (incl. the per-leaf aLevel + morphTargetNormal) AND the shared material
+        // overrides both position & normal nodes.
         this.wiringLogged = true;
-        const ml = mat as unknown as NodeMaterialLike;
+        const sm = this.sharedMat as unknown as { positionNode: unknown; normalNode: unknown };
         console.log(
           `[NMS audit] wiring: morphTargetNormal=${!!geometry.getAttribute('morphTargetNormal')} ` +
-            `positionNode=${!!ml.positionNode} normalNode=${!!ml.normalNode}`,
+            `aLodR=${!!geometry.getAttribute('aLodR')} ` +
+            `positionNode=${!!sm.positionNode} normalNode=${!!sm.normalNode}`,
         );
       }
       this.uploadedThisCut++;
@@ -922,8 +874,9 @@ export class QuadtreeManager {
         this.scene.remove(e.mesh);
         e.mesh.geometry.dispose();
       }
-      e.mat?.dispose();
+      e.mat?.dispose(); // only per-leaf debug clones; the shared material is disposed once below
     }
+    this.sharedMat.dispose();
     this.entries.clear();
   }
 

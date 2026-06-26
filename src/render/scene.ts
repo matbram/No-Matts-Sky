@@ -226,22 +226,17 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // Octave count of the FINEST leaf — what the collision probe must sample so the
   // player stands on the same bumps the deepest mesh shows (not a smoother field).
   const groundOct = lodOctaves(recipe, MAX_DEPTH);
-  // Double-sided so skirt curtains show regardless of winding. Fully OPAQUE: the
-  // LOD transition is a GEOMETRY morph (the manager clones this per leaf and drives
-  // a per-leaf morph uniform that lerps each vertex morphTarget→position), so detail
-  // resolves in with a single opaque surface — no dither, no two surfaces at once.
-  const material = new MeshStandardNodeMaterial({
-    color: 0x9a8c7a,
-    roughness: 0.92,
-    metalness: 0.0,
-    side: DoubleSide,
-  });
-  material.wireframe = params.has('wire'); // debug: see the tessellation / where lines fall
+  // The terrain material is now owned by the manager (createTerrainMaterial): ONE shared, fully
+  // OPAQUE, double-sided MeshStandardNodeMaterial whose per-vertex CDLOD morph lerps each vertex
+  // morphTarget→position (and its normal) as a function of camera distance — so detail resolves in
+  // with a single opaque surface, no dither, no two surfaces at once. Per-leaf data rides in the
+  // `aLevel` attribute, so there is no per-leaf material clone.
   // splitPx 300 (smaller, gentler LOD steps — affordable after the ~13× meshing
   // speedup); maxDepth = MAX_DEPTH gives meter-scale near-field cells for walking.
-  const manager = new QuadtreeManager(scene, material, recipe, R, {
+  const manager = new QuadtreeManager(scene, recipe, R, {
     splitPx: FLY_SPLIT_PX,
     maxDepth: MAX_DEPTH,
+    wireframe: params.has('wire'), // debug: see the tessellation / where lines fall
     // Always-resident coarse base: the whole sphere stays meshed at BASE_DEPTH so every
     // finer leaf morphs from a real parent (no fresh-over-backdrop pop). The static inset
     // backdrop stays as the ultimate below-everything filler (startup / frustum-edge gaps).
@@ -738,11 +733,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       window.removeEventListener('keyup', onKeyUp, { capture: true });
       window.removeEventListener('mousemove', onMouseMove);
       canvas.removeEventListener('click', onClick);
-      manager.dispose();
+      manager.dispose(); // disposes the shared terrain material it owns
       controls.dispose();
       backdropGeo.dispose();
       backdropMaterial.dispose();
-      material.dispose();
       renderer.dispose();
     },
   };
