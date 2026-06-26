@@ -41,6 +41,8 @@ import {
   cameraPosition,
   smoothstep,
   mx_noise_vec3,
+  Fn,
+  If,
 } from 'three/tsl';
 
 /**
@@ -190,20 +192,28 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     mat.normalNode = nGeom;
   } else {
     // ── Surface detail (fades in with proximity, on the morph's schedule) ───────
-    // ONE octave only. The mx_noise_vec3 is the per-fragment fill-rate bottleneck (the real cause of the
-    // choppiness — ?nodetail was buttery), and it's evaluated for EVERY on-screen terrain pixel. The fine
-    // 6 m octave only shows within ~6 km of the surface, so dropping it (was two mx_noise_vec3) halves the
-    // noise cost everywhere for a detail band that's rarely on screen. Combined with the lower default pixel
-    // ratio (scene.ts), this clears the GPU budget. (A per-fragment branch to skip the noise entirely at
-    // range needs TSL Fn/If control flow — deferred; this unconditional halving is the robust win.)
+    // ONE octave only (the fine 6 m octave was dropped — it only shows within ~6 km, rarely on screen).
     // Stable, float-precise absolute coordinate (see header): render-space position + renderOrigin mod L.
     const pDetail = positionWorld.add(uDetailPhase);
     // Weight: tie to the geometry morph (off where geometry collapses to its parent, so the two never fight)
     // AND a distance gate (anti-alias: 0 before the feature drops below a pixel).
     const morphW = mFinal.oneMinus(); // 1 near (full geometry detail) → 0 far (parent)
     const wA = morphW.mul(smoothstep(DETAIL_A_FAR_M, DETAIL_A_NEAR_M, dist));
-    // One gradient-noise vec3 (≈[-1,1]³), reused for albedo mottle + normal perturbation.
-    const ndA = mx_noise_vec3(pDetail.mul(1 / DETAIL_A_SCALE_M));
+    // One gradient-noise vec3 (≈[-1,1]³), reused for albedo mottle + normal perturbation — but the
+    // mx_noise_vec3 is the dominant per-fragment fill-rate cost (?nodetail was buttery) and at orbit/altitude
+    // its weight wA is 0, so evaluating it there is pure wasted fill. Gate it behind a per-fragment branch:
+    // a Fn establishes the build stack If() needs (calling If during top-level material construction has no
+    // stack → the earlier "Cannot read properties of null (reading 'If')"), and the compiler emits a REAL
+    // WGSL `if`, so the noise is genuinely SKIPPED where wA≈0 — not hoisted. The branch is coherent per-leaf
+    // (wA is a distance/morph function, ~constant across a leaf), so GPU divergence is negligible. Returns 0
+    // when skipped, matching the ×wA≈0 contribution it would otherwise have produced.
+    const ndA = Fn(() => {
+      const out = vec3(0).toVar();
+      If(wA.greaterThan(0.001), () => {
+        out.assign(mx_noise_vec3(pDetail.mul(1 / DETAIL_A_SCALE_M)));
+      });
+      return out;
+    })();
 
     // Albedo mottle: ±detail near, fading to the flat band colour with distance.
     const mottle = ndA.x.mul(wA).mul(0.22);
