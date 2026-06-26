@@ -192,9 +192,31 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
   shallow (≤ live+1) cut. Pure core funcs unchanged (only the call order in `update()`); all 91 goldens
   unchanged. Headless `?lodaudit`: `maxNbrΔ=1` on every cut line, the front still climbs one level per
   generation `{2,3}→…→{2,3,4,5,6,7,8}`, `fresh=0` — gated incremental refinement fully preserved, just
-  cheaper. (commit `8c3ef1f`.) ⚠️ **Real-GPU confirm:** `?perf` at orbit → `worstDt < 16.67 ms` (idle floor,
-  C1); zooming in/out → no more 19–20 ms `recut` spikes (C2). If still short of locked 60, the deferred
-  levers are numeric region keys in `balanceCut`/`coveringDepth` and moving cut-selection to a worker.
+  cheaper. (commit `8c3ef1f`.)
+
+- **Locked-60 follow-up #2 — the idle floor IS the vsync cadence + numeric region keys (same session/branch):**
+  the next real-GPU `?perf` reframed the problem. **The idle ~17.6 ms floor is the display/vsync cadence, NOT
+  GPU cost** — proof: at idle (96 draws) `gpu/other≈17.6`, but at deep zoom (433 draws, *more* geometry)
+  `gpu/other` *drops* to ~8 ms because the ~9 ms recut ate into it; GPU work can't fall as geometry rises, so
+  most of the idle "17.6" is vsync idle-wait (the GPU has ~8 ms of work in a ~17.6 ms frame = large headroom).
+  That's why **C1 didn't move the idle floor** (idle was never GPU-bound — C1 stays, it's correct and buys
+  close-range headroom). **C2 helped the recut but didn't finish it** — still ~9–12 ms at 400–445 leaves
+  (worst on zoom-OUT, where the clamp rebuilds `coverRegion` from all live leaves), the 18–21 ms worst-frames
+  while zooming. Root cause: the hot cut Sets were keyed by freshly-concatenated **strings** (`coveringDepth`
+  runs 12× per leaf per balance pass; clamp's `coverRegion` is O(live×maxDepth) prefixes rebuilt every recut)
+  → ~10⁵ string allocations/recut = GC churn, not algorithmic work. Fix (**C3**): pack each region
+  (face, path digits, depth) into a single JS-safe integer (`packRegion`, `< 2³⁷`, injective — depth encoded
+  explicitly so `[]`/`[0]`/`[0,0]` never collide; `assertRegionDepth ≤ 15` guards a future `MAX_DEPTH` bump),
+  Sets become `Set<number>`, and `coveringDepth` builds the key incrementally (no per-level alloc). Converted
+  `balanceCut`/`coveringDepth`/`maxNeighborDepth`/`maxNeighborDelta`/`clampCutToReachableFrontier`/`selectCut`
+  backfill in `src/core/quadtree.ts`. **Byte-identical cuts** — all 91 tests pass unchanged (the bit-identical
+  gate); headless `?lodaudit` is identical to C2 (`maxNbrΔ=1`, same leaf counts per step, `fresh=0`). A/B
+  micro-bench (clamp+balance on a 724-leaf deep-zoom cut): **string 28.4 ms → integer 3.4 ms (~8.3×)**,
+  identical output. At the user's ~430-leaf zoom regime this drops the recut spike from ~9–12 ms to ~1–2 ms.
+  (commit `0f8f3b7`.) ⚠️ **Real-GPU confirm:** `?perf` while zooming — `recut=` should stay single-digit and
+  the 18–21 ms zoom worst-frames drop under the cadence; idle stays ~17.6 ms (that's the *display* cadence —
+  not a regression; if the panel is ~57 Hz, 17.6 ms is already "locked to the display"). Deferred fallback if
+  the recut still bites: move cut-selection to a worker (it's pure/worker-safe).
 
 Measured-good on WebGPU (build the user ran): orbit→surface descent holds 60 fps / ~16.8 ms,
 `cov=96/96 holes=0` throughout, `fresh=0 refine=N` (sharpen-in-place, no pop), `bornM≈1.0`, largest cut ~466
