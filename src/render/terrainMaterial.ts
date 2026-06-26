@@ -106,6 +106,9 @@ export interface TerrainMaterialOpts {
   wireframe?: boolean;
   /** ?slopeband=N: index into SLOPE_PRESETS for the slope-band look (default 0 = current). */
   slopePreset?: number;
+  /** ?nodetail: build WITHOUT the two per-pixel mx_noise_vec3 (+ mottle + normal perturbation) — a GPU
+   *  fill-rate probe / cheap fallback. Geometry morph + slope-band albedo are kept. */
+  noDetail?: boolean;
 }
 
 export interface TerrainMaterialHandle {
@@ -172,19 +175,7 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     mFinal,
   ).normalize();
 
-  // ── Surface detail (fades in with proximity, on the morph's schedule) ───────
-  // Stable, float-precise absolute coordinate (see header): render-space position + renderOrigin mod L.
-  const pDetail = positionWorld.add(uDetailPhase);
-  // Per-octave weight: tie to the geometry morph (off where geometry collapses to its parent, so the
-  // two never fight) AND a distance gate (anti-alias: 0 before the feature drops below a pixel).
-  const morphW = mFinal.oneMinus(); // 1 near (full geometry detail) → 0 far (parent)
-  const wA = morphW.mul(smoothstep(DETAIL_A_FAR_M, DETAIL_A_NEAR_M, dist));
-  const wB = morphW.mul(smoothstep(DETAIL_B_FAR_M, DETAIL_B_NEAR_M, dist));
-  // One gradient-noise vec3 per octave (≈[-1,1]³), reused for albedo mottle + normal perturbation.
-  const ndA = mx_noise_vec3(pDetail.mul(1 / DETAIL_A_SCALE_M));
-  const ndB = mx_noise_vec3(pDetail.mul(1 / DETAIL_B_SCALE_M));
-
-  // Slope material bands. up = per-pixel radial direction (precision-robust: direction of a huge
+  // Slope material bands (always). up = per-pixel radial direction (precision-robust: direction of a huge
   // vector). slope=1 where the surface faces straight up (flat) → sand; lower → rock.
   const up = positionWorld.add(uRenderOrigin).normalize();
   const slope = nGeom.dot(up).clamp(0, 1);
@@ -192,25 +183,48 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
   const band = smoothstep(sb.lo, sb.hi, slope);
   const albedo = mix(vec3(...sb.rock), vec3(...sb.sand), band);
 
-  // Albedo mottle: ±detail near, fading to the flat band colour with distance (matches the coarse
-  // look you saw from higher up → continuous, no pop).
-  const mottle = ndA.x.mul(wA).mul(0.22).add(ndB.x.mul(wB).mul(0.28));
-  mat.colorNode = albedo.mul(mottle.add(1));
-  // Gentle roughness break-up so the surface doesn't read as one uniform sheen up close.
-  mat.roughnessNode = float(0.92).sub(ndB.y.mul(wB).mul(0.08)).clamp(0.4, 1);
+  if (opts.noDetail) {
+    // GPU fill-rate probe / cheap fallback: no procedural detail at all (the two mx_noise_vec3, the mottle,
+    // and the normal perturbation are NOT in the compiled shader). Just the morph normal + slope-band albedo.
+    mat.colorNode = albedo;
+    mat.roughnessNode = float(0.92);
+    mat.normalNode = nGeom;
+  } else {
+    // ── Surface detail (fades in with proximity, on the morph's schedule) ───────
+    // Stable, float-precise absolute coordinate (see header): render-space position + renderOrigin mod L.
+    const pDetail = positionWorld.add(uDetailPhase);
+    // Per-octave weight: tie to the geometry morph (off where geometry collapses to its parent, so the
+    // two never fight) AND a distance gate (anti-alias: 0 before the feature drops below a pixel).
+    const morphW = mFinal.oneMinus(); // 1 near (full geometry detail) → 0 far (parent)
+    const wA = morphW.mul(smoothstep(DETAIL_A_FAR_M, DETAIL_A_NEAR_M, dist));
+    const wB = morphW.mul(smoothstep(DETAIL_B_FAR_M, DETAIL_B_NEAR_M, dist));
+    // One gradient-noise vec3 per octave (≈[-1,1]³), reused for albedo mottle + normal perturbation.
+    const ndA = mx_noise_vec3(pDetail.mul(1 / DETAIL_A_SCALE_M));
+    const ndB = mx_noise_vec3(pDetail.mul(1 / DETAIL_B_SCALE_M));
 
-  // Normal perturbation: tilt the morph normal by the TANGENTIAL part of the detail noise (remove the
-  // along-normal component so it tilts, not inflates), weighted so it vanishes exactly where geometry
-  // morphs to the parent. Gives the surface fine relief shading up close, smoothing out with distance.
-  const pert = ndA.mul(wA).add(ndB.mul(wB));
-  const pertTang = pert.sub(nGeom.mul(pert.dot(nGeom)));
-  mat.normalNode = nGeom.add(pertTang.mul(0.2)).normalize();
+    // Albedo mottle: ±detail near, fading to the flat band colour with distance (matches the coarse
+    // look you saw from higher up → continuous, no pop).
+    const mottle = ndA.x.mul(wA).mul(0.22).add(ndB.x.mul(wB).mul(0.28));
+    mat.colorNode = albedo.mul(mottle.add(1));
+    // Gentle roughness break-up so the surface doesn't read as one uniform sheen up close.
+    mat.roughnessNode = float(0.92).sub(ndB.y.mul(wB).mul(0.08)).clamp(0.4, 1);
+
+    // Normal perturbation: tilt the morph normal by the TANGENTIAL part of the detail noise (remove the
+    // along-normal component so it tilts, not inflates), weighted so it vanishes exactly where geometry
+    // morphs to the parent. Gives the surface fine relief shading up close, smoothing out with distance.
+    const pert = ndA.mul(wA).add(ndB.mul(wB));
+    const pertTang = pert.sub(nGeom.mul(pert.dot(nGeom)));
+    mat.normalNode = nGeom.add(pertTang.mul(0.2)).normalize();
+  }
 
   // Bias the finer leaf toward the camera so it wins the depth test over a coarser ancestor still
-  // retained for the brief moment until purge (surfaces match there, so nothing fights).
-  mat.polygonOffset = true;
-  mat.polygonOffsetFactor = -1;
-  mat.polygonOffsetUnits = -1;
+  // retained for the brief moment until purge (surfaces match there, so nothing fights). NOT in wireframe:
+  // WebGPU rejects a non-zero depthBias on LineList topology (the ?wire pipeline errors out otherwise).
+  if (!opts.wireframe) {
+    mat.polygonOffset = true;
+    mat.polygonOffsetFactor = -1;
+    mat.polygonOffsetUnits = -1;
+  }
 
   return {
     material: mat,

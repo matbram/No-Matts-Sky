@@ -107,6 +107,7 @@ export interface ManagerOpts {
   workers?: number; // pool size (default: min(10, cores-1))
   wireframe?: boolean; // debug: render the shared terrain material as wireframe (?wire)
   slopePreset?: number; // ?slopeband=N: slope-band look preset (index into SLOPE_PRESETS; default 0 = current)
+  noDetail?: boolean; // ?nodetail: build the terrain material without the per-pixel mx_noise detail (GPU probe)
   skirts?: boolean; // enable LOD-transition skirts (default OFF — the apron already covers
   // holes at LOD transitions, and the skirts were the visible boundary grid; ?skirt re-enables)
   debugColor?: 'lod' | 'skirt' | 'morph'; // debug tint: LOD level / skirted leaves / morph progress
@@ -229,7 +230,7 @@ export class QuadtreeManager {
     this.heightMargin = recipe.height * 1.6;
     // The ONE shared terrain material (per-leaf data rides in the `aLevel` attribute); its kDist
     // uniform is updated each frame via setMorphParams.
-    const handle = createTerrainMaterial({ wireframe: opts.wireframe, slopePreset: opts.slopePreset });
+    const handle = createTerrainMaterial({ wireframe: opts.wireframe, slopePreset: opts.slopePreset, noDetail: opts.noDetail });
     this.sharedMat = handle.material;
     this.kDistUniform = handle.kDist;
     this.matRenderOrigin = handle.renderOrigin;

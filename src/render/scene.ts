@@ -181,7 +181,15 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     logarithmicDepthBuffer: useLog,
     reversedDepthBuffer: useRevz,
   });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  // Pixel ratio (fill-rate lever): on a HiDPI/Retina display devicePixelRatio is 2, so we shade 4× the
+  // fragments — the dominant cost when the terrain shader fills the viewport. ?dpr=N overrides the cap so we
+  // can measure/trade fragment cost vs sharpness (e.g. ?dpr=1 quarters the fragments on Retina). Default 2.
+  const dprCap = (() => {
+    const v = parseFloat(params.get('dpr') ?? '');
+    return Number.isFinite(v) && v > 0 ? v : 2;
+  })();
+  const effPixelRatio = Math.min(window.devicePixelRatio, dprCap);
+  renderer.setPixelRatio(effPixelRatio);
   renderer.toneMapping = ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
   // CRITICAL (CLAUDE.md §2): WebGPURenderer init is async — await before render.
@@ -199,6 +207,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   );
   console.log('[NMS] renderer backend:', be?.constructor?.name, '| isWebGPUBackend:', be?.isWebGPUBackend);
   console.log('[NMS] depth:', { logarithmicDepthBuffer: useLog, reversedDepthBuffer: useRevz, forceWebGL: useWebGL });
+  console.log('[NMS] pixelRatio:', { devicePixelRatio: window.devicePixelRatio, cap: dprCap, effective: effPixelRatio });
   console.log('[NMS] debug toggles:', {
     noback: params.has('noback'),
     wire: params.has('wire'),
@@ -253,6 +262,9 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     // ?slopeband=N: pick a slope-band "look" preset (0=current/hard, 1=wide, 2=low-contrast, 3=soft).
     // Render-only cosmetic; default 0 leaves today's look unchanged.
     slopePreset: Number(params.get('slopeband')) || 0,
+    // ?nodetail: GPU probe — build the terrain material WITHOUT the two per-pixel mx_noise_vec3 (+ mottle
+    // + normal perturbation). If this collapses gpu/other, the procedural noise is the fill-rate cost.
+    noDetail: params.has('nodetail'),
     // Always-resident coarse base: the whole sphere stays meshed at BASE_DEPTH so every
     // finer leaf morphs from a real parent (no fresh-over-backdrop pop). The static inset
     // backdrop stays as the ultimate below-everything filler (startup / frustum-edge gaps).
