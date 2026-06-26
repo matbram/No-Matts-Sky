@@ -244,3 +244,145 @@ export function meshChunk(
     key: chunkKey(req),
   };
 }
+
+/** Swap discontinuity at a one-level LOD refinement (metres + degrees). */
+export interface SwapDelta {
+  dPosMax: number; // worst surface-position gap (m) over the sampled points
+  dPosAvg: number;
+  dNrmMaxDeg: number; // worst normal-direction gap (deg) over the sampled points
+  dNrmAvgDeg: number;
+  samples: number;
+}
+
+/**
+ * DIAGNOSTIC (not on the mesher hot path): how far a child leaf's morph=1 state
+ * departs from the parent leaf it replaces, the instant it swaps in.
+ *
+ * The premise of the geomorph is that a child born at morph=1 is INVISIBLE — it
+ * should be exactly the coarse parent leaf it covers. But the mesher bakes the
+ * child's morph target as the one-octave-coarser field sampled on the CHILD's finer
+ * grid (chunk.ts:136/174), while the parent leaf is that SAME field sampled on the
+ * PARENT's coarser grid. Both approximate the same continuous surface, so any
+ * difference is pure grid-discretization — this measures it (the suspected source of
+ * the per-leaf "step" the user sees on zoom-in, since position morph is smooth).
+ *
+ * For `req` = the child {face, path, lod} (parent = path[:-1], lod-1), sample a
+ * perAxis×perAxis spread of PARENT-CELL CENTRES across the child's uv rect — the
+ * points where the child's new (in-between) grid vertices sit, the only places its
+ * morph=1 surface can differ from the parent (vertices that DO coincide with a parent
+ * grid point are trivially equal, so probing those just reports a false zero). At each
+ * sample, BOTH surfaces are built from the shared parent-octave field
+ * `octParent = lodOctaves(recipe, lod-1)`:
+ *   • child morph=1 — the field evaluated AT the cell-centre direction (the fine child
+ *     grid carries a vertex there), giving surface radius + analytic normal;
+ *   • parent leaf — the field bilinearly interpolated from the 4 surrounding parent-grid
+ *     corners (the coarse, piecewise-linear mesh the parent leaf actually carries there).
+ * Returns the max/avg position gap (m) and normal gap (deg). Pure + deterministic. The
+ * gap is the high-frequency detail the child resolves but the parent can't ≈ the dropped
+ * octave's local amplitude — i.e. the geometric size of the swap pop.
+ *
+ * Large dNrm (≳ several °) and/or dPos (≳ a few m) ⇒ the morph target does NOT
+ * reproduce the parent → fix the mesher. ≈0 ⇒ the swap is clean and the visible
+ * "step" is the slope-band shader threshold amplifying the per-leaf normal morph.
+ */
+export function swapDelta(
+  req: ChunkRequest,
+  recipe: TerrainRecipe,
+  radius: number,
+  tan: number = CHUNK_GRID_TANGENTIAL,
+  perAxis = 4,
+): SwapDelta {
+  // No parent → nothing swaps (root/base leaf). Report zero.
+  if (req.path.length === 0) {
+    return { dPosMax: 0, dPosAvg: 0, dNrmMaxDeg: 0, dNrmAvgDeg: 0, samples: 0 };
+  }
+  const child = uvRectFromPath(req.path);
+  const parent = uvRectFromPath(req.path.slice(0, -1));
+  const octParent = lodOctaves(recipe, req.lod - 1); // the SAME octave field both surfaces use
+  const scale = recipe.noiseScale;
+  const height = recipe.height;
+  const pdu = (parent.u1 - parent.u0) / tan; // parent grid spacing (2× coarser than the child's)
+  const pdv = (parent.v1 - parent.v0) / tan;
+
+  const t = new Float64Array(4);
+  const d = new Float64Array(4);
+
+  // Surface point + outward analytic normal of the octParent field at face-(u,v).
+  const surf = (u: number, v: number, pos: Float64Array, nrm: Float64Array): void => {
+    const dir = faceDirection(req.face, u, v);
+    terrainAt(recipe, dir[0] * scale, dir[1] * scale, dir[2] * scale, t, undefined, octParent);
+    const r = radius + height * t[0]!;
+    pos[0] = dir[0] * r;
+    pos[1] = dir[1] * r;
+    pos[2] = dir[2] * r;
+    assembleDensity(radius, r, dir[0], dir[1], dir[2], t[0]!, t[1]!, t[2]!, t[3]!, height, scale, d);
+    const gx = -d[1]!, gy = -d[2]!, gz = -d[3]!;
+    const ln = 1 / Math.sqrt(gx * gx + gy * gy + gz * gz + 1e-30);
+    nrm[0] = gx * ln;
+    nrm[1] = gy * ln;
+    nrm[2] = gz * ln;
+  };
+
+  const cPos = new Float64Array(3), cNrm = new Float64Array(3);
+  const p00 = new Float64Array(3), p10 = new Float64Array(3), p01 = new Float64Array(3), p11 = new Float64Array(3);
+  const n00 = new Float64Array(3), n10 = new Float64Array(3), n01 = new Float64Array(3), n11 = new Float64Array(3);
+
+  // The child rect is exactly one quadrant of the parent, so its edges land on parent grid
+  // lines (dyadic). It spans `cellsU×cellsV` whole parent cells (= tan/2 each). Walk a spread
+  // of those cells and sample each one's CENTRE — tu=tv=0.5, the in-between child vertex and the
+  // worst case for the parent's bilinear interpolation, hence the meaningful swap gap.
+  const baseGiu = Math.round((child.u0 - parent.u0) / pdu);
+  const baseGiv = Math.round((child.v0 - parent.v0) / pdv);
+  const cellsU = Math.max(1, Math.round((child.u1 - child.u0) / pdu));
+  const cellsV = Math.max(1, Math.round((child.v1 - child.v0) / pdv));
+
+  let dPosMax = 0, dPosSum = 0, dNrmMax = 0, dNrmSum = 0, count = 0;
+
+  for (let a = 0; a < perAxis; a++) {
+    const giu = baseGiu + Math.min(cellsU - 1, Math.floor(((a + 0.5) * cellsU) / perAxis));
+    const cu0 = parent.u0 + pdu * giu;
+    const su = cu0 + pdu * 0.5; // parent-cell centre in u
+    for (let b = 0; b < perAxis; b++) {
+      const giv = baseGiv + Math.min(cellsV - 1, Math.floor(((b + 0.5) * cellsV) / perAxis));
+      const cv0 = parent.v0 + pdv * giv;
+      const sv = cv0 + pdv * 0.5; // parent-cell centre in v
+
+      // Child morph=1 surface: the field at the in-between vertex (the child grid carries it).
+      surf(su, sv, cPos, cNrm);
+
+      // Parent leaf surface: bilinear of the 4 surrounding parent-grid corners. At the cell
+      // centre the four weights are equal (0.25), so this is their plain average.
+      surf(cu0, cv0, p00, n00);
+      surf(cu0 + pdu, cv0, p10, n10);
+      surf(cu0, cv0 + pdv, p01, n01);
+      surf(cu0 + pdu, cv0 + pdv, p11, n11);
+      const px = 0.25 * (p00[0]! + p10[0]! + p01[0]! + p11[0]!);
+      const py = 0.25 * (p00[1]! + p10[1]! + p01[1]! + p11[1]!);
+      const pz = 0.25 * (p00[2]! + p10[2]! + p01[2]! + p11[2]!);
+      let nx = n00[0]! + n10[0]! + n01[0]! + n11[0]!;
+      let ny = n00[1]! + n10[1]! + n01[1]! + n11[1]!;
+      let nz = n00[2]! + n10[2]! + n01[2]! + n11[2]!;
+      const nl = 1 / Math.sqrt(nx * nx + ny * ny + nz * nz + 1e-30);
+      nx *= nl; ny *= nl; nz *= nl;
+
+      const dPos = Math.hypot(cPos[0]! - px, cPos[1]! - py, cPos[2]! - pz);
+      let dot = cNrm[0]! * nx + cNrm[1]! * ny + cNrm[2]! * nz;
+      if (dot > 1) dot = 1; else if (dot < -1) dot = -1;
+      const dNrm = (Math.acos(dot) * 180) / Math.PI;
+
+      if (dPos > dPosMax) dPosMax = dPos;
+      if (dNrm > dNrmMax) dNrmMax = dNrm;
+      dPosSum += dPos;
+      dNrmSum += dNrm;
+      count++;
+    }
+  }
+
+  return {
+    dPosMax,
+    dPosAvg: count ? dPosSum / count : 0,
+    dNrmMaxDeg: dNrmMax,
+    dNrmAvgDeg: count ? dNrmSum / count : 0,
+    samples: count,
+  };
+}

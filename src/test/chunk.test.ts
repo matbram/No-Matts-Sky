@@ -8,7 +8,7 @@ import {
   surfaceAt,
   type TerrainRecipe,
 } from '../core/density.ts';
-import { meshChunk, uvRectFromPath, chunkKey, type ChunkRequest } from '../core/chunk.ts';
+import { meshChunk, uvRectFromPath, chunkKey, swapDelta, type ChunkRequest } from '../core/chunk.ts';
 import { surfaceNets, type SampledField } from '../core/surfacenets.ts';
 import { faceDirection } from '../core/cubesphere.ts';
 import { EARTH_RADIUS_M } from '../core/constants.ts';
@@ -470,6 +470,71 @@ describe('meshChunk morph targets (LOD geomorph)', () => {
     field.cornerMorphPos = cornerPos.slice();
     const m2 = surfaceNets(field, [0, 0, 0]);
     expect(fnv1a(m2.morphTargets)).toBe(fnv1a(m2.positions));
+  });
+});
+
+describe('swapDelta (LOD refinement swap discontinuity — diagnostic)', () => {
+  // The instant a child leaf streams in at morph=1 it should be invisible: exactly the
+  // coarse parent leaf it covers. swapDelta measures how far it actually departs — the
+  // suspected source of the per-leaf "step" on zoom-in. It compares the child's morph=1
+  // surface (the parent-octave field at the fine child grid) to the parent leaf (that SAME
+  // field at the coarse parent grid). Pure + deterministic so it can be reasoned about.
+  const child: ChunkRequest = { face: 2, path: [2, 1], lod: 2 };
+
+  it('is deterministic: same request → identical deltas', () => {
+    expect(swapDelta(child, RECIPE, R)).toEqual(swapDelta(child, RECIPE, R));
+  });
+
+  it('reports a full sample grid with non-degenerate, in-range deltas', () => {
+    const d = swapDelta(child, RECIPE, R, 32, 4);
+    expect(d.samples).toBe(16); // perAxis² = 4×4
+    // The probe must be NON-degenerate: a child mesh built at 2× the parent grid genuinely
+    // departs from the parent at the in-between vertices, so the gap is strictly positive
+    // (a zero here meant we accidentally sampled only parent grid lines → false "clean swap").
+    expect(d.dPosMax).toBeGreaterThan(0);
+    expect(d.dPosAvg).toBeGreaterThan(0);
+    expect(d.dPosAvg).toBeLessThanOrEqual(d.dPosMax);
+    // …and bounded by the terrain's peak-to-peak relief — it's the detail the coarse parent
+    // grid can't represent (missing fine surface), NOT a structural hole/NaN. The gap is large
+    // at coarse refinements (a big parent cell undersamples its own octaves) and shrinks with
+    // depth as cells get fine relative to feature size — see the per-depth log on a real zoom.
+    expect(d.dPosMax).toBeLessThan(2 * RECIPE.height);
+    expect(d.dNrmMaxDeg).toBeGreaterThan(0);
+    expect(d.dNrmMaxDeg).toBeLessThanOrEqual(180);
+    expect(d.dNrmAvgDeg).toBeLessThanOrEqual(d.dNrmMaxDeg);
+  });
+
+  it('is the zero delta at the root (no parent to swap from)', () => {
+    const root: ChunkRequest = { face: 0, path: [], lod: 0 };
+    expect(swapDelta(root, RECIPE, R)).toEqual({
+      dPosMax: 0,
+      dPosAvg: 0,
+      dNrmMaxDeg: 0,
+      dNrmAvgDeg: 0,
+      samples: 0,
+    });
+  });
+
+  it('matches recorded deltas (FROZEN) — re-bless only on a deliberate mesher change', () => {
+    // Rounded so the snapshot is readable and robust to last-ULP float drift; the
+    // determinism test above pins the exact (unrounded) reproducibility.
+    const d = swapDelta(child, RECIPE, R, 32, 4);
+    const r2 = (x: number): number => Math.round(x * 100) / 100;
+    expect({
+      dPosMax: r2(d.dPosMax),
+      dPosAvg: r2(d.dPosAvg),
+      dNrmMaxDeg: r2(d.dNrmMaxDeg),
+      dNrmAvgDeg: r2(d.dNrmAvgDeg),
+      samples: d.samples,
+    }).toMatchInlineSnapshot(`
+      {
+        "dNrmAvgDeg": 14.73,
+        "dNrmMaxDeg": 32.33,
+        "dPosAvg": 2038.21,
+        "dPosMax": 7130.83,
+        "samples": 16,
+      }
+    `);
   });
 });
 

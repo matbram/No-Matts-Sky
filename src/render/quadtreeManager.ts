@@ -27,7 +27,7 @@ import {
   type CameraView,
   type QuadNode,
 } from '../core/quadtree.ts';
-import { chunkKey, uvRectFromPath, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
+import { chunkKey, uvRectFromPath, swapDelta, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
 import { faceDirection, wrapFaceUV, CUBE_FACES } from '../core/cubesphere.ts';
 import { lodOctaves, terrainAt, type TerrainRecipe } from '../core/density.ts';
 import {
@@ -182,6 +182,15 @@ export class QuadtreeManager {
   private floorWinsMaxWin = 0; // peak floorWins% across frames since the last [NMS step] log (A is a WAVE,
   // not a per-frame snap — a batch held at the floor fades together — so a single log-tick snapshot can
   // miss it; the window peak catches it).
+  // [NMS step] swap-delta (the decisive measurement): per REFINEMENT leaf going live, how far its morph=1
+  // surface departs from the parent leaf it replaces (swapDelta in /core). Accumulated max/avg over the
+  // window, reset at each log. Large ⇒ the morph target doesn't reproduce the parent (mesher fix); ≈0 ⇒
+  // the swap is clean and the visible step is the slope-band threshold (shader fix).
+  private swapDPosMax = 0;
+  private swapDNrmMax = 0;
+  private swapDPosSum = 0;
+  private swapDNrmSum = 0;
+  private swapN = 0;
   // CDLOD geomorph: ONE shared material (createTerrainMaterial) carries the per-vertex distance
   // morph; its kDist uniform = (viewportHeight/(2·tan(fovY/2)))/splitPx — the same projected-size
   // constant selectCut uses, so the morph band aligns with the split distance (set per frame by the
@@ -583,16 +592,28 @@ export class QuadtreeManager {
             .map((c, d) => (c ? `${d}:${c}` : ''))
             .filter(Boolean)
             .join(',');
+          // swap-delta (decisive): the morph=1 child-vs-parent discontinuity over the refinements this
+          // window. dNrm large (≳ several °) and/or dPos large (≳ a few m) ⇒ the morph target doesn't
+          // reproduce the parent leaf → mesher fix; ≈0 ⇒ a clean swap, so the visible step is the
+          // slope-band shader threshold amplifying the per-leaf normal morph → shader fix.
+          const swDPosAvg = this.swapN > 0 ? this.swapDPosSum / this.swapN : 0;
+          const swDNrmAvg = this.swapN > 0 ? this.swapDNrmSum / this.swapN : 0;
           console.log(
             `[NMS step] A:floorWins=${fw.toFixed(0)}%(peak ${this.floorWinsMaxWin.toFixed(0)}%) lift=${fl.toFixed(2)} age=${fa}ms snap=${this.snapCount}(floor ${this.snapFloor}) | ` +
               `B:bornHist[≥.9=${this.bornHist[0]}/.7=${this.bornHist[1]}/.3=${this.bornHist[2]}/<.3=${this.bornHist[3]}] ` +
               `pf=${pfKm.toFixed(2)}km need=${(needM / 1000).toFixed(2)}km pfAdeq=${pfAdeq === Infinity ? '∞' : pfAdeq.toFixed(2)} | ` +
-              `C:new[${nbd || 'none'}] | D:${this.nearDetailStr()}`,
+              `C:new[${nbd || 'none'}] | D:${this.nearDetailStr()} | ` +
+              `swap[dPos=${this.swapDPosMax.toFixed(1)}m(avg ${swDPosAvg.toFixed(1)}) dNrm=${this.swapDNrmMax.toFixed(1)}°(avg ${swDNrmAvg.toFixed(1)}) n=${this.swapN}]`,
           );
           this.snapCount = 0;
           this.snapFloor = 0;
           this.floorWinsMaxWin = 0;
           this.newByDepth.length = 0;
+          this.swapDPosMax = 0;
+          this.swapDNrmMax = 0;
+          this.swapDPosSum = 0;
+          this.swapDNrmSum = 0;
+          this.swapN = 0;
         }
       }
     }
@@ -870,8 +891,20 @@ export class QuadtreeManager {
             break;
           }
         }
-        if (covered) this.refineThisCut++;
-        else {
+        if (covered) {
+          this.refineThisCut++;
+          // [NMS step] swap-delta: only a REFINEMENT (live ancestor present) actually "swaps" a parent
+          // for a child at morph=1; measure that discontinuity. Gated to ?lodaudit (the [NMS step] line);
+          // bounded by the per-frame upload budget, so the per-leaf swapDelta eval is affordable here.
+          if (this.opts.debugAudit && depth > 0) {
+            const sd = swapDelta({ face: e.node.face, path: e.node.path, lod: depth }, this.recipe, this.radius);
+            if (sd.dPosMax > this.swapDPosMax) this.swapDPosMax = sd.dPosMax;
+            if (sd.dNrmMaxDeg > this.swapDNrmMax) this.swapDNrmMax = sd.dNrmMaxDeg;
+            this.swapDPosSum += sd.dPosAvg;
+            this.swapDNrmSum += sd.dNrmAvgDeg;
+            this.swapN++;
+          }
+        } else {
           this.freshThisCut++;
           freshThisFrame++;
           if (depth < freshDepthMin) freshDepthMin = depth;

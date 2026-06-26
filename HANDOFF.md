@@ -166,7 +166,16 @@ leaves (no spike), no rAF `[Violation]` stalls.
   can't miss it); **B** `bornHist[≥.9/.7/.3/<.3]` + `pfAdeq` = leaves arriving late (mass in `<.3`, lead <
   need) → snap in part-detailed; **C** `new[depth:count]` = a whole LOD level arriving in one recut burst;
   **D** `mNear/wMorph/gA/gB` = whether the surface texture steps independently of the geometry morph (gA/gB
-  are smooth in distance, so if texture steps it's `wMorph` = the morph, i.e. the same root as A/B).
+  are smooth in distance, so if texture steps it's `wMorph` = the morph, i.e. the same root as A/B);
+  **swap** `[dPos=Xm(avg) dNrm=Y°(avg) n=N]` = the **decisive** measurement — per refinement leaf going live,
+  how far its morph=1 surface departs from the parent leaf it replaces (`swapDelta` in `/core`, sampled at
+  parent-cell centres where the child's new in-between vertices sit). The geomorph assumes morph=1 is
+  invisible (== the parent), but the morph target is the coarser field on the CHILD's finer grid, so it
+  resolves detail the coarse parent grid couldn't. **Large `dNrm`/`dPos` ⇒ the morph target doesn't reproduce
+  the parent → mesher fix** (make morph=1 a true parent-grid no-op); **≈0 ⇒ a clean swap, so the visible step
+  is the slope-band shader threshold amplifying the normal morph → shader fix.** The gap is large at coarse
+  refinements (a big parent cell undersamples its octaves) and shrinks with depth, so read it at the depths a
+  real zoom refines through (`C:new[...]`), not the coarse early levels.
 - **The HUD overlay** now also shows `worst <ms>` + a `⚠ N jank` count and goes RED on any hitch — the
   smoothed "fps" alone hid the stutter. **`maxNbrΔ`** is now the ACCURATE fine-probe metric (the old
   quarter-cell probe over-reported, e.g. `=4` on cuts that were already 2:1 balanced).
