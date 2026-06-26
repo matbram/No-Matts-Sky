@@ -134,14 +134,26 @@ leaves (no spike), no rAF `[Violation]` stalls.
   = graded, bimodal = boundary steps); **`stream`** = pending/inflight/ready/live + worker busy + ms/leaf;
   **`pf/band`** = prefetch ÷ morph-band width (want >0.1 at altitude).
 - `[NMS pop] fresh=N depth=a..b` — fires when leaves appear over the backdrop (the residual pop).
+- `[NMS perf] worstDt= recut= upload= tick= gpu/other= | live=Ndraws churn=/s | approach= inst= prefetch=`
+  (`?perf`) — the spike breakdown the smoothed FPS overlay hides. `worstDt` = worst frame in the window;
+  the four stage times say WHICH main-thread step spiked (`recut`=update/selectCut/balanceCut,
+  `upload`=GPU upload, `tick`, `gpu/other`=dt minus measured = GPU/vsync). `live=Ndraws` = leaf count =
+  draw calls (aim well under the cut ballooning); `churn` = meshes created+disposed/s (high = thrash).
+- **The HUD overlay** now also shows `worst <ms>` + a `⚠ N jank` count and goes RED on any hitch — the
+  smoothed "fps" alone hid the stutter. **`maxNbrΔ`** is now the ACCURATE fine-probe metric (the old
+  quarter-cell probe over-reported, e.g. `=4` on cuts that were already 2:1 balanced).
 
 Key tunables in `scene.ts`: `BASE_DEPTH=2`, `PREFETCH_MAX_FRAC=0.35`, `PREFETCH_FLOOR_M=3000`,
-`PREFETCH_CEIL_M=200000`, `PREFETCH_S=1.0`, `RECUT_MAX_MS=200`, `RECUT_MIN_MOVE_M=1`, `maxDepth=15`
-(~9.5 m cells). In `terrainMaterial.ts`: `MORPH_START_FRAC=0.30` (the CDLOD fade-band start, shared by the
-TSL graph + the CPU mirror), and the detail dials — `DETAIL_PHASE_MOD_M=100000`, `DETAIL_A_SCALE_M=40`
-(coarse mottle, fades ~50 km→1 km), `DETAIL_B_SCALE_M=6` (fine grain, fades ~6 km→200 m), plus the `SAND`/
-`ROCK` band palette. Debug flags (URL query): `?lodaudit ?lodmorphdebug ?morphcolor ?wire ?lodcolor
-?skirt ?skirtcolor ?noback ?dark ?webgl ?clipdebug ?nolog ?revz`.
+`PREFETCH_CEIL_M=20000`, `PREFETCH_S=0.7`, `APPROACH_MAX_MPS=5000` (clamps the per-frame closing rate so
+an orbit zoom can't pin prefetch), `APPROACH_DT_MAX_MS=100`, `RECUT_MAX_MS=300`, `RECUT_MIN_MOVE_M=1`,
+`maxDepth=15` (~9.5 m cells). In `terrainMaterial.ts`: `MORPH_START_FRAC=0.30`, `BIRTH_MS=150` (late-leaf
+fade-up floor), and the detail dials — `DETAIL_PHASE_MOD_M=100000`, `DETAIL_A_SCALE_M=40` (coarse mottle,
+fades ~50 km→1 km), `DETAIL_B_SCALE_M=6` (fine grain, fades ~6 km→200 m), plus the `SAND`/`ROCK` band
+palette. `core/quadtree.ts` adds `balanceCut` (2:1 restrict) + `maxNeighborDelta` (accurate metric).
+Debug flags (URL query): `?perf ?seamscan ?lodaudit ?lodmorphdebug ?morphcolor ?wire ?lodcolor
+?skirt ?skirtcolor ?noback ?dark ?webgl ?clipdebug ?nolog ?revz`. **`?seamscan`** is now required for the
+expensive O(live²) seam + O(96·live) coverage scans (off by default even under `?lodaudit`, since at
+~500 leaves they were themselves a periodic main-thread spike).
 
 ## 8. Guardrails (from CLAUDE.md §4 — do not break)
 - `/core` never imports Three.js. Core is **deterministic** (pinned PCG; `Math.imul`/`>>>0`; no `Math.random`).
