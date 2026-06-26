@@ -73,14 +73,13 @@ export const BIRTH_MS = 500;
 // in a normal fly descent (the origin is fixed per preset), rare in a long walk.
 const DETAIL_PHASE_MOD_M = 100_000;
 
-// Two procedural detail octaves: coarse features fade in from higher up, fine features only at close
-// range — together a continuous onset of surface texture across the descent. Each octave's distance
-// gate (smoothstep far→near) is also its anti-alias guard: it reaches 0 before the feature projects
-// below ~1 px, so the finest detail never shimmers. [T] tune.
+// Procedural detail (ONE octave — the 6 m fine-grain octave was dropped for fill-rate; see the material
+// body). Coarse 40 m mottle fades in from ~50 km. Its distance gate (smoothstep far→near) is also its
+// anti-alias guard: it reaches 0 before the feature projects below ~1 px, so detail never shimmers. [T] tune.
 const DETAIL_A_SCALE_M = 40; // coarse mottle (~40 m features)
 export const DETAIL_A_NEAR_M = 1_000;
 export const DETAIL_A_FAR_M = 50_000;
-const DETAIL_B_SCALE_M = 6; // fine grain (~6 m features)
+// Retained for the manager's [NMS step] gB diagnostic only (the 6 m octave they gated is no longer shaded).
 export const DETAIL_B_NEAR_M = 200;
 export const DETAIL_B_FAR_M = 6_000;
 
@@ -191,30 +190,33 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     mat.normalNode = nGeom;
   } else {
     // ── Surface detail (fades in with proximity, on the morph's schedule) ───────
+    // ONE octave only. The mx_noise_vec3 is the per-fragment fill-rate bottleneck (the real cause of the
+    // choppiness — ?nodetail was buttery), and it's evaluated for EVERY on-screen terrain pixel. The fine
+    // 6 m octave only shows within ~6 km of the surface, so dropping it (was two mx_noise_vec3) halves the
+    // noise cost everywhere for a detail band that's rarely on screen. Combined with the lower default pixel
+    // ratio (scene.ts), this clears the GPU budget. (A per-fragment branch to skip the noise entirely at
+    // range needs TSL Fn/If control flow — deferred; this unconditional halving is the robust win.)
     // Stable, float-precise absolute coordinate (see header): render-space position + renderOrigin mod L.
     const pDetail = positionWorld.add(uDetailPhase);
-    // Per-octave weight: tie to the geometry morph (off where geometry collapses to its parent, so the
-    // two never fight) AND a distance gate (anti-alias: 0 before the feature drops below a pixel).
+    // Weight: tie to the geometry morph (off where geometry collapses to its parent, so the two never fight)
+    // AND a distance gate (anti-alias: 0 before the feature drops below a pixel).
     const morphW = mFinal.oneMinus(); // 1 near (full geometry detail) → 0 far (parent)
     const wA = morphW.mul(smoothstep(DETAIL_A_FAR_M, DETAIL_A_NEAR_M, dist));
-    const wB = morphW.mul(smoothstep(DETAIL_B_FAR_M, DETAIL_B_NEAR_M, dist));
-    // One gradient-noise vec3 per octave (≈[-1,1]³), reused for albedo mottle + normal perturbation.
+    // One gradient-noise vec3 (≈[-1,1]³), reused for albedo mottle + normal perturbation.
     const ndA = mx_noise_vec3(pDetail.mul(1 / DETAIL_A_SCALE_M));
-    const ndB = mx_noise_vec3(pDetail.mul(1 / DETAIL_B_SCALE_M));
 
-    // Albedo mottle: ±detail near, fading to the flat band colour with distance (matches the coarse
-    // look you saw from higher up → continuous, no pop).
-    const mottle = ndA.x.mul(wA).mul(0.22).add(ndB.x.mul(wB).mul(0.28));
+    // Albedo mottle: ±detail near, fading to the flat band colour with distance.
+    const mottle = ndA.x.mul(wA).mul(0.22);
     mat.colorNode = albedo.mul(mottle.add(1));
     // Gentle roughness break-up so the surface doesn't read as one uniform sheen up close.
-    mat.roughnessNode = float(0.92).sub(ndB.y.mul(wB).mul(0.08)).clamp(0.4, 1);
+    mat.roughnessNode = float(0.92).sub(ndA.y.mul(wA).mul(0.06)).clamp(0.4, 1);
 
     // Normal perturbation: tilt the morph normal by the TANGENTIAL part of the detail noise (remove the
-    // along-normal component so it tilts, not inflates), weighted so it vanishes exactly where geometry
-    // morphs to the parent. Gives the surface fine relief shading up close, smoothing out with distance.
-    const pert = ndA.mul(wA).add(ndB.mul(wB));
+    // along-normal component so it tilts, not inflates), weighted so it vanishes where geometry morphs to
+    // the parent. Gives fine relief shading up close, smoothing out with distance.
+    const pert = ndA.mul(wA);
     const pertTang = pert.sub(nGeom.mul(pert.dot(nGeom)));
-    mat.normalNode = nGeom.add(pertTang.mul(0.2)).normalize();
+    mat.normalNode = nGeom.add(pertTang.mul(0.3)).normalize();
   }
 
   // Bias the finer leaf toward the camera so it wins the depth test over a coarser ancestor still

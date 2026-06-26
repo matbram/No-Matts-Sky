@@ -183,10 +183,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   });
   // Pixel ratio (fill-rate lever): on a HiDPI/Retina display devicePixelRatio is 2, so we shade 4× the
   // fragments — the dominant cost when the terrain shader fills the viewport. ?dpr=N overrides the cap so we
-  // can measure/trade fragment cost vs sharpness (e.g. ?dpr=1 quarters the fragments on Retina). Default 2.
+  // can measure/trade fragment cost vs sharpness. Default cap 1.5: on a Retina (devicePixelRatio 2) display
+  // that's ~44% fewer fragments than 2.0 while staying sharp; 1× displays are unaffected (min(1,1.5)=1).
+  // ?dpr=2 restores full sharpness, ?dpr=1 is max perf.
   const dprCap = (() => {
     const v = parseFloat(params.get('dpr') ?? '');
-    return Number.isFinite(v) && v > 0 ? v : 2;
+    return Number.isFinite(v) && v > 0 ? v : 1.5;
   })();
   const effPixelRatio = Math.min(window.devicePixelRatio, dprCap);
   renderer.setPixelRatio(effPixelRatio);
