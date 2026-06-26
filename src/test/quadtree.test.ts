@@ -5,13 +5,15 @@ import {
   projectedSize,
   lodBoundRadius,
   selectCut,
+  balanceCut,
   isPathPrefix,
   retainedShouldRemove,
   type CameraView,
   type SelectOpts,
   type QuadNode,
 } from '../core/quadtree.ts';
-import { chunkKey } from '../core/chunk.ts';
+import { chunkKey, uvRectFromPath } from '../core/chunk.ts';
+import { wrapFaceUV } from '../core/cubesphere.ts';
 import { EARTH_RADIUS_M } from '../core/constants.ts';
 
 // Step 2 gate (slice spec §6): correct LOD selection, coarse far → fine near, far
@@ -192,5 +194,91 @@ describe('selectCut', () => {
     const baseMaxDepth = Math.max(...base.map((n) => n.path.length));
     const preMaxDepth = Math.max(...pre.map((n) => n.path.length));
     expect(preMaxDepth).toBeGreaterThanOrEqual(baseMaxDepth);
+  });
+});
+
+describe('balanceCut (2:1 restricted quadtree)', () => {
+  const MAXD = 8;
+  const bkey = (n: QuadNode): string => `${n.face}/${n.path.join('')}`;
+
+  // Full-sphere depth-1 base: 6 faces × 4 quadrants = 24 leaves, perfectly balanced.
+  const fullBase = (): QuadNode[] => {
+    const out: QuadNode[] = [];
+    for (let f = 0; f < 6; f++) for (let q = 0; q < 4; q++) out.push({ face: f, path: [q] });
+    return out;
+  };
+  // Uniformly refine a node to `depth` (a balanced patch, but coarser/finer than its neighbours).
+  const refineTo = (node: QuadNode, depth: number): QuadNode[] =>
+    node.path.length >= depth ? [node] : childrenOf(node).flatMap((c) => refineTo(c, depth));
+
+  // INDEPENDENT 2:1 check (denser than balanceCut's own probe, so a missed neighbour fails here):
+  // probe each leaf edge at 15 points and report the largest |neighbourDepth − depth| across the cut.
+  const coveringDepthT = (cut: Set<string>, face: number, u: number, v: number): number => {
+    let u0 = -1, u1 = 1, v0 = -1, v1 = 1;
+    const path: number[] = [];
+    for (let d = 1; d <= MAXD; d++) {
+      const um = (u0 + u1) / 2, vm = (v0 + v1) / 2;
+      let q = 0;
+      if (u >= um) { q |= 1; u0 = um; } else u1 = um;
+      if (v >= vm) { q |= 2; v0 = vm; } else v1 = vm;
+      path.push(q);
+      if (cut.has(`${face}/${path.join('')}`)) return d;
+    }
+    return -1;
+  };
+  const maxNbrDelta = (leaves: QuadNode[]): number => {
+    const cut = new Set(leaves.map(bkey));
+    let maxD = 0;
+    for (const lf of leaves) {
+      const r = uvRectFromPath(lf.path);
+      const eps = (r.u1 - r.u0) * 0.02;
+      const d = lf.path.length;
+      for (let i = 1; i < 16; i++) {
+        const t = i / 16;
+        const v = r.v0 + (r.v1 - r.v0) * t;
+        const u = r.u0 + (r.u1 - r.u0) * t;
+        for (const [pu, pv] of [[r.u1 + eps, v], [r.u0 - eps, v], [u, r.v1 + eps], [u, r.v0 - eps]]) {
+          const w = wrapFaceUV(lf.face, pu!, pv!);
+          const nd = coveringDepthT(cut, w.face, w.u, w.v);
+          if (nd >= 0) maxD = Math.max(maxD, Math.abs(nd - d));
+        }
+      }
+    }
+    return maxD;
+  };
+
+  it('is a no-op on an already-balanced uniform cut', () => {
+    const base = fullBase();
+    expect(maxNbrDelta(base)).toBeLessThanOrEqual(1);
+    const balanced = balanceCut(base, MAXD);
+    expect(balanced.length).toBe(base.length);
+    expect(new Set(balanced.map(bkey))).toEqual(new Set(base.map(bkey)));
+  });
+
+  it('eliminates >1-level steps (2:1 balances an imbalanced cut)', () => {
+    // A depth-4 patch dropped beside depth-1 neighbours = a 3-level step (the maxNbrΔ=4 the
+    // ?lodaudit logs showed). Replace face-0 quadrant 0 with its depth-4 tiling; keep the rest at 1.
+    const cut = fullBase().filter((l) => !(l.face === 0 && l.path[0] === 0));
+    cut.push(...refineTo({ face: 0, path: [0] }, 4));
+    expect(maxNbrDelta(cut)).toBeGreaterThan(1); // input is imbalanced
+
+    const balanced = balanceCut(cut, MAXD);
+    expect(maxNbrDelta(balanced)).toBeLessThanOrEqual(1); // output is 2:1 balanced → morphable
+    expect(balanced.length).toBeGreaterThan(cut.length); // only ADDED transition leaves
+  });
+
+  it('is deterministic and never coarsens (every input region stays at ≥ its depth)', () => {
+    const cut = fullBase().filter((l) => !(l.face === 2 && l.path[0] === 1));
+    cut.push(...refineTo({ face: 2, path: [1] }, 4));
+    const a = balanceCut(cut, MAXD);
+    const b = balanceCut(cut, MAXD);
+    expect(new Set(a.map(bkey))).toEqual(new Set(b.map(bkey)));
+    // Coverage preserved: at each input leaf's centre, the balanced cut covers it at ≥ its depth.
+    const balSet = new Set(a.map(bkey));
+    for (const lf of cut) {
+      const r = uvRectFromPath(lf.path);
+      const nd = coveringDepthT(balSet, lf.face, (r.u0 + r.u1) / 2, (r.v0 + r.v1) / 2);
+      expect(nd).toBeGreaterThanOrEqual(lf.path.length);
+    }
   });
 });

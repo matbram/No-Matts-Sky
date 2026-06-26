@@ -17,6 +17,7 @@
 import { Scene, Mesh, BufferGeometry, BufferAttribute, Color, Vector3, type Material } from 'three';
 import {
   selectCut,
+  balanceCut,
   nodeBounds,
   lodBoundRadius,
   retainedShouldRemove,
@@ -270,18 +271,25 @@ export class QuadtreeManager {
       if (camera.halfFov !== undefined) this.dbgHalfFov = camera.halfFov;
     }
     let leavesAdded = 0;
-    const cut = selectCut(camera, {
-      radius: this.radius,
-      heightMargin: this.heightMargin,
-      splitPx: splitPx ?? this.opts.splitPx,
-      maxDepth: this.opts.maxDepth,
-      // Speed-aware prefetch: request finer leaves early so the CDLOD morph fades them
-      // in continuously (no late snap). approachSpeed·leadTime is computed render-side.
-      prefetchM,
-      // Always-resident coarse base — keep the whole sphere meshed at low detail so every
-      // refinement has a real parent to morph from (no backdrop pop). 0 = off.
-      baseDepth: this.opts.baseDepth ?? 0,
-    });
+    // 2:1 balance the screen-space cut: force-split any leaf whose edge-neighbour is >1 level finer
+    // so every cross-LOD step is exactly one level → the CDLOD morph can hide it (no unmorphable
+    // seam/pop, which ?lodaudit logged as maxNbrΔ up to 4). selectCut stays the pure SSE decision
+    // (its golden test is unchanged); balanceCut is a separate pure pass applied on top.
+    const cut = balanceCut(
+      selectCut(camera, {
+        radius: this.radius,
+        heightMargin: this.heightMargin,
+        splitPx: splitPx ?? this.opts.splitPx,
+        maxDepth: this.opts.maxDepth,
+        // Speed-aware prefetch: request finer leaves early so the CDLOD morph fades them
+        // in continuously (no late snap). approachSpeed·leadTime is computed render-side.
+        prefetchM,
+        // Always-resident coarse base — keep the whole sphere meshed at low detail so every
+        // refinement has a real parent to morph from (no backdrop pop). 0 = off.
+        baseDepth: this.opts.baseDepth ?? 0,
+      }),
+      this.opts.maxDepth,
+    );
 
     const wanted = new Set<string>();
     for (const node of cut) {

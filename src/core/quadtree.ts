@@ -12,7 +12,7 @@
 // the render-side manager.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { faceDirection } from './cubesphere.ts';
+import { faceDirection, wrapFaceUV } from './cubesphere.ts';
 import { uvRectFromPath } from './chunk.ts';
 
 /** A quadtree node: a cube face + a path of quadrants (lod = path.length). */
@@ -323,4 +323,110 @@ function baseCellPaths(depth: number): number[][] {
     paths = next;
   }
   return paths;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// balanceCut — 2:1 restricted quadtree (CDLOD's morph hides only a ONE-level step)
+//
+// CDLOD blends a leaf toward its PARENT at the shared edge, so a coarse leaf meeting a leaf exactly
+// one level finer is seamless. A step of 2+ levels (e.g. a depth-2 base leaf abutting a depth-6 leaf
+// with no 3/4/5 between — ?lodaudit logged exactly this: maxNbrΔ=4, lod={2,4,5,6}) is UNMORPHABLE
+// and shows as a hard seam / pop. balanceCut force-splits any leaf whose edge-neighbour is >1 level
+// finer, to a fixpoint, so every cross-LOD edge is exactly one level. Pure + deterministic (a
+// function of the leaf set + maxDepth); applied AFTER selectCut, so selectCut's golden test is
+// unchanged and this gets its own test.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Internal cut key: `face/pathDigits` (e.g. `3/021`). Empty path → `3/`. */
+function balanceKey(face: number, path: number[]): string {
+  return `${face}/${path.join('')}`;
+}
+
+/**
+ * Depth of the cut leaf covering face-(u,v): walk the quadtree from the root, return the depth of
+ * the first prefix present in `cut` (the cut is a partition, so that's THE covering leaf). -1 if
+ * uncovered (e.g. a culled far side when baseDepth=0) → caller treats as "no constraint". The
+ * quadrant test matches uvRectFromPath exactly (bit0 = upper-u half, bit1 = upper-v half).
+ */
+function coveringDepth(cut: Set<string>, face: number, u: number, v: number, maxDepth: number): number {
+  if (cut.has(balanceKey(face, []))) return 0;
+  let u0 = -1, u1 = 1, v0 = -1, v1 = 1;
+  const path: number[] = [];
+  for (let d = 1; d <= maxDepth; d++) {
+    const um = (u0 + u1) / 2, vm = (v0 + v1) / 2;
+    let q = 0;
+    if (u >= um) { q |= 1; u0 = um; } else u1 = um;
+    if (v >= vm) { q |= 2; v0 = vm; } else v1 = vm;
+    path.push(q);
+    if (cut.has(balanceKey(face, path))) return d;
+  }
+  return -1;
+}
+
+/**
+ * Max depth of any edge-neighbour of leaf (face,path) in the cut. Probes just past each of the 4
+ * edges at several along-edge fractions (so a finer neighbour anywhere along the edge is caught);
+ * `wrapFaceUV` maps an overshoot across a cube edge onto the neighbour face (the same watertight
+ * convention the mesher's apron uses), so cross-face neighbours resolve correctly. Catching a
+ * 2-levels-finer neighbour is enough — deeper ones are caught after the first split, by the fixpoint.
+ */
+function maxNeighborDepth(cut: Set<string>, face: number, path: number[], maxDepth: number): number {
+  const r = uvRectFromPath(path);
+  const eps = (r.u1 - r.u0) * 0.02; // just past the edge; r is square so u/v spans match
+  const fr = [0.25, 0.5, 0.75];
+  let maxNd = -1;
+  const probe = (pu: number, pv: number): void => {
+    const w = wrapFaceUV(face, pu, pv);
+    const nd = coveringDepth(cut, w.face, w.u, w.v, maxDepth);
+    if (nd > maxNd) maxNd = nd;
+  };
+  for (const t of fr) {
+    const v = r.v0 + (r.v1 - r.v0) * t;
+    probe(r.u1 + eps, v); // +u edge
+    probe(r.u0 - eps, v); // −u edge
+    const u = r.u0 + (r.u1 - r.u0) * t;
+    probe(u, r.v1 + eps); // +v edge
+    probe(u, r.v0 - eps); // −v edge
+  }
+  return maxNd;
+}
+
+/**
+ * Force-split any leaf whose edge-neighbour is >1 level finer, to a fixpoint, so the returned cut is
+ * 2:1 balanced (`maxNbrΔ ≤ 1`) and every cross-LOD step is morphable (no seam pop). Balancing only
+ * adds the intermediate transition leaves (it never coarsens), so the count grows modestly when the
+ * input cut is already near-balanced. `maxLeaves` is a defensive growth cap.
+ */
+export function balanceCut(leaves: QuadNode[], maxDepth: number, maxLeaves = 8192): QuadNode[] {
+  const cut = new Set<string>();
+  for (const lf of leaves) cut.add(balanceKey(lf.face, lf.path));
+  // Each pass only splits (deepens) leaves, bounded by maxDepth, so it converges in ≤ maxDepth
+  // passes; the guard is a touch higher for safety.
+  for (let pass = 0; pass <= maxDepth + 2; pass++) {
+    let changed = false;
+    for (const k of [...cut]) {
+      if (!cut.has(k)) continue; // already split away earlier this pass
+      const slash = k.indexOf('/');
+      const face = +k.slice(0, slash);
+      const pathStr = k.slice(slash + 1);
+      const depth = pathStr.length;
+      if (depth >= maxDepth) continue;
+      const path = depth ? Array.from(pathStr, (c) => +c) : [];
+      if (maxNeighborDepth(cut, face, path, maxDepth) - depth >= 2) {
+        cut.delete(k);
+        for (let q = 0; q < 4; q++) cut.add(balanceKey(face, [...path, q]));
+        changed = true;
+        if (cut.size >= maxLeaves) break;
+      }
+    }
+    if (!changed || cut.size >= maxLeaves) break;
+  }
+  const out: QuadNode[] = [];
+  for (const k of cut) {
+    const slash = k.indexOf('/');
+    const face = +k.slice(0, slash);
+    const pathStr = k.slice(slash + 1);
+    out.push({ face, path: pathStr.length ? Array.from(pathStr, (c) => +c) : [] });
+  }
+  return out;
 }
