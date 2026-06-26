@@ -14,7 +14,7 @@
 // altitude (full per-frame floating origin is Step 4).
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { Scene, Mesh, BufferGeometry, BufferAttribute, Color, type Material } from 'three';
+import { Scene, Mesh, BufferGeometry, BufferAttribute, Color, Vector3, type Material } from 'three';
 import {
   selectCut,
   nodeBounds,
@@ -27,7 +27,7 @@ import {
 import { chunkKey, uvRectFromPath, type ChunkMesh, type MeshJob } from '../core/chunk.ts';
 import { faceDirection, wrapFaceUV, CUBE_FACES } from '../core/cubesphere.ts';
 import { lodOctaves, terrainAt, type TerrainRecipe } from '../core/density.ts';
-import { createTerrainMaterial, MORPH_START_FRAC } from './terrainMaterial.ts';
+import { createTerrainMaterial, detailPhaseOf, MORPH_START_FRAC } from './terrainMaterial.ts';
 
 type Status = 'pending' | 'inflight' | 'ready' | 'live';
 interface Entry {
@@ -152,6 +152,11 @@ export class QuadtreeManager {
   // the leaf-CENTRE morph for ?lodmorphdebug/?morphcolor; the actual morph is per-vertex in TSL.
   private readonly sharedMat: Material;
   private readonly kDistUniform: { value: number };
+  // Material world-origin uniforms (set on every floating-origin recenter): the FULL render origin
+  // (direction, for slope bands) and renderOrigin reduced mod L in double (the stable, float-precise
+  // base for the surface-detail coordinate). See terrainMaterial.ts.
+  private readonly matRenderOrigin: { value: Vector3 };
+  private readonly matDetailPhase: { value: Vector3 };
   private kDist = 0;
   private camX = 0;
   private camY = 0;
@@ -179,6 +184,8 @@ export class QuadtreeManager {
     const handle = createTerrainMaterial({ wireframe: opts.wireframe });
     this.sharedMat = handle.material;
     this.kDistUniform = handle.kDist;
+    this.matRenderOrigin = handle.renderOrigin;
+    this.matDetailPhase = handle.detailPhase;
     const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
     const n = Math.max(1, Math.min(opts.workers ?? 6, cores - 1));
     for (let i = 0; i < n; i++) {
@@ -191,9 +198,13 @@ export class QuadtreeManager {
     }
   }
 
-  /** Re-center the render frame; reposition all live meshes relative to it. */
+  /** Re-center the render frame; reposition all live meshes relative to it. Also feed the material's
+   *  world-origin uniforms so the surface detail stays anchored to absolute world space (no swim) and
+   *  precise (the detail phase is renderOrigin reduced mod L in double — the float shader can't). */
   setRenderOrigin(o: [number, number, number]): void {
     this.renderOrigin = o;
+    this.matRenderOrigin.value.set(o[0], o[1], o[2]);
+    detailPhaseOf(o[0], o[1], o[2], this.matDetailPhase.value);
     for (const e of this.entries.values()) {
       if (e.mesh) e.mesh.position.set(e.center[0] - o[0], e.center[1] - o[1], e.center[2] - o[2]);
     }
