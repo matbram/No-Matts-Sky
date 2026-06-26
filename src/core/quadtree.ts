@@ -156,11 +156,51 @@ export function retainedShouldRemove(
 // create a >1-level neighbour step that balance didn't already tolerate).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Region key (face + quadrant path) — NOT keyed by lod, so prefixes nest. Paths are single digits 0..3. */
-function regionKey(face: number, path: number[], len: number): string {
-  let s = face + ':';
-  for (let i = 0; i < len; i++) s += path[i];
-  return s;
+// ─────────────────────────────────────────────────────────────────────────────
+// Packed-integer region key — the recut-cost fix.
+//
+// The hot recut Sets (balanceCut's cut + per-probe coveringDepth lookups, clamp's liveLeaf/coverRegion)
+// were keyed by freshly-concatenated STRINGS — at 400+ leaves that's ~10^5 string allocations per recut
+// (the ~9–12 ms zoom spike). Pack a region (face 0–5, quadrant path of digits 0–3, depth = path length)
+// into a single JS-safe integer instead, so the same Sets become Set<number> with zero per-probe
+// allocation. The regions/cuts produced are byte-identical — only the internal key representation changes
+// — so the quadtree golden tests must pass UNCHANGED.
+//
+// Layout (disjoint fields, key < 2^37 ≪ 2^53 so it's an exact JS integer):
+//   pathBits  bits 0..29  — digits packed 2 bits each, MSB-first (pathBits < 4^depth ≤ 4^15 = 2^30)
+//   depth     bits 30..33 — 0..15 (distinguishes [] vs [0] vs [0,0]; injective ⇒ no collisions)
+//   face      bits 34..36 — 0..5
+// MUST hold maxDepth ≤ MAX_REGION_DEPTH; assertMaxDepth guards it so a future MAX_DEPTH bump fails loudly
+// instead of silently overflowing pathBits into the depth field.
+const REGION_DEPTH_UNIT = 2 ** 30; // depth field multiplier (pathBits occupies the low 30 bits)
+const REGION_FACE_UNIT = 2 ** 34; // face field multiplier (depth occupies bits 30..33)
+const MAX_REGION_DEPTH = 15;
+
+function assertRegionDepth(maxDepth: number): void {
+  if (maxDepth > MAX_REGION_DEPTH) {
+    throw new Error(
+      `quadtree region key supports depth ≤ ${MAX_REGION_DEPTH}; got maxDepth=${maxDepth}. ` +
+        `Widen the packed-key fields (and re-check the 2^53 budget) before raising MAX_DEPTH.`,
+    );
+  }
+}
+
+/** Packed integer key for region (face + the first `len` quadrant digits of `path`). Prefixes nest by
+ *  encoding depth explicitly. Equal keys ⟺ same face, same depth, same digits (injective). */
+function packRegion(face: number, path: number[], len: number): number {
+  let pathBits = 0;
+  for (let i = 0; i < len; i++) pathBits = pathBits * 4 + path[i]!;
+  return face * REGION_FACE_UNIT + len * REGION_DEPTH_UNIT + pathBits;
+}
+
+/** Recover the quadrant digits from a packed key's pathBits + depth (inverse of packRegion's packing). */
+function unpackPath(pathBits: number, depth: number): number[] {
+  const path: number[] = new Array(depth);
+  for (let i = depth - 1; i >= 0; i--) {
+    path[i] = pathBits % 4;
+    pathBits = Math.floor(pathBits / 4);
+  }
+  return path;
 }
 
 /**
@@ -174,37 +214,37 @@ export function clampCutToReachableFrontier(
   live: ReadonlyArray<QuadNode>,
   baseDepth: number,
 ): QuadNode[] {
-  // Two lookups built once from the live set:
-  //  • liveLeaf: exact "face:path" of each live LEAF — to find the deepest live ANCESTOR of a target.
-  //  • coverRegion: "face:prefix" for EVERY prefix (incl. self) of every live leaf — so coverRegion.has(P)
+  // Two lookups built once from the live set (packed-integer keys — see packRegion):
+  //  • liveLeaf: exact key of each live LEAF — to find the deepest live ANCESTOR of a target.
+  //  • coverRegion: key of EVERY prefix (incl. self) of every live leaf — so coverRegion.has(P)
   //    ⟺ some live leaf has P as a prefix ⟺ region P contains live detail at depth ≥ |P| (a descendant).
-  const liveLeaf = new Set<string>();
-  const coverRegion = new Set<string>();
+  const liveLeaf = new Set<number>();
+  const coverRegion = new Set<number>();
   for (const lf of live) {
-    liveLeaf.add(regionKey(lf.face, lf.path, lf.path.length));
-    for (let d = 0; d <= lf.path.length; d++) coverRegion.add(regionKey(lf.face, lf.path, d));
+    liveLeaf.add(packRegion(lf.face, lf.path, lf.path.length));
+    for (let d = 0; d <= lf.path.length; d++) coverRegion.add(packRegion(lf.face, lf.path, d));
   }
 
   const out: QuadNode[] = [];
-  const seen = new Set<string>();
+  const seen = new Set<number>();
   for (const t of targets) {
     const D = t.path.length;
     let allowed: number;
-    if (coverRegion.has(regionKey(t.face, t.path, D))) {
+    if (coverRegion.has(packRegion(t.face, t.path, D))) {
       // Region already holds live detail at ≥ D (target itself live, or a live descendant → merge-up/steady).
       allowed = D;
     } else {
       // No detail at this depth yet → refining or cold. Find the deepest live LEAF ancestor (d < D).
       let La = -1;
       for (let d = D - 1; d >= baseDepth; d--) {
-        if (liveLeaf.has(regionKey(t.face, t.path, d))) {
+        if (liveLeaf.has(packRegion(t.face, t.path, d))) {
           La = d;
           break;
         }
       }
       allowed = La >= 0 ? La + 1 : Math.min(D, baseDepth); // refine one level past live, else load the base
     }
-    const key = regionKey(t.face, t.path, allowed);
+    const key = packRegion(t.face, t.path, allowed);
     if (seen.has(key)) continue;
     seen.add(key);
     out.push({ face: t.face, path: t.path.slice(0, allowed) });
@@ -395,11 +435,11 @@ export function selectCut(camera: CameraView, opts: SelectOpts): QuadNode[] {
   // would show through = the very pop we're removing. Backfill any base cell not covered by
   // a leaf with a resident leaf, so the whole sphere is guaranteed tiled at baseDepth.
   if (baseDepth > 0) {
-    const covered = new Set<string>();
-    for (const lf of leaves) covered.add(`${lf.face}/${lf.path.slice(0, baseDepth).join(',')}`);
+    const covered = new Set<number>();
+    for (const lf of leaves) covered.add(packRegion(lf.face, lf.path, baseDepth)); // prefix of length baseDepth
     for (let f = 0; f < 6; f++) {
       for (const path of baseCellPaths(baseDepth)) {
-        if (!covered.has(`${f}/${path.join(',')}`)) leaves.push({ face: f, path: path.slice() });
+        if (!covered.has(packRegion(f, path, baseDepth))) leaves.push({ face: f, path: path.slice() });
       }
     }
   }
@@ -430,28 +470,26 @@ function baseCellPaths(depth: number): number[][] {
 // unchanged and this gets its own test.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Internal cut key: `face/pathDigits` (e.g. `3/021`). Empty path → `3/`. */
-function balanceKey(face: number, path: number[]): string {
-  return `${face}/${path.join('')}`;
-}
-
 /**
  * Depth of the cut leaf covering face-(u,v): walk the quadtree from the root, return the depth of
  * the first prefix present in `cut` (the cut is a partition, so that's THE covering leaf). -1 if
  * uncovered (e.g. a culled far side when baseDepth=0) → caller treats as "no constraint". The
- * quadrant test matches uvRectFromPath exactly (bit0 = upper-u half, bit1 = upper-v half).
+ * quadrant test matches uvRectFromPath exactly (bit0 = upper-u half, bit1 = upper-v half). Builds the
+ * packed-integer region key incrementally as it descends — no per-level string/array allocation. This
+ * is the hot probe (12× per leaf per balance pass), so its allocation-freeness is the recut-cost win.
  */
-function coveringDepth(cut: Set<string>, face: number, u: number, v: number, maxDepth: number): number {
-  if (cut.has(balanceKey(face, []))) return 0;
+function coveringDepth(cut: Set<number>, face: number, u: number, v: number, maxDepth: number): number {
+  const faceBits = face * REGION_FACE_UNIT;
+  if (cut.has(faceBits)) return 0; // root: depth 0, pathBits 0
   let u0 = -1, u1 = 1, v0 = -1, v1 = 1;
-  const path: number[] = [];
+  let pathBits = 0;
   for (let d = 1; d <= maxDepth; d++) {
     const um = (u0 + u1) / 2, vm = (v0 + v1) / 2;
     let q = 0;
     if (u >= um) { q |= 1; u0 = um; } else u1 = um;
     if (v >= vm) { q |= 2; v0 = vm; } else v1 = vm;
-    path.push(q);
-    if (cut.has(balanceKey(face, path))) return d;
+    pathBits = pathBits * 4 + q;
+    if (cut.has(faceBits + d * REGION_DEPTH_UNIT + pathBits)) return d; // == packRegion(face, path, d)
   }
   return -1;
 }
@@ -463,7 +501,7 @@ function coveringDepth(cut: Set<string>, face: number, u: number, v: number, max
  * convention the mesher's apron uses), so cross-face neighbours resolve correctly. Catching a
  * 2-levels-finer neighbour is enough — deeper ones are caught after the first split, by the fixpoint.
  */
-function maxNeighborDepth(cut: Set<string>, face: number, path: number[], maxDepth: number): number {
+function maxNeighborDepth(cut: Set<number>, face: number, path: number[], maxDepth: number): number {
   const r = uvRectFromPath(path);
   const eps = (r.u1 - r.u0) * 0.02; // just past the edge; r is square so u/v spans match
   const fr = [0.25, 0.5, 0.75];
@@ -491,23 +529,23 @@ function maxNeighborDepth(cut: Set<string>, face: number, path: number[], maxDep
  * input cut is already near-balanced. `maxLeaves` is a defensive growth cap.
  */
 export function balanceCut(leaves: QuadNode[], maxDepth: number, maxLeaves = 8192): QuadNode[] {
-  const cut = new Set<string>();
-  for (const lf of leaves) cut.add(balanceKey(lf.face, lf.path));
+  assertRegionDepth(maxDepth);
+  const cut = new Set<number>();
+  for (const lf of leaves) cut.add(packRegion(lf.face, lf.path, lf.path.length));
   // Each pass only splits (deepens) leaves, bounded by maxDepth, so it converges in ≤ maxDepth
   // passes; the guard is a touch higher for safety.
   for (let pass = 0; pass <= maxDepth + 2; pass++) {
     let changed = false;
     for (const k of [...cut]) {
       if (!cut.has(k)) continue; // already split away earlier this pass
-      const slash = k.indexOf('/');
-      const face = +k.slice(0, slash);
-      const pathStr = k.slice(slash + 1);
-      const depth = pathStr.length;
+      const face = Math.floor(k / REGION_FACE_UNIT);
+      const depth = Math.floor((k - face * REGION_FACE_UNIT) / REGION_DEPTH_UNIT);
       if (depth >= maxDepth) continue;
-      const path = depth ? Array.from(pathStr, (c) => +c) : [];
+      const pathBits = k - face * REGION_FACE_UNIT - depth * REGION_DEPTH_UNIT;
+      const path = unpackPath(pathBits, depth);
       if (maxNeighborDepth(cut, face, path, maxDepth) - depth >= 2) {
         cut.delete(k);
-        for (let q = 0; q < 4; q++) cut.add(balanceKey(face, [...path, q]));
+        for (let q = 0; q < 4; q++) cut.add(packRegion(face, [...path, q], depth + 1));
         changed = true;
         if (cut.size >= maxLeaves) break;
       }
@@ -516,10 +554,10 @@ export function balanceCut(leaves: QuadNode[], maxDepth: number, maxLeaves = 819
   }
   const out: QuadNode[] = [];
   for (const k of cut) {
-    const slash = k.indexOf('/');
-    const face = +k.slice(0, slash);
-    const pathStr = k.slice(slash + 1);
-    out.push({ face, path: pathStr.length ? Array.from(pathStr, (c) => +c) : [] });
+    const face = Math.floor(k / REGION_FACE_UNIT);
+    const depth = Math.floor((k - face * REGION_FACE_UNIT) / REGION_DEPTH_UNIT);
+    const pathBits = k - face * REGION_FACE_UNIT - depth * REGION_DEPTH_UNIT;
+    out.push({ face, path: unpackPath(pathBits, depth) });
   }
   return out;
 }
@@ -533,8 +571,9 @@ export function balanceCut(leaves: QuadNode[], maxDepth: number, maxLeaves = 819
  * fact balanced, and its O(leaves²) scan was a recut spike.) Cheap: O(leaves · maxDepth). Debug-only.
  */
 export function maxNeighborDelta(leaves: QuadNode[], maxDepth: number): number {
-  const cut = new Set<string>();
-  for (const lf of leaves) cut.add(balanceKey(lf.face, lf.path));
+  assertRegionDepth(maxDepth);
+  const cut = new Set<number>();
+  for (const lf of leaves) cut.add(packRegion(lf.face, lf.path, lf.path.length));
   let maxD = 0;
   for (const lf of leaves) {
     const r = uvRectFromPath(lf.path);
