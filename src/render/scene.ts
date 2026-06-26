@@ -250,6 +250,9 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     splitPx: FLY_SPLIT_PX,
     maxDepth: MAX_DEPTH,
     wireframe: params.has('wire'), // debug: see the tessellation / where lines fall
+    // ?slopeband=N: pick a slope-band "look" preset (0=current/hard, 1=wide, 2=low-contrast, 3=soft).
+    // Render-only cosmetic; default 0 leaves today's look unchanged.
+    slopePreset: Number(params.get('slopeband')) || 0,
     // Always-resident coarse base: the whole sphere stays meshed at BASE_DEPTH so every
     // finer leaf morphs from a real parent (no fresh-over-backdrop pop). The static inset
     // backdrop stays as the ultimate below-everything filler (startup / frustum-edge gaps).

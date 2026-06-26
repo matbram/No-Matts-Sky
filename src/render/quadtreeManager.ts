@@ -104,8 +104,9 @@ export interface ManagerOpts {
   // sphere (no horizon/cone cull) so every finer leaf morphs from a real parent → no
   // fresh-over-backdrop pop when a region rotates/streams in. 0 = off. See SelectOpts.baseDepth.
   baseDepth?: number;
-  workers?: number; // pool size (default: min(6, cores-1))
+  workers?: number; // pool size (default: min(10, cores-1))
   wireframe?: boolean; // debug: render the shared terrain material as wireframe (?wire)
+  slopePreset?: number; // ?slopeband=N: slope-band look preset (index into SLOPE_PRESETS; default 0 = current)
   skirts?: boolean; // enable LOD-transition skirts (default OFF — the apron already covers
   // holes at LOD transitions, and the skirts were the visible boundary grid; ?skirt re-enables)
   debugColor?: 'lod' | 'skirt' | 'morph'; // debug tint: LOD level / skirted leaves / morph progress
@@ -228,14 +229,18 @@ export class QuadtreeManager {
     this.heightMargin = recipe.height * 1.6;
     // The ONE shared terrain material (per-leaf data rides in the `aLevel` attribute); its kDist
     // uniform is updated each frame via setMorphParams.
-    const handle = createTerrainMaterial({ wireframe: opts.wireframe });
+    const handle = createTerrainMaterial({ wireframe: opts.wireframe, slopePreset: opts.slopePreset });
     this.sharedMat = handle.material;
     this.kDistUniform = handle.kDist;
     this.matRenderOrigin = handle.renderOrigin;
     this.matDetailPhase = handle.detailPhase;
     this.matNow = handle.now;
     const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
-    const n = Math.max(1, Math.min(opts.workers ?? 6, cores - 1));
+    // Pool size. The descent bottleneck is meshing THROUGHPUT (real-GPU ?lodaudit showed reqLat ~700–870ms
+    // with busy6/6 saturated + a 100–170 request backlog on zoom-in), so default to 10 workers — still
+    // clamped by cores-1, which leaves a core for the main thread and only adds parallelism on machines
+    // that have the cores to spare (≤6-core machines are unaffected).
+    const n = Math.max(1, Math.min(opts.workers ?? 10, cores - 1));
     for (let i = 0; i < n; i++) {
       const w = new Worker(new URL('../workers/mesher.worker.ts', import.meta.url), {
         type: 'module',
@@ -894,10 +899,12 @@ export class QuadtreeManager {
         if (covered) {
           this.refineThisCut++;
           // [NMS step] swap-delta: only a REFINEMENT (live ancestor present) actually "swaps" a parent
-          // for a child at morph=1; measure that discontinuity. Gated to ?lodaudit (the [NMS step] line);
-          // bounded by the per-frame upload budget, so the per-leaf swapDelta eval is affordable here.
-          if (this.opts.debugAudit && depth > 0) {
-            const sd = swapDelta({ face: e.node.face, path: e.node.path, lod: depth }, this.recipe, this.radius);
+          // for a child at morph=1; measure that discontinuity. Gated to ?lodaudit (the [NMS step] line).
+          // It runs on the MAIN thread, so cap it: ≤8 leaves/window × perAxis 2 (4 samples) — enough for a
+          // representative max/avg without becoming the hitch it measures during a zoom-in refine burst
+          // (was up to 40 leaves × 16 samples per recut). Diagnostic only — no gameplay effect.
+          if (this.opts.debugAudit && depth > 0 && this.swapN < 8) {
+            const sd = swapDelta({ face: e.node.face, path: e.node.path, lod: depth }, this.recipe, this.radius, 2);
             if (sd.dPosMax > this.swapDPosMax) this.swapDPosMax = sd.dPosMax;
             if (sd.dNrmMaxDeg > this.swapDNrmMax) this.swapDNrmMax = sd.dNrmMaxDeg;
             this.swapDPosSum += sd.dPosAvg;

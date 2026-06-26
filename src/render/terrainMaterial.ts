@@ -84,13 +84,28 @@ const DETAIL_B_SCALE_M = 6; // fine grain (~6 m features)
 export const DETAIL_B_NEAR_M = 200;
 export const DETAIL_B_FAR_M = 6_000;
 
-// One archetype's palette (barren): flatter ground reads as light regolith, steeper faces as darker
-// rock. Cosmetic floats (render-only — NOT canonical, no determinism constraint; master plan §5.8).
-const SAND = [0.62, 0.55, 0.45] as const;
-const ROCK = [0.40, 0.36, 0.33] as const;
+// One archetype's palette (barren): flatter ground reads as light regolith (SAND), steeper faces as
+// darker rock. The slope-band smoothstep(lo,hi) maps surface tilt → albedo; a NARROW band + HIGH contrast
+// (preset 0) turns tiny normal variation into a high-contrast salt-and-pepper mottle, so these presets let
+// us A/B "looks" live via ?slopeband=N and pick one. Cosmetic floats (render-only — NOT canonical, no
+// determinism constraint; master plan §5.8), so changing/adding presets has no core/golden impact.
+export interface SlopePreset {
+  lo: number; // smoothstep start (slope below → full ROCK)
+  hi: number; // smoothstep end   (slope above → full SAND)
+  rock: readonly [number, number, number];
+  sand: readonly [number, number, number];
+}
+export const SLOPE_PRESETS: readonly SlopePreset[] = [
+  { lo: 0.55, hi: 0.82, rock: [0.40, 0.36, 0.33], sand: [0.62, 0.55, 0.45] }, // 0 current — hard mottle (A/B ref)
+  { lo: 0.25, hi: 0.98, rock: [0.40, 0.36, 0.33], sand: [0.62, 0.55, 0.45] }, // 1 wide band — flip → gradient, same colours
+  { lo: 0.55, hi: 0.82, rock: [0.47, 0.43, 0.39], sand: [0.57, 0.51, 0.44] }, // 2 low contrast — keeps definition, mutes black/tan
+  { lo: 0.30, hi: 0.95, rock: [0.47, 0.43, 0.39], sand: [0.57, 0.51, 0.44] }, // 3 soft — wide + low contrast (gentlest)
+];
 
 export interface TerrainMaterialOpts {
   wireframe?: boolean;
+  /** ?slopeband=N: index into SLOPE_PRESETS for the slope-band look (default 0 = current). */
+  slopePreset?: number;
 }
 
 export interface TerrainMaterialHandle {
@@ -173,8 +188,9 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
   // vector). slope=1 where the surface faces straight up (flat) → sand; lower → rock.
   const up = positionWorld.add(uRenderOrigin).normalize();
   const slope = nGeom.dot(up).clamp(0, 1);
-  const band = smoothstep(0.55, 0.82, slope);
-  const albedo = mix(vec3(...ROCK), vec3(...SAND), band);
+  const sb = SLOPE_PRESETS[Math.min(Math.max((opts.slopePreset ?? 0) | 0, 0), SLOPE_PRESETS.length - 1)]!;
+  const band = smoothstep(sb.lo, sb.hi, slope);
+  const albedo = mix(vec3(...sb.rock), vec3(...sb.sand), band);
 
   // Albedo mottle: ±detail near, fading to the flat band colour with distance (matches the coarse
   // look you saw from higher up → continuous, no pop).

@@ -134,7 +134,21 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
   pre-existing ~1.6% `_tLo`-normalization residual) — pop removed. 91 tests + typecheck + build green.
   ⚠️ Real-GPU confirm: steady zoom — `[NMS step] swap[…]≈0` at all depths, detail "just gets clearer," no
   per-generation step. (A faint *static* sand/rock speckle, if any, is the separate slope-band threshold —
-  deferred, optional shader softening; the user chose mesher-only first.)
+  deferred, optional shader softening; the user chose mesher-only first.) **Confirmed live** on the next
+  build: `swap[dPos≈8–77m dNrm≈0.1–0.5°]` at every refinement depth, fresh=0, maxNbrΔ≤1.
+
+- **Zoom-in throughput + slope-band looks (same session/branch):** the real-GPU `?lodaudit` log showed the
+  parent-grid fix landed but the *descent itself* was laggy — `reqLat` climbing to ~700–870 ms with the
+  worker pool pinned `busy6/6` and a 100–170 request backlog, i.e. **meshing throughput** at deep LOD (it
+  settles instantly when motion stops). Fixes: (a) **recovered the parent-grid pass cost** in `meshChunk` —
+  the interior parent points coincide *bitwise* with the odd child columns (verified `pu0+pdu·pi ==
+  u0+du·(2pi−1)` at tan=16/32/64, depths 0–8), so reuse their already-computed `colTLo`/`colDir` and only
+  evaluate the parent **perimeter** (~72 vs ~361 fBm/chunk, −18%); **bit-identical → all frozen goldens
+  unchanged**, planet determinism preserved. (b) **Worker-pool default 6→10** (still clamped by cores−1) —
+  `busy6/6` was the bottleneck. (c) **swapDelta audit made ~8× cheaper** (≤8 leaves × perAxis 2) so the
+  `?lodaudit` diagnostic stops being the hitch it measures. Plus **`?slopeband=N`** (0 current / 1 wide /
+  2 low-contrast / 3 soft) — render-only slope-band presets in `terrainMaterial.ts` to A/B the speckle look
+  live and pick one. 91 tests + typecheck + build green.
 
 Measured-good on WebGPU (build the user ran): orbit→surface descent holds 60 fps / ~16.8 ms,
 `cov=96/96 holes=0` throughout, `fresh=0 refine=N` (sharpen-in-place, no pop), `bornM≈1.0`, largest cut ~466

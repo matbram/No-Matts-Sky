@@ -60,6 +60,7 @@ export const CHUNK_GRID_RADIAL = 12;
 // call (surfaceNets allocates them) so they can be transferred and kept.
 let _sColDir: Float64Array = new Float64Array(0);
 let _sColT: Float64Array = new Float64Array(0);
+let _sColTLo: Float64Array = new Float64Array(0); // per-column one-octave-coarser value+grad (_tLo), 4/col
 let _sColDr: Float64Array = new Float64Array(0); // per-column radial morph offset (m)
 let _sColMN: Float64Array = new Float64Array(0); // per-column morph-target (parent) NORMAL, unit (3 per col)
 // Parent-GRID morph source: the one-octave-coarser field sampled on the PARENT's 2×-coarser grid (then
@@ -148,6 +149,7 @@ export function meshChunk(
   const colCount = cnx * cny;
   const colDir = (_sColDir = fit(_sColDir, colCount * 3));
   const colT = (_sColT = fit(_sColT, colCount * 4)); // [tv, tdx, tdy, tdz] per column
+  const colTLo = (_sColTLo = fit(_sColTLo, colCount * 4)); // one-octave-coarser [tv, tdx, tdy, tdz] per column
   const colDr = (_sColDr = fit(_sColDr, colCount)); // radial morph offset per column
   const colMN = (_sColMN = fit(_sColMN, colCount * 3)); // morph-target (parent) normal per column
   for (let j = 0; j < cny; j++) {
@@ -163,12 +165,18 @@ export function meshChunk(
       colDir[ci * 3] = dir[0];
       colDir[ci * 3 + 1] = dir[1];
       colDir[ci * 3 + 2] = dir[2];
-      // Full detail only (outLo skipped — the morph source is the parent-grid pass below).
-      terrainAt(recipe, dir[0] * scale, dir[1] * scale, dir[2] * scale, _t, undefined, oct);
+      // Full detail value+grad → colT. The one-octave-coarser value+grad (terrainAt's outLo, ~free since it
+      // shares `inv` — no extra fBm) → colTLo: the parent-grid pass below reuses these at the interior
+      // parent points (which coincide with the ODD child columns) instead of re-evaluating terrainAt there.
+      terrainAt(recipe, dir[0] * scale, dir[1] * scale, dir[2] * scale, _t, _tLo, oct);
       colT[ci * 4] = _t[0]!;
       colT[ci * 4 + 1] = _t[1]!;
       colT[ci * 4 + 2] = _t[2]!;
       colT[ci * 4 + 3] = _t[3]!;
+      colTLo[ci * 4] = _tLo[0]!;
+      colTLo[ci * 4 + 1] = _tLo[1]!;
+      colTLo[ci * 4 + 2] = _tLo[2]!;
+      colTLo[ci * 4 + 3] = _tLo[3]!;
     }
   }
 
@@ -189,18 +197,38 @@ export function meshChunk(
     const pcnx = tan / 2 + 3, pcny = tan / 2 + 3;
     const pVal = (_sPVal = fit(_sPVal, pcnx * pcny));
     const pNrm = (_sPNrm = fit(_sPNrm, pcnx * pcny * 3));
+    // The INTERIOR parent points (pi/pj in [1, pcnx-2]) sit exactly on the ODD child columns
+    // (parent pi ↔ child column 2·pi−1, same direction), so reuse their already-evaluated `colTLo`/`colDir`
+    // instead of calling terrainAt again (~289 of ~361 parent fBm evals/chunk recovered). Only the parent
+    // PERIMETER (one parent cell beyond the child grid's apron) is evaluated fresh, at the same
+    // `pu0+pdu·pi` coordinate as before. Morph normals (assembleDensity on the coarser field) stay
+    // identical. Determinism: the interior coordinate `u0+du·(2pi−1)` and the perimeter `pu0+pdu·pi` are the
+    // same arithmetic the golden test froze, so the morph digests are unchanged (the test proves it).
     for (let pj = 0; pj < pcny; pj++) {
       const pv = pv0 + pdv * pj;
+      const interiorJ = pj >= 1 && pj <= pcny - 2;
+      const cj = 2 * pj - 1; // child row coinciding with this parent row (interior only)
       for (let pi = 0; pi < pcnx; pi++) {
         const pp = pj * pcnx + pi;
-        const w = wrapFaceUV(req.face, pu0 + pdu * pi, pv);
-        const dir = faceDirection(w.face, w.u, w.v);
-        terrainAt(recipe, dir[0] * scale, dir[1] * scale, dir[2] * scale, _t, _tLo, oct);
-        pVal[pp] = _tLo[0]!;
+        let dx: number, dy: number, dz: number, tv: number, td1: number, td2: number, td3: number;
+        if (interiorJ && pi >= 1 && pi <= pcnx - 2) {
+          // Reuse the coinciding odd child column (no terrainAt).
+          const ci = cj * cnx + (2 * pi - 1);
+          dx = colDir[ci * 3]!; dy = colDir[ci * 3 + 1]!; dz = colDir[ci * 3 + 2]!;
+          tv = colTLo[ci * 4]!; td1 = colTLo[ci * 4 + 1]!; td2 = colTLo[ci * 4 + 2]!; td3 = colTLo[ci * 4 + 3]!;
+        } else {
+          // Parent-grid perimeter: evaluate the coarser field fresh (same coordinate as before).
+          const w = wrapFaceUV(req.face, pu0 + pdu * pi, pv);
+          const dir = faceDirection(w.face, w.u, w.v);
+          terrainAt(recipe, dir[0] * scale, dir[1] * scale, dir[2] * scale, _t, _tLo, oct);
+          dx = dir[0]; dy = dir[1]; dz = dir[2];
+          tv = _tLo[0]!; td1 = _tLo[1]!; td2 = _tLo[2]!; td3 = _tLo[3]!;
+        }
+        pVal[pp] = tv;
         // Analytic morph normal at the parent surface radius (radius + height·tvLo), one octave dropped —
         // same source as the base normal, so a fully-morphed leaf shades exactly like its parent.
-        const rmP = radius + height * _tLo[0]!;
-        assembleDensity(radius, rmP, dir[0], dir[1], dir[2], _tLo[0]!, _tLo[1]!, _tLo[2]!, _tLo[3]!, height, scale, _dLo);
+        const rmP = radius + height * tv;
+        assembleDensity(radius, rmP, dx, dy, dz, tv, td1, td2, td3, height, scale, _dLo);
         const mgx = -_dLo[1]!, mgy = -_dLo[2]!, mgz = -_dLo[3]!;
         const mln = 1 / Math.sqrt(mgx * mgx + mgy * mgy + mgz * mgz + 1e-30);
         pNrm[pp * 3] = mgx * mln;
