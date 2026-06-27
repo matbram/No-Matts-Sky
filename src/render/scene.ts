@@ -202,6 +202,9 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // Step 6: ?noatmo hides the atmosphere shell; ?nohaze disables the terrain's aerial-perspective haze
   // (forces air density 0). Both are render-only A/B levers — handy on a real GPU to judge the look.
   const noHaze = params.has('nohaze');
+  // ?daylit: force the sun to the camera-facing hemisphere so the viewed side is fully lit — an
+  // atmosphere tuning aid, since the fixed preset/spawn spots otherwise sit near the dim pole/terminator.
+  const daylit = params.has('daylit');
   const renderer = new WebGPURenderer({
     canvas,
     antialias: true,
@@ -355,13 +358,13 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   backdrop.visible = !params.has('noback'); // debug: hide → do the lines become black gaps?
   planetGroup.add(backdrop); // co-rotates with the planet (centered at planet center)
 
-  // ── Step 6 (S1): atmosphere shell ──────────────────────────────────────────
-  // A planet-centered sky shell whose analytic scatter (Rayleigh blue + limb/horizon
-  // brightening + sun halo) reads as a glowing limb from orbit and as blue sky from the
-  // surface, both from the SAME real `_sunDir`. It lives on `scene` (NOT planetGroup) — an
-  // unspun inertial shell positioned at the planet centre (= scene `−_spunOrigin`) each frame,
-  // exactly like the Sun/Moon bodies. ?noatmo hides it for A/B. The black `scene.background`
-  // stays: the additive shell only covers the planet+sky region, space elsewhere is black.
+  // ── Step 6 redux: soft-limb atmosphere (ray-marched single-scatter) ─────────
+  // A planet-centered sky shell at the atmosphere TOP (R+100 km) whose colour is an analytic
+  // ray-march of in-scatter × transmittance through exponentially-thinning air — so the limb
+  // fades SMOOTHLY into space (no hard edge) and the surface gets a real graded blue sky. It
+  // lives on `scene` (unspun, inertial), positioned at the planet centre (scene `−_spunOrigin`)
+  // each frame and fed the camera's radial `up`/altitude + `_sunDir`. ?noatmo hides it for A/B.
+  // The black `scene.background` stays for the space beyond the soft limb.
   const atmosphere = createAtmosphere(R);
   atmosphere.mesh.visible = !params.has('noatmo');
   scene.add(atmosphere.mesh);
@@ -392,6 +395,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const _qSpinInv = new Quaternion(); // inertial → body (for the body-fixed cut camera in fly/orbit)
   const _skyV = new Vector3();
   const _spunOrigin = new Vector3(); // renderOrigin rotated by qSpin, for the slope-band `up` uniform
+  const _camUp = new Vector3(); // scene-space camera radial up (for the atmosphere ray-march), per frame
   let hudDistMoon = 0; // true camera→body distances (scene space), for the HUD readout
   let hudDistSun = 0;
 
@@ -773,7 +777,19 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // Sun/Moon bodies) and consumes the REAL inertial sun direction — so day/night + the sun halo
       // come from the same geometry as the lit terrain (no separate sky light).
       atmosphere.mesh.position.set(-_spunOrigin.x, -_spunOrigin.y, -_spunOrigin.z);
+      // Feed the ray-march its precision-safe frame: the camera's radial `up` and altitude above the
+      // mean radius, both relative to the planet centre (scene `−_spunOrigin`). camRelCenter = camera
+      // scene pos − planetCentre = camera.position + _spunOrigin; |it| = distance from centre.
+      _camUp.copy(camera.position).add(_spunOrigin);
+      const camDist = Math.max(_camUp.length(), 1);
+      _camUp.multiplyScalar(1 / camDist);
+      if (daylit) {
+        _sunDir.copy(_camUp); // light the camera-facing hemisphere (tuning aid)
+        sun.position.copy(_sunDir).multiplyScalar(SUN_PROXY_DIST);
+      }
       atmosphere.sunDir.value.copy(_sunDir);
+      atmosphere.planetUp.value.copy(_camUp);
+      atmosphere.camAlt.value = Math.max(0, camDist - R);
       // R2: place the Sun + Moon as REAL bodies at their true planet-centered inertial positions, in
       // scene space (= inertialPC − spunOrigin), at real radii. From the planet they're tiny discs at the
       // correct angular size + direction; in creative (G) the floating origin rides the camera, so flying

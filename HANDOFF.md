@@ -349,6 +349,19 @@ leaves (no spike), no rAF `[Violation]` stalls.
      per-fragment noise cost (the cost S4 must bound) for no visible gain — documented in code. **Headless-
      confirmed:** orbit renders with softer mottle + warmer palette, no artifacts; typecheck + 129 tests + build
      green. ⚠ Real-GPU: judge the elevation tiers up close in daylight.
+   - **ATMOSPHERE OVERHAUL (user feedback "hard edge"; chose LUT + Earth-like + clouds + ocean).** The S1
+     shell read as a hard-edged ring (a thin mesh + Fresnel term = a geometric silhouette). Replaced with a
+     ray-marched soft-limb sky; full plan (LUT atmosphere + ocean + clouds) in the approved plan file.
+     - **Stage A DONE** (`src/render/atmosphere.ts` rewrite): a BackSide shell at R+100km whose colour is an
+       analytic single-scatter ray-march (Rayleigh+Mie+ozone, exp density) → the limb fades SMOOTHLY into
+       space (no silhouette) and the surface gets a real graded blue sky (deep zenith → pale horizon).
+       Precision-safe near the surface: the CPU feeds the camera's radial `up` + altitude (`atmosphere.planetUp`
+       /`atmosphere.camAlt`); per-sample altitude uses the difference-of-squares form (no |oc|²−R² cancellation).
+       New `?daylit` dev toggle lights the camera-facing hemisphere for tuning (preset/spawn spots sit near the
+       dim pole/terminator). **Headless-confirmed (`?webgl`):** soft limb (no hard edge); `?daylit` ground view
+       = graded blue sky + horizon desaturation; typecheck + 129 tests + build green. Thin limb at high orbit is
+       realistic (dramatic at low orbit); brightness/richness come in Stages B (transmittance+sky-view LUT), C
+       (multiscatter), E (preset lock). Then Phase O (ocean) + Phase C (clouds).
    - **S4 — perf hygiene done; 60fps lock is the real-GPU gate.** Micro-opt: the terrain shader now reuses one
      radial length for both the slope `up` and the elevation band (one sqrt/fragment, not two — hottest path).
      Headless `?perf` (orbit→mid→surface) confirms S1–S3 added **no unbounded main-thread work**: recut ≈14–20 ms
