@@ -77,12 +77,22 @@ export const BIRTH_MS = 500;
 // in a normal fly descent (the origin is fixed per preset), rare in a long walk.
 const DETAIL_PHASE_MOD_M = 100_000;
 
-// Procedural detail (ONE octave — the 6 m fine-grain octave was dropped for fill-rate; see the material
-// body). Coarse 40 m mottle fades in from ~50 km. Its distance gate (smoothstep far→near) is also its
-// anti-alias guard: it reaches 0 before the feature projects below ~1 px, so detail never shimmers. [T] tune.
-const DETAIL_A_SCALE_M = 40; // coarse mottle (~40 m features)
+// Procedural detail — TWO octaves, each with a distance gate that is also its anti-alias guard (the
+// smoothstep far→near reaches 0 before the feature projects below ~1 px, so detail never shimmers):
+//   • octave A (~40 m): near-ground fine grain, fades in from ~50 km (the 6 m octave was dropped for fill-rate).
+//   • octave C (~500 m): the ALTITUDE-BAND octave (NEW). The 40 m grain can't reach orbit (it would shimmer
+//     below a pixel), so from 130–280 km the surface had NO high-frequency content and read as flat "clay."
+//     A 500 m feature still projects to >~1 px at ~280 km, so this octave can run up to ~400 km, giving the
+//     surface relief shading + mottle from altitude. It's a BAND (off below ~2.5 km where octave A + the
+//     geometry already carry it, so we don't pay both noise taps at the surface). [T] tune.
+const DETAIL_A_SCALE_M = 40; // fine mottle (~40 m features)
 export const DETAIL_A_NEAR_M = 1_000;
 export const DETAIL_A_FAR_M = 50_000;
+const DETAIL_C_SCALE_M = 500; // coarse relief (~500 m features) for the altitude/orbit band
+export const DETAIL_C_NEAR_M = 12_000; // distance gate "near" (full strength at/below this)
+export const DETAIL_C_FAR_M = 400_000; // …fades to 0 beyond (anti-alias: a 500 m feature is ~1 px at ~280 km)
+const DETAIL_C_FADE_LO = 2_500; // band floor: octave C off below this (octave A + geometry cover the near field)
+const DETAIL_C_FADE_HI = 9_000; // …ramps to full by here
 // Retained for the manager's [NMS step] gB diagnostic only (the 6 m octave they gated is no longer shaded).
 export const DETAIL_B_NEAR_M = 200;
 export const DETAIL_B_FAR_M = 6_000;
@@ -264,22 +274,28 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     mat.normalNode = nGeom;
   } else {
     // ── Surface detail (fades in with proximity, on the morph's schedule) ───────
-    // ONE octave only (the fine 6 m octave was dropped — it only shows within ~6 km, rarely on screen).
-    // Stable, float-precise BODY-fixed coordinate (see header): positionLocal + the leaf centre reduced
-    // mod L (aCenterPhase). Body-fixed ⇒ the detail is locked to the ground through the planet's spin AND
-    // through floating-origin recenters. The mod-L (100 km) wrap seam is body-fixed and off-screen — L ≫
-    // the 40 m detail scale and detail only renders within ~50 km, so a 100 km-spaced seam never shows.
+    // TWO octaves: A (~40 m, near grain) + C (~500 m, altitude band). Both use the same stable, float-precise
+    // BODY-fixed coordinate (see header): positionLocal + the leaf centre reduced mod L (aCenterPhase).
+    // Body-fixed ⇒ the detail is locked to the ground through the planet's spin AND through floating-origin
+    // recenters. The mod-L (100 km) wrap seam is body-fixed and off-screen — L ≫ both detail scales and the
+    // 500 m octave only renders within ~400 km, so the 100 km-spaced seam never shows on screen.
     const pDetail = positionLocal.add(attribute('aCenterPhase', 'vec3'));
     // Weight: tie to the geometry morph (off where geometry collapses to its parent, so the two never fight)
     // AND a distance gate (anti-alias: 0 before the feature drops below a pixel).
     const morphW = mFinal.oneMinus(); // 1 near (full geometry detail) → 0 far (parent)
     const wA = morphW.mul(smoothstep(DETAIL_A_FAR_M, DETAIL_A_NEAR_M, dist));
+    // Octave C weight: distance gate (full ≤12 km, off >400 km) × a near-field floor so it's a BAND that
+    // switches off below ~2.5 km (octave A + the geometry carry the near field — avoids paying both taps).
+    const wC = morphW
+      .mul(smoothstep(DETAIL_C_FAR_M, DETAIL_C_NEAR_M, dist))
+      .mul(smoothstep(DETAIL_C_FADE_LO, DETAIL_C_FADE_HI, dist));
     const rc = pDetail.mul(1 / DETAIL_A_SCALE_M);
-    // ONE gradient-noise vec3 (≈[-1,1]³, reused for albedo mottle + roughness + normal perturbation). The
-    // mx_noise tap is the dominant per-fragment fill cost and at orbit/altitude wA is 0, so gate it behind a
-    // per-fragment branch (a Fn establishes the build stack If() needs; the compiler emits a REAL WGSL `if`,
-    // so the noise is genuinely SKIPPED where wA≈0). Returns 0 when skipped. (Triplanar was tried — 3 taps,
-    // ~3× the fill cost — but for ISOTROPIC noise the gain over a single 3D tap is marginal, so reverted.)
+    const rcC = pDetail.mul(1 / DETAIL_C_SCALE_M);
+    // Each gradient-noise vec3 (≈[-1,1]³, reused for albedo mottle + roughness + normal perturbation). The
+    // mx_noise tap is the dominant per-fragment fill cost, so each is gated behind a per-fragment branch (a Fn
+    // establishes the build stack If() needs; the compiler emits a REAL WGSL `if`, so the noise is genuinely
+    // SKIPPED where the weight ≈0). Near the surface octave A runs and C is off; at altitude A is off and C
+    // runs — so it's ~one tap either way, not two (except a thin overlap band). Returns 0 when skipped.
     const ndA = Fn(() => {
       const out = vec3(0).toVar();
       If(wA.greaterThan(0.001), () => {
@@ -287,11 +303,18 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
       });
       return out;
     })();
+    const ndC = Fn(() => {
+      const out = vec3(0).toVar();
+      If(wC.greaterThan(0.001), () => {
+        out.assign(mx_noise_vec3(rcC));
+      });
+      return out;
+    })();
 
-    // Albedo: ±fine mottle near (fading to the flat band colour with distance) PLUS analytic sedimentary
-    // strata on the steep ROCK zones (band→0 = rock) — altitude-banded layering that reads as layered cliffs
-    // without a noise tap. Both fade out with wA.
-    const mottle = ndA.x.mul(wA).mul(0.22);
+    // Albedo: ±fine mottle near + ±coarse mottle through the altitude band (so the surface isn't one flat
+    // tone from orbit) PLUS analytic sedimentary strata on the steep ROCK zones (band→0 = rock) — altitude-
+    // banded layering that reads as layered cliffs without a noise tap. All fade out with their weights.
+    const mottle = ndA.x.mul(wA).mul(0.22).add(ndC.x.mul(wC).mul(0.16));
     const strata = sin(elev.mul(STRATA_FREQ)).mul(band.oneMinus()).mul(wA).mul(STRATA_AMP);
     // Distance-reveal (anti-pop): pre-apply the micro-relief's mean self-shadow darkening where the relief
     // is still absent (far), lifting to 1 as it arrives (near) — so brightness is continuous across the band
@@ -302,10 +325,11 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     // Gentle roughness break-up so the surface doesn't read as one uniform sheen up close.
     mat.roughnessNode = float(0.92).sub(ndA.y.mul(wA).mul(0.06)).clamp(0.4, 1);
 
-    // Normal perturbation: tilt the morph normal by the TANGENTIAL part of the (triplanar) detail noise
-    // (remove the along-normal component so it tilts, not inflates), weighted so it vanishes where geometry
-    // morphs to the parent. Gives fine relief shading up close, smoothing out with distance.
-    const pert = ndA.mul(wA);
+    // Normal perturbation: tilt the morph normal by the TANGENTIAL part of the detail noise (remove the
+    // along-normal component so it tilts, not inflates), weighted so it vanishes where geometry morphs to the
+    // parent. Octave A gives fine relief up close; octave C (weighted a little lower) gives the coarse relief
+    // shading that turns the surface from flat "clay" into terrain when viewed from altitude.
+    const pert = ndA.mul(wA).add(ndC.mul(wC).mul(0.7));
     const pertTang = pert.sub(nGeom.mul(pert.dot(nGeom)));
     mat.normalNode = nGeom.add(pertTang.mul(0.3)).normalize();
   }

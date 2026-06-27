@@ -116,11 +116,11 @@ const FLY_SPLIT_PX = 300;
 // the [LAND] console block reports exactly what the on-screen land does). The decisive lighting signal is
 // N·sun (day/night), which is colour-independent; the lit-RGB is approximate (three sRGB→linearizes the
 // light colours; we don't, so treat lit-RGB as relative, N·sun + diffuse as authoritative).
-const LAND_SUN_INT = 1.4;                            // DirectionalLight intensity (scene.ts sun)
+const LAND_SUN_INT = 1.55;                           // DirectionalLight intensity (scene.ts sun)
 const LAND_SUN_COL = [1.0, 0.957, 0.902] as const;   // 0xfff4e6
 const LAND_HEMI_SKY = [0.533, 0.667, 0.8] as const;  // 0x88aacc HemisphereLight sky
 const LAND_HEMI_GROUND = [0.078, 0.063, 0.094] as const; // 0x141018 HemisphereLight ground
-const LAND_HEMI_INT = 0.25;
+const LAND_HEMI_INT = 0.12;
 const _landSs = (e0: number, e1: number, x: number): number => {
   let t = (x - e0) / (e1 - e0);
   if (t < 0) t = 0; else if (t > 1) t = 1;
@@ -314,10 +314,13 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const camera = new PerspectiveCamera(55, 1, R * 0.4, R * 8);
   const fovY = (camera.fov * Math.PI) / 180;
 
-  const sun = new DirectionalLight(0xfff4e6, 1.4);
+  // Sun a touch brighter + the sky-fill cut roughly in half: the strong hemisphere ambient was
+  // filling shadowed slopes and washing relief into flat "clay." Less fill ⇒ lit/shadow contrast
+  // returns and slopes read as relief. (Mirror these in the ?landlog constants below.)
+  const sun = new DirectionalLight(0xfff4e6, 1.55);
   sun.position.set(1, 0.35, 0.6);
   scene.add(sun);
-  scene.add(new HemisphereLight(0x88aacc, 0x141018, 0.25));
+  scene.add(new HemisphereLight(0x88aacc, 0x141018, 0.12));
 
   const controls = new OrbitControls(camera, canvas);
   controls.enableDamping = true;
