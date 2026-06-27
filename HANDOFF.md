@@ -14,24 +14,32 @@ A real-scale (Earth = 6,371 km) procedurally-generated planet you can fly from o
 descend (no popping/flicker). The vertical-slice core (CLAUDE.md Steps 0–4) is done, plus an extensive
 LOD-quality pass (continuous distance-morph, speed/altitude-aware prefetch, always-resident coarse base,
 analytic morph normals). **Steps 0–6 are now implemented** (Step 5 re-architected to the real reference-frame
-system — a genuinely spinning planet under a real far Sun + Moon you can fly to; Step 6 = atmosphere sky +
-aerial-perspective haze + elevation palette). **All visual + 60 fps acceptance is a real-GPU gate** (headless
-software-WebGL confirms correctness/render only). Remaining: real-GPU confirmation pass + the deferred
-refinements (velocity inheritance on launch, analytic eclipse, Moon as a landable body — see §6).
+system — a genuinely spinning planet under a real far Sun + Moon you can fly to; Step 6 = a **soft
+ray-marched atmosphere** with transmittance + multiscatter-proxy **LUTs**, aerial-perspective haze, an
+elevation palette, an **ocean** at sea level, and lit drifting **clouds** — the full Earth-like look).
+Flight is now an **untethered full-6DOF free-fly** (the default camera) with a **player-controlled throttle**
+(no altitude auto-scaling), **runtime time-rate control** (T: 1×/…/360×/pause), and **solid-planet
+collision** (you can't fly through the ground — underwater is allowed). **All visual + 60 fps acceptance is a
+real-GPU gate** (headless software-WebGL confirms correctness/render only). Remaining: real-GPU confirmation
+pass + the deferred refinements (velocity inheritance on launch, analytic eclipse, Moon as a landable body —
+see §6).
 
 ## 2. First 5 minutes (new session)
 ```bash
 cd No-Matts-Sky
 git pull   # a fresh clone is already on the task's feature branch — don't hard-code a branch name (it changes per task)
 npm install
-npm test          # 11 suites (golden/determinism): hash, noise, cubesphere, density, chunk, quadtree,
-                  #   seedchain, facts, surfacenets, core-boundary, digest
+npm test          # 12 suites (golden/determinism): hash, noise, cubesphere, density, chunk, quadtree,
+                  #   seedchain, facts, surfacenets, core-boundary, digest, orbits
 npm run build     # tsc --noEmit && vite build (the same gates CI runs — .github/workflows/ci.yml)
 npm run typecheck # tsc --noEmit
 npm run dev       # open the printed localhost URL in a WebGPU browser (Chrome/Edge)
 ```
-- Camera presets: **1** = orbit, **2** = mid, **3** = surface. **F** = walk, **G** = creative fly. Drag =
-  orbit, scroll = zoom.
+- **Default = untethered 6DOF free-fly:** **WASD** + **Space/Ctrl** (up/down) move along the camera, mouse
+  looks (no clamp — full inversion), **Q/E** roll, **R** smoothly re-levels the horizon, **X** full-stop,
+  **Shift** boost, **`[`/`]`** or **mouse wheel** set the throttle target, **T** cycles the game-time rate
+  (1×/60×/360×/pause). **F** = walk, **G** = toggle free-fly. **1/2/3** = orbit/mid/surface presets
+  (drag = orbit, scroll = zoom while in preset mode).
 - To judge LOD behavior, open with **`?lodaudit`** and watch the console `[NMS audit]` lines (see §7).
 - Headless screenshots + console (no human/GPU): `npm run shoot` → writes to `.shots/`
   (`QUERY='?lodaudit' npm run shoot mytag`). Uses Playwright + software WebGPU (SwiftShader).
@@ -62,13 +70,18 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
 | `chunk.ts` | `meshChunk`: 2-pass column-cache; per-corner density + `cornerNormal` + `cornerMorphNormal`; apron + conditioned skirts |
 | `constants.ts` | real radii (Earth 6.371e6, Moon 1.737e6, Mars 3.39e6 m) |
 | `facts.ts` | `PlaceFacts` schema + the slice's single barren planet (coordinate-seeded) |
+| `orbits.ts` | Kepler/NR (e≤0.8) `orbitalPosition`/`orbitalVelocity` + `spinAngle`; real Earth/Moon elements; frozen golden |
 
 | `/src/render` (Three.js) | role |
 |---|---|
 | `scene.ts` | render shell: WebGPU renderer, camera presets, floating-origin recentre, recut logic, prefetch/telemetry, all `?`-flags |
 | `terrainMaterial.ts` | the **ONE shared** terrain material (`createTerrainMaterial`): per-vertex CDLOD geomorph (position+normal, from `aLodR`/`aParentR` attrs + shared `kDist`) **and** distance-faded surface detail (slope bands + procedural `mx_noise` detail, faded by `1−mFinal`); `detailPhaseOf` = renderOrigin mod L (double) for swim-free, precise detail coords |
 | `quadtreeManager.ts` | streaming state machine (pending→inflight→ready→live→purged), worker pool, per-frame GPU upload budget; fills per-leaf `aLodR`/`aParentR` + renders every leaf with the shared material (clones only for debug tints), feeds the material's origin/detail-phase uniforms, all `[NMS …]` logging |
-| `player.ts` | character controller: walk/fly, ground collision via analytic `surfaceAt` probe |
+| `player.ts` | character controller: walk (gravity + ground collision) **and untethered 6DOF free-fly** (free-quaternion look, Q/E roll, smooth R, player throttle, **solid-planet collision**); collision via analytic `surfaceAt` probe |
+| `atmosphere.ts` | soft ray-marched single-scatter sky shell (Rayleigh+Mie+ozone) + aerial-perspective haze; LUT-fed |
+| `atmosphereLUT.ts` | one-time transmittance LUT (256×64 RGBA16F via `QuadMesh` pass) + multiscatter proxy; `?atmonolut` falls back to analytic |
+| `ocean.ts` | opaque sea-level water sphere (Fresnel sky-reflection, sun glint, day/night); land/sea by depth sort |
+| `clouds.ts` | lit, drifting fBm cloud shell at R+9 km (alpha-blended, depth-tested) |
 | `stats.ts` | FPS / frame-time overlay (turns red < 55 fps) |
 | `main.ts` | entry: WebGPU gate + animation loop |
 | `/src/workers/mesher.worker.ts` | off-thread meshing; returns mesh via **buffer transfer** (not copy) |
@@ -492,8 +505,8 @@ expensive O(live²) seam + O(96·live) coverage scans (off by default even under
 - Add/extend a **golden test** whenever you add a core generation function.
 
 ## 9. Tests
-`npm test` → `src/test/{hash,noise,cubesphere,density,chunk,quadtree,seedchain,facts,surfacenets,core-boundary,digest}.test.ts`
-(119 tests, 11 suites). Golden/determinism via
+`npm test` → `src/test/{hash,noise,cubesphere,density,chunk,quadtree,seedchain,facts,surfacenets,core-boundary,digest,orbits}.test.ts`
+(129 tests, 12 suites). Golden/determinism via
 `toMatchInlineSnapshot` + FNV-1a digest (`src/test/digest.ts`). These are **frozen** — if a golden value
 changes, the generation pipeline drifted (and the future Rust port would diverge); only re-bless
 deliberately (e.g. the planned `edgeMask` change will legitimately regenerate mesher digests).
