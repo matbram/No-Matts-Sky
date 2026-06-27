@@ -13,8 +13,11 @@ A real-scale (Earth = 6,371 km) procedurally-generated planet you can fly from o
 **walk on**, at a locked **60 fps**, with **seamless, pop-free CDLOD terrain** that "gets clearer" as you
 descend (no popping/flicker). The vertical-slice core (CLAUDE.md Steps 0–4) is done, plus an extensive
 LOD-quality pass (continuous distance-morph, speed/altitude-aware prefetch, always-resident coarse base,
-analytic morph normals). **Remaining slice work: Step 5 (real spin/orbit — day/night, moving sun, moon
-shadow, velocity-inheriting launch) and Step 6 (atmosphere LUT + triplanar materials + final 60fps lock).**
+analytic morph normals). **Steps 0–6 are now implemented** (Step 5 re-architected to the real reference-frame
+system — a genuinely spinning planet under a real far Sun + Moon you can fly to; Step 6 = atmosphere sky +
+aerial-perspective haze + elevation palette). **All visual + 60 fps acceptance is a real-GPU gate** (headless
+software-WebGL confirms correctness/render only). Remaining: real-GPU confirmation pass + the deferred
+refinements (velocity inheritance on launch, analytic eclipse, Moon as a landable body — see §6).
 
 ## 2. First 5 minutes (new session)
 ```bash
@@ -346,8 +349,22 @@ leaves (no spike), no rAF `[Violation]` stalls.
      per-fragment noise cost (the cost S4 must bound) for no visible gain — documented in code. **Headless-
      confirmed:** orbit renders with softer mottle + warmer palette, no artifacts; typecheck + 129 tests + build
      green. ⚠ Real-GPU: judge the elevation tiers up close in daylight.
-   - **S4 — lock 60fps + per-leaf attr fix**: profile `?perf`; move per-leaf constant attributes
-     (`aLodR`/`aParentR`/`aBirthMs`) → per-mesh uniforms (audit finding); confirm worstDt < 16.67 ms on a real GPU.
+   - **S4 — perf hygiene done; 60fps lock is the real-GPU gate.** Micro-opt: the terrain shader now reuses one
+     radial length for both the slope `up` and the elevation band (one sqrt/fragment, not two — hottest path).
+     Headless `?perf` (orbit→mid→surface) confirms S1–S3 added **no unbounded main-thread work**: recut ≈14–20 ms
+     (one-off on a preset switch), upload ≈0.4–1.7 ms, tick ≈0.1–0.3 ms; live ≈72–104 draws (bounded), churn 1–2/s
+     (no thrash); the huge `gpu/other` is purely software-WebGL (SwiftShader CPU) fragment cost that a real GPU
+     eliminates. ⚠ **Real-GPU gate (unchanged):** `?perf` worstDt < 16.67 ms across surface→orbit→Moon→Sun; the
+     levers if it's tight are `?dpr=1`, `?nodetail`, `?noatmo`/`?nohaze`, lowering `MAX_DEPTH`.
+     - **Per-leaf attr → per-mesh uniform: deliberately DEFERRED (not the bottleneck; morph-risk).** The audit's
+       suggestion to move `aLodR`/`aParentR`/`aBirthMs` off per-vertex attributes was NOT done: (1) the measured
+       descent bottleneck is meshing throughput, not attribute upload (HANDOFF "Measured-good"); (2) per-mesh
+       uniforms don't bind cleanly to a SHARED Three-WebGPU node material (the per-vertex constant IS the standard
+       workaround — the alternative is a per-leaf material clone, which is what the shared material exists to
+       avoid); (3) `aParentR` can't be derived from `aLodR` in-shader (BOUND_FACTOR's parent/child ratio runs
+       1.52→2 by depth, not constant). Risking the load-bearing CDLOD morph for a one-time-per-leaf upload trim
+       that isn't the bottleneck violates the prime directive. Revisit only if a real-GPU `?perf` shows upload as
+       the spike, or when a 2D-textured archetype makes true triplanar (and per-mesh data) worthwhile.
    - Deferred refinements: velocity inheritance on launch; unify orbit presets into one seamless free-flight;
      nearest-body speed scaling; un-swim surface detail under spin; analytic eclipse; Moon as a real landable body.
 

@@ -220,17 +220,20 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
   // reused for both the radial `up` and the elevation band below. slope=1 where the surface faces straight
   // up (flat) → sand; lower → rock.
   const r = positionWorld.add(uRenderOrigin);
-  const up = r.normalize();
+  // One radial length, reused for BOTH the slope `up` (= r/|r|) and the elevation band below — saves a
+  // sqrt per fragment vs a separate normalize()+length() in the hottest (every-terrain-fragment) path.
+  const rLen = r.length();
+  const up = r.div(rLen);
   const slope = nGeom.dot(up).clamp(0, 1);
   const sb = SLOPE_PRESETS[Math.min(Math.max((opts.slopePreset ?? 0) | 0, 0), SLOPE_PRESETS.length - 1)]!;
   const band = smoothstep(sb.lo, sb.hi, slope);
   const slopeAlbedo = mix(vec3(...sb.rock), vec3(...sb.sand), band);
 
   // Elevation palette band (S3): blend the slope albedo toward darker lowland / paler highland by the
-  // fragment's normalized height above the mean radius. Cheap (one length + two smoothsteps); always on.
+  // fragment's normalized height above the mean radius. Cheap (two smoothsteps, reuses rLen); always on.
   const radius = opts.radius ?? 0;
   const heightAmp = opts.heightAmp ?? 1;
-  const elev = r.length().sub(radius).div(heightAmp); // ≈ [-1, 1] (surface = R + fBm·height)
+  const elev = rLen.sub(radius).div(heightAmp); // ≈ [-1, 1] (surface = R + fBm·height)
   const lowW = smoothstep(LOW_HI, LOW_LO, elev); // 1 in deep valleys → 0 above LOW_HI
   const peakW = smoothstep(PEAK_LO, PEAK_HI, elev); // 0 below PEAK_LO → 1 high up
   const albedo = mix(mix(slopeAlbedo, vec3(...LOW_COLOR), lowW), vec3(...PEAK_COLOR), peakW);
