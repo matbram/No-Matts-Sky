@@ -107,6 +107,23 @@ export interface SlopePreset {
   rock: readonly [number, number, number];
   sand: readonly [number, number, number];
 }
+// ── Elevation palette (S3) ───────────────────────────────────────────────────
+// A 3rd material tier on top of the slope rock/sand: pale dusty highlands up high, darker regolith down
+// low, so the barren palette varies by elevation. Cheap — no noise: a smoothstep on the fragment's radius
+// above the mean (reusing the slope `up` vector's magnitude). Always on, so it reads as large-scale
+// highland/lowland tinting from orbit AND grounds the surface. Cosmetic (render-only; no determinism).
+// NB on "triplanar": the surface detail is isotropic 3D gradient noise (mx_noise_vec3 of the world
+// position) — it has no single-axis projection to stretch, so literal 3-axis triplanar would only triple
+// the dominant per-fragment noise cost (the very cost S4 must bound) for no visible gain. The elevation
+// band is the S3 palette win instead; triplanar is the right tool only if a future 2D-textured archetype
+// is added.
+const PEAK_COLOR = [0.66, 0.62, 0.55] as const; // pale dusty highlands
+const LOW_COLOR = [0.33, 0.27, 0.23] as const; // darker lowland regolith
+const PEAK_LO = 0.20; // elevation (× height amplitude) where highlands start to fade in
+const PEAK_HI = 0.85; // …and reach full highland colour
+const LOW_HI = -0.10; // lowland tint starts fading in as elevation drops below this
+const LOW_LO = -0.70; // …and reaches full lowland colour
+
 export const SLOPE_PRESETS: readonly SlopePreset[] = [
   { lo: 0.55, hi: 0.82, rock: [0.40, 0.36, 0.33], sand: [0.62, 0.55, 0.45] }, // 0 current — hard mottle (A/B ref)
   { lo: 0.25, hi: 0.98, rock: [0.40, 0.36, 0.33], sand: [0.62, 0.55, 0.45] }, // 1 wide band — flip → gradient, same colours
@@ -121,6 +138,10 @@ export interface TerrainMaterialOpts {
   /** ?nodetail: build WITHOUT the two per-pixel mx_noise_vec3 (+ mottle + normal perturbation) — a GPU
    *  fill-rate probe / cheap fallback. Geometry morph + slope-band albedo are kept. */
   noDetail?: boolean;
+  /** Mean planet radius (m) + terrain height amplitude (m) — shader constants for the S3 elevation
+   *  palette band (`(|p|−radius)/heightAmp` ≈ normalized elevation). Constant for the slice's one planet. */
+  radius?: number;
+  heightAmp?: number;
 }
 
 export interface TerrainMaterialHandle {
@@ -195,13 +216,24 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     mFinal,
   ).normalize();
 
-  // Slope material bands (always). up = per-pixel radial direction (precision-robust: direction of a huge
-  // vector). slope=1 where the surface faces straight up (flat) → sand; lower → rock.
-  const up = positionWorld.add(uRenderOrigin).normalize();
+  // Slope material bands (always). r = the fragment's inertial position (precision-robust as a direction);
+  // reused for both the radial `up` and the elevation band below. slope=1 where the surface faces straight
+  // up (flat) → sand; lower → rock.
+  const r = positionWorld.add(uRenderOrigin);
+  const up = r.normalize();
   const slope = nGeom.dot(up).clamp(0, 1);
   const sb = SLOPE_PRESETS[Math.min(Math.max((opts.slopePreset ?? 0) | 0, 0), SLOPE_PRESETS.length - 1)]!;
   const band = smoothstep(sb.lo, sb.hi, slope);
-  const albedo = mix(vec3(...sb.rock), vec3(...sb.sand), band);
+  const slopeAlbedo = mix(vec3(...sb.rock), vec3(...sb.sand), band);
+
+  // Elevation palette band (S3): blend the slope albedo toward darker lowland / paler highland by the
+  // fragment's normalized height above the mean radius. Cheap (one length + two smoothsteps); always on.
+  const radius = opts.radius ?? 0;
+  const heightAmp = opts.heightAmp ?? 1;
+  const elev = r.length().sub(radius).div(heightAmp); // ≈ [-1, 1] (surface = R + fBm·height)
+  const lowW = smoothstep(LOW_HI, LOW_LO, elev); // 1 in deep valleys → 0 above LOW_HI
+  const peakW = smoothstep(PEAK_LO, PEAK_HI, elev); // 0 below PEAK_LO → 1 high up
+  const albedo = mix(mix(slopeAlbedo, vec3(...LOW_COLOR), lowW), vec3(...PEAK_COLOR), peakW);
 
   if (opts.noDetail) {
     // GPU fill-rate probe / cheap fallback: no procedural detail at all (the two mx_noise_vec3, the mottle,

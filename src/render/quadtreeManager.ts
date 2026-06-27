@@ -237,7 +237,13 @@ export class QuadtreeManager {
     this.heightMargin = recipe.height * 1.6;
     // The ONE shared terrain material (per-leaf data rides in the `aLodR`/`aParentR` attributes); its kDist
     // uniform is updated each frame via setMorphParams.
-    const handle = createTerrainMaterial({ wireframe: opts.wireframe, slopePreset: opts.slopePreset, noDetail: opts.noDetail });
+    const handle = createTerrainMaterial({
+      wireframe: opts.wireframe,
+      slopePreset: opts.slopePreset,
+      noDetail: opts.noDetail,
+      radius, // S3 elevation band: mean planet radius + terrain amplitude as shader constants
+      heightAmp: recipe.height,
+    });
     this.sharedMat = handle.material;
     this.kDistUniform = handle.kDist;
     this.matRenderOrigin = handle.renderOrigin;

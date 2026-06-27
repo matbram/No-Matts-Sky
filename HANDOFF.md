@@ -336,9 +336,16 @@ leaves (no spike), no rAF `[Violation]` stalls.
      +9 blue-shift (B−R) to distant terrain — the aerial-perspective signature. ⚠ Real-GPU: the full daylit look
      is best judged flying the **day-side equator** (the fixed headless spawn spot sits near the spin pole, so
      it's perpetually grazing-lit/dim — not a bug, just the test view).
-   - **S3 — triplanar + altitude band + palette lock**: upgrade the single-coord detail to true triplanar (3 axis
-     samples weighted by the morph-normal) + a 3rd altitude/peak band; keep behind the noise-skip `If` + near gate;
-     pick a `SLOPE_PRESETS` winner.
+   - **S3 — elevation palette band + slope-preset lock: DONE** (`terrainMaterial.ts`). A 3rd material tier on
+     top of the slope rock/sand — pale dusty **highlands** up high, darker **lowland** regolith down low — keyed
+     to the fragment's normalized height `(|p|−R)/heightAmp` (cheap: one length + two smoothsteps, no noise,
+     always on → reads as large-scale highland/lowland tinting from orbit and grounds the surface). Slope preset
+     locked to **2** (low-contrast — mutes preset 0's harsh black/tan salt-and-pepper; `?slopeband=N` overrides).
+     **Deliberately NOT literal 3-axis triplanar:** the detail is isotropic 3D gradient noise (`mx_noise_vec3` of
+     the world position) with no single-axis projection to stretch, so triplanar would only triple the dominant
+     per-fragment noise cost (the cost S4 must bound) for no visible gain — documented in code. **Headless-
+     confirmed:** orbit renders with softer mottle + warmer palette, no artifacts; typecheck + 129 tests + build
+     green. ⚠ Real-GPU: judge the elevation tiers up close in daylight.
    - **S4 — lock 60fps + per-leaf attr fix**: profile `?perf`; move per-leaf constant attributes
      (`aLodR`/`aParentR`/`aBirthMs`) → per-mesh uniforms (audit finding); confirm worstDt < 16.67 ms on a real GPU.
    - Deferred refinements: velocity inheritance on launch; unify orbit presets into one seamless free-flight;

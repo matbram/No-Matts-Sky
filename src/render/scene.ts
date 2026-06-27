@@ -300,9 +300,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     splitPx: FLY_SPLIT_PX,
     maxDepth: MAX_DEPTH,
     wireframe: params.has('wire'), // debug: see the tessellation / where lines fall
-    // ?slopeband=N: pick a slope-band "look" preset (0=current/hard, 1=wide, 2=low-contrast, 3=soft).
-    // Render-only cosmetic; default 0 leaves today's look unchanged.
-    slopePreset: Number(params.get('slopeband')) || 0,
+    // ?slopeband=N: pick a slope-band "look" preset (0=hard, 1=wide, 2=low-contrast, 3=soft).
+    // S3 locked the winner to 2 (low-contrast: keeps slope definition, mutes the harsh black/tan
+    // salt-and-pepper of 0) — it reads cleaner under the new elevation palette band. ?slopeband=N overrides.
+    slopePreset: params.has('slopeband') ? Number(params.get('slopeband')) : 2,
     // ?nodetail: GPU probe — build the terrain material WITHOUT the two per-pixel mx_noise_vec3 (+ mottle
     // + normal perturbation). If this collapses gpu/other, the procedural noise is the fill-rate cost.
     noDetail: params.has('nodetail'),
