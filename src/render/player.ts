@@ -30,9 +30,13 @@ export interface WalkInput {
   back: boolean;
   left: boolean;
   right: boolean;
-  jump: boolean; // walk: jump · fly: ascend (Space)
+  jump: boolean; // walk: jump · fly: ascend along camera-up (Space)
   sprint: boolean; // walk: run · fly: boost (Shift)
-  down: boolean; // fly: descend (Ctrl); ignored in walk
+  down: boolean; // fly: descend along camera-down (Ctrl); ignored in walk
+  rollLeft: boolean; // fly: bank/roll left (Q); ignored in walk
+  rollRight: boolean; // fly: bank/roll right (E); ignored in walk
+  level: boolean; // fly: ease orientation back upright to the planet (R); ignored in walk
+  brake: boolean; // fly: instant full-stop (X); ignored in walk
 }
 
 const NO_INPUT: WalkInput = {
@@ -43,6 +47,10 @@ const NO_INPUT: WalkInput = {
   jump: false,
   sprint: false,
   down: false,
+  rollLeft: false,
+  rollRight: false,
+  level: false,
+  brake: false,
 };
 
 // Tunables [T].
@@ -62,16 +70,24 @@ const MAX_DT = 0.05; // clamp dt (s) so an alt-tab hitch can't fling/tunnel
 const BODY_R = 0.4; // m — footprint half-width (player body radius)
 const STEP_AHEAD = 0.5; // m — forward look-ahead probe along the move direction
 
-// Creative-flight [T]: spaceship-style AUTO-SCALING cruise (Space-Engine/Elite feel). Speed ramps with
-// ALTITUDE above the surface — slow + precise on the deck, blazing in deep space — so you reach the Moon
-// in seconds and the Sun in ~15 min without gear-shifting. `[`/`]` apply a manual throttle multiplier;
-// Shift boosts. Replaces the old fixed speed ladder (whose ~40 km/s top made the Moon ~2.7 h away).
-const FLY_MIN = 20; // m/s floor (fine control near the ground)
-const FLY_CAP = 0.3 * 299_792_458; // ≈ 8.99e7 m/s (0.3c) hard cap — interplanetary cruise, not instant
-const FLY_RATE = 0.7; // cruise ≈ altitudeAboveSurface × this per second (cross your altitude in ~1.4 s)
-const FLY_THROTTLES = [0.1, 0.25, 0.5, 1, 2, 4] as const; // `[`/`]` manual multiplier on the auto cruise
-const FLY_THROTTLE_DEFAULT = 3; // index → 1×
-const FLY_BOOST = 4; // Shift multiplier in fly
+// Creative-flight [T]: PLAYER-CONTROLLED throttle (you only go faster when you choose to — no altitude
+// auto-scaling). The throttle is an ABSOLUTE target-speed ladder; `[`/`]` + mouse-wheel step it, Shift
+// boosts, and the craft eases (critically-damped, no overshoot) toward the target so holding a direction
+// ramps up smoothly and releasing eases to a stop. X stops dead.
+const FLY_CAP = 0.3 * 299_792_458; // ≈ 8.99e7 m/s (0.3c) hard cap on the throttle target
+const FLY_THROTTLE_SPEEDS = [
+  5, 20, 75, 300, 1_200, 5_000, 20_000, 80_000, 350_000, 1.5e6, 7e6, 3e7, FLY_CAP,
+] as const; // ~5 m/s … 0.3c, log-spaced
+const FLY_THROTTLE_DEFAULT = 6; // index → 20 km/s (perceptible from the orbit spawn; wheel down near the deck)
+const FLY_BOOST = 4; // Shift multiplier on the throttle target
+const ACCEL_RATE = 3; // velocity ease rate (1/s): ~95% of target in ~1 s, no overshoot
+const ROLL_SPEED = 1.6; // rad/s bank rate (Q/E)
+
+// Canonical local axes for the free-fly quaternion math (shared immutables — never mutated).
+const AX_X = new Vector3(1, 0, 0);
+const AX_Y = new Vector3(0, 1, 0);
+const AX_Z = new Vector3(0, 0, 1);
+const ZERO = new Vector3(0, 0, 0);
 // Octave counts the clip-debug probe samples alongside the collision count, to
 // quantify how far the surface moves per LOD level (the geomorph/streaming transient).
 const DEBUG_OCTAVES = [14, 12, 10, 4] as const;
@@ -109,6 +125,13 @@ export class PlayerController {
   private readonly _zAxis = new Vector3();
   private readonly _m = new Matrix4();
   private readonly _quat = new Quaternion();
+  // Free 6DOF fly state: a free orientation quaternion + a persistent velocity eased toward the throttle
+  // target. Used only in fly mode; walk keeps yaw/pitch + the radial-up basis.
+  private readonly _flyQuat = new Quaternion();
+  private readonly _vel = new Vector3();
+  private readonly _upCam = new Vector3();
+  private readonly _dqA = new Quaternion();
+  private readonly _dqB = new Quaternion();
   private readonly _surf = new Float64Array(7);
   private readonly _probe = new Float64Array(7); // footprint sample scratch
   private readonly _moveDir = new Vector3(); // unit tangential move dir (0 when idle)
@@ -147,29 +170,33 @@ export class PlayerController {
     this.radialVel = 0;
     this.grounded = true;
     this.speedEst = 0;
+    this._vel.set(0, 0, 0); // fly velocity reset on every (re)spawn / teleport
     // Populate _surf/_centerSurfR + camera quaternion. Walk snaps to ground; fly stays put.
-    if (this.flyMode) this.updateFly(0, NO_INPUT);
-    else this.update(0, NO_INPUT);
+    if (this.flyMode) {
+      // Seed the free 6DOF orientation from the radial-up basis at spawn (upright, facing the heading),
+      // so entering free-fly is seamless; it's fully free from then on.
+      this.basis();
+      this.orient();
+      this._flyQuat.copy(this._quat);
+      this.updateFly(0, NO_INPUT);
+    } else {
+      this.update(0, NO_INPUT);
+    }
   }
 
   /** Enter/leave creative free-fly (no gravity, no terrain collision). */
   setFly(on: boolean): void {
     this.flyMode = on;
   }
-  /** Cycle the manual throttle multiplier (`[`/`]`, dir +1/−1) on the auto cruise. No-op while walking. */
+  /** Step the throttle target speed (`[`/`]`/wheel, dir +1/−1) along the absolute ladder. No-op walking. */
   cycleSpeed(dir: number): void {
-    this.flyThrottleIdx = Math.max(0, Math.min(FLY_THROTTLES.length - 1, this.flyThrottleIdx + Math.sign(dir)));
+    this.flyThrottleIdx = Math.max(0, Math.min(FLY_THROTTLE_SPEEDS.length - 1, this.flyThrottleIdx + Math.sign(dir)));
   }
 
-  /**
-   * Auto-scaling cruise speed (m/s): ramps with altitude above the surface (slow on the deck → fast in
-   * deep space) × the manual throttle, hard-capped at FLY_CAP (0.3c). The Shift boost is applied on top
-   * by the movement code. Pure read of the current position; safe to call from the HUD or the update.
-   */
-  private cruiseSpeed(): number {
-    const alt = Math.max(0, this.worldPos.length() - this.planetRadius); // altitude above mean radius
-    const base = Math.min(FLY_CAP, Math.max(FLY_MIN, alt * FLY_RATE));
-    return Math.min(FLY_CAP, base * FLY_THROTTLES[this.flyThrottleIdx]!);
+  /** Player-set throttle TARGET speed (m/s): the absolute ladder value at the current throttle index — no
+   *  altitude scaling, so you only go faster when you raise the throttle. The craft eases toward this. */
+  private throttleSpeed(): number {
+    return FLY_THROTTLE_SPEEDS[this.flyThrottleIdx]!;
   }
   isFlying(): boolean {
     return this.flyMode;
@@ -177,6 +204,14 @@ export class PlayerController {
 
   /** Accumulate mouse-look (pointer-lock movementX/Y, pixels). */
   addMouse(dx: number, dy: number): void {
+    if (this.flyMode) {
+      // Free 6DOF look: incremental LOCAL yaw (about camera up) + pitch (about camera right). No clamp,
+      // no forced planet-up — look anywhere, including straight up and over the top. Roll is via Q/E.
+      this._dqA.setFromAxisAngle(AX_Y, -dx * MOUSE_SENS);
+      this._dqB.setFromAxisAngle(AX_X, -dy * MOUSE_SENS);
+      this._flyQuat.multiply(this._dqA).multiply(this._dqB).normalize();
+      return;
+    }
     this.yaw += dx * MOUSE_SENS; // mouse-right turns right
     this.pitch -= dy * MOUSE_SENS; // mouse-up looks up
     if (this.pitch > PITCH_LIMIT) this.pitch = PITCH_LIMIT;
@@ -314,35 +349,44 @@ export class PlayerController {
   }
 
   /**
-   * Creative free-fly update: move in the LOOK direction (W/S) + right (A/D) + radial
-   * (Space up, Ctrl down), at the current speed ladder × Shift boost. NO gravity, NO
-   * surfaceAt floor, NO collision — you pass through terrain (that's the point). We
-   * still sample the surface once for the altitude() HUD readout. Zero per-frame alloc.
+   * Creative free-fly update — TRUE 6DOF (Superman). Orientation is a free quaternion (`_flyQuat`): mouse
+   * looks anywhere (no clamp), Q/E roll/bank, R re-levels to the planet. Movement is fully camera-relative
+   * (W/S along look, A/D along camera right, Space/Ctrl along CAMERA up — not the planet's). Speed is
+   * PLAYER-CONTROLLED: a velocity eased (critically-damped, no overshoot) toward `throttleSpeed × boost`
+   * along the thrust direction, so holding a key ramps up and releasing eases to a stop; X stops dead. NO
+   * gravity / collision (you pass through terrain — that's the point). One surfaceAt sample for the HUD.
    */
   updateFly(dtRaw: number, input: WalkInput): void {
     const dt = Math.min(Math.max(dtRaw, 0), MAX_DT);
-    this.basis();
-    // Look direction (yaw heading tilted by pitch) — fly moves along the full 3-D look.
-    this._look
-      .copy(this._fwd)
-      .multiplyScalar(Math.cos(this.pitch))
-      .addScaledVector(this._up, Math.sin(this.pitch))
-      .normalize();
-    const speed = Math.min(FLY_CAP, this.cruiseSpeed() * (input.sprint ? FLY_BOOST : 1));
+    // Roll (Q/E) about the camera's local forward; R eases back upright relative to the planet.
+    if (input.rollLeft) this._flyQuat.multiply(this._dqA.setFromAxisAngle(AX_Z, ROLL_SPEED * dt));
+    if (input.rollRight) this._flyQuat.multiply(this._dqA.setFromAxisAngle(AX_Z, -ROLL_SPEED * dt));
+    if (input.level) this.levelFly();
+    this._flyQuat.normalize();
+
+    // Camera-relative 6DOF axes from the free orientation.
+    this._fwd.set(0, 0, -1).applyQuaternion(this._flyQuat);
+    this._right.set(1, 0, 0).applyQuaternion(this._flyQuat);
+    this._upCam.set(0, 1, 0).applyQuaternion(this._flyQuat);
+
+    // Desired velocity = combined thrust direction × throttle target (× Shift boost), capped.
     this._move.set(0, 0, 0);
-    if (input.forward) this._move.add(this._look);
-    if (input.back) this._move.sub(this._look);
+    if (input.forward) this._move.add(this._fwd);
+    if (input.back) this._move.sub(this._fwd);
     if (input.right) this._move.add(this._right);
     if (input.left) this._move.sub(this._right);
-    if (input.jump) this._move.add(this._up); // ascend
-    if (input.down) this._move.sub(this._up); // descend
-    if (this._move.lengthSq() > 0) {
-      this._move.normalize().multiplyScalar(speed * dt);
-      this.worldPos.add(this._move);
-      this.speedEst = speed;
-    } else {
-      this.speedEst = 0;
-    }
+    if (input.jump) this._move.add(this._upCam); // ascend along camera up
+    if (input.down) this._move.sub(this._upCam); // descend along camera down
+    const target = Math.min(FLY_CAP, this.throttleSpeed() * (input.sprint ? FLY_BOOST : 1));
+    if (this._move.lengthSq() > 0) this._move.normalize().multiplyScalar(target);
+    // else `_move` stays 0 → ease to a stop (no free coasting; predictable).
+
+    // Critically-damped ease toward the desired velocity (no overshoot), then integrate.
+    this._vel.lerp(this._move, 1 - Math.exp(-ACCEL_RATE * dt));
+    if (input.brake) this._vel.set(0, 0, 0); // instant full-stop (X)
+    this.worldPos.addScaledVector(this._vel, dt);
+    this.speedEst = this._vel.length();
+
     this.radialVel = 0; // no gravity in fly; reset so re-entering walk doesn't inherit a fall
     this.grounded = false;
     // Surface under the eye, for the altitude() HUD only (does not affect movement).
@@ -353,8 +397,33 @@ export class PlayerController {
     );
     this._centerSurfR = this._surf[0]!;
     this._fpMaxR = this._centerSurfR; // so altitude() (eye above surface) works in fly too
-    this.orient();
+    // Camera = the free orientation; look = forward.
+    this._quat.copy(this._flyQuat);
+    this._look.copy(this._fwd);
     void spinAngle(); // Step 5 seam (identity now)
+  }
+
+  /**
+   * Re-level the free orientation to the planet: keep the current heading (forward projected onto the
+   * tangent plane) but set up = radial. For the R "level" key — recovers from a tumble. Instant (called
+   * each frame while R is held). Reuses the orient() scratch.
+   */
+  private levelFly(): void {
+    this._up.copy(this.worldPos).normalize(); // radial up
+    this._fwd.set(0, 0, -1).applyQuaternion(this._flyQuat); // current forward
+    this._look.copy(this._fwd).addScaledVector(this._up, -this._fwd.dot(this._up)); // tangent heading
+    if (this._look.lengthSq() < 1e-8) {
+      // Looking straight up/down → pick any tangent so the basis is well-defined.
+      if (Math.abs(this._up.y) < 0.99) this._ref.set(0, 1, 0);
+      else this._ref.set(1, 0, 0);
+      this._look.crossVectors(this._ref, this._up);
+    }
+    this._look.normalize();
+    this._zAxis.copy(this._look).multiplyScalar(-1);
+    this._xAxis.crossVectors(this._up, this._zAxis).normalize();
+    this._yAxis.crossVectors(this._zAxis, this._xAxis).normalize();
+    this._m.makeBasis(this._xAxis, this._yAxis, this._zAxis);
+    this._flyQuat.setFromRotationMatrix(this._m);
   }
 
   /**
@@ -386,6 +455,17 @@ export class PlayerController {
     if (gap < this._minGap) this._minGap = gap;
   }
 
+  /** Aim the free-fly camera toward the planet centre (used for the initial spawn so you see the planet,
+   *  not empty space tangent to the surface). Fly mode only. */
+  aimAtPlanet(): void {
+    this._look.copy(this.worldPos).multiplyScalar(-1).normalize(); // direction toward the planet centre
+    this._ref.set(0, 1, 0);
+    if (Math.abs(this._look.dot(this._ref)) > 0.99) this._ref.set(1, 0, 0); // avoid a degenerate up
+    this._m.lookAt(ZERO, this._look, this._ref); // -Z → toward the centre
+    this._flyQuat.setFromRotationMatrix(this._m);
+    this._quat.copy(this._flyQuat);
+  }
+
   getWorldPos(out: Vector3): void {
     out.copy(this.worldPos);
   }
@@ -413,9 +493,9 @@ export class PlayerController {
   nearestSurfaceGap(): number {
     return this._minGap;
   }
-  /** Current cruise speed (m/s) at this altitude × throttle, before Shift boost — for the HUD. */
+  /** Current throttle TARGET speed (m/s), before Shift boost — for the HUD (the current speed is `speed()`). */
   flySpeed(): number {
-    return this.cruiseSpeed();
+    return this.throttleSpeed();
   }
   /**
    * Clip-debug snapshot for the `?clipdebug` console line (debug path only). Writes,

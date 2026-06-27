@@ -276,6 +276,17 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
     `clamp(altitude × 0.7, 20 m/s, 0.3c)` × throttle; `[`/`]` throttle, Shift boost. The Moon is reachable in
     seconds, the Sun in ~minutes (the old ~40 km/s ladder made the Moon ~2.7 h away — that's why "fly to it" felt
     broken). HUD shows cruise speed + distance-to-Moon/Sun.
+  - **FF (free-flight overhaul) — Phase 1 DONE** (`player.ts` + `scene.ts`): user feedback "stuck on an axis /
+    invisible guideline." Free-fly now has a **free orientation quaternion** (`_flyQuat`): mouse looks anywhere
+    (no pitch clamp, no forced planet-up), **Q/E roll/bank**, **R re-level**; movement is fully **camera-relative
+    6DOF** (W=look, A/D=camera right, Space/Ctrl=camera up). **Speed is player-controlled** (replaced altitude
+    auto-scaling): an absolute **throttle ladder** (`[`/`]` + mouse wheel), the velocity **eases** toward the
+    throttle target (critically-damped, no overshoot), **Shift** boosts, **X** full-stops. **Free-fly is the
+    default camera on load** (aimed at the planet); orbit-drag + **1/2/3** presets and **F** walk remain; **G**
+    toggles. **T** cycles the game-time rate (1×/60×/360×/pause) so things run at real speed; HUD shows it. Walk
+    mode unchanged. Headless-confirmed: presets + walk still render, typecheck + 129 tests + build green. ⚠
+    Real-GPU: the 6DOF feel. **Phase 2 (deferred):** altitude-aware frame — inertial in space (planet rotates
+    beneath), body-fixed + gravity in the atmosphere — with a smooth blend (gravity feel to be confirmed).
 - **Step 6 (S1) — atmosphere sky + sun glow** (`src/render/atmosphere.ts`, this commit). A planet-centered shell
   at `R·1.025` (BackSide, additive, depth-tested but not depth-writing) with an analytic single-scatter colour
   (Rayleigh blue + limb/horizon brightening + a Mie forward-glow sun halo), fed the SAME real `_sunDir` as the

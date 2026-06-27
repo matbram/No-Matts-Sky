@@ -196,10 +196,20 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // Step 5 (real spin/orbit): ?timescale=N overrides the base game-time multiplier (how fast a
   // day/orbit passes while testing); ?notime freezes the clock for A/B; ?noshadow disables the
   // moon's cast shadow (so a shadow-path issue can't block the rest of Step 5).
-  const timeScale = (() => {
+  // Game-time multiplier. Now RUNTIME-adjustable (the `T` key cycles TIME_RATES) so things can run at real
+  // (1×) speed, not always sped up — ?timescale=N still sets the initial value.
+  let timeScale = (() => {
     const v = parseFloat(params.get('timescale') ?? '');
     return Number.isFinite(v) && v >= 0 ? v : TIME_COMPRESSION;
   })();
+  // T cycles this ladder: pause / real-time / minutes-per-day / the 360× default / fast. Day-night & the
+  // sun/orbits then advance at the chosen rate (HUD shows it).
+  const TIME_RATES = [0, 1, 60, TIME_COMPRESSION, 3600] as const;
+  let timeRateIdx = Math.max(0, TIME_RATES.indexOf(TIME_COMPRESSION as (typeof TIME_RATES)[number]));
+  const cycleTime = (): void => {
+    timeRateIdx = (timeRateIdx + 1) % TIME_RATES.length;
+    timeScale = TIME_RATES[timeRateIdx]!;
+  };
   const noTime = params.has('notime');
   const noShadow = params.has('noshadow');
   // Step 6: ?noatmo hides the atmosphere shell; ?nohaze disables the terrain's aerial-perspective haze
@@ -602,7 +612,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // ── Walking (Step 4) + creative flight: floating-origin + body-fixed player ──
   let mode: 'fly' | 'walk' | 'creative' = 'fly';
   let player: PlayerController | null = null;
-  const held: WalkInput = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, down: false };
+  const held: WalkInput = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, down: false, rollLeft: false, rollRight: false, level: false, brake: false };
   // Re-center the floating origin on the player past this drift, so GPU floats stay
   // ~0.06 mm-precise near the player (512·2⁻²³) → no jitter, while big planet-scale
   // doubles are differenced in JS and never reach the GPU (CLAUDE.md §4).
@@ -670,11 +680,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   }
   // Creative free-fly: spawn where the camera is now, no gravity/collision. Reuses the
   // PlayerController (setFly) so the sphere-stable look basis + floating origin are shared.
-  function enterCreative(): void {
+  function enterCreative(aimAtPlanet = false): void {
     _spawn.copy(camera.position).add(renderOrigin); // current camera world position
     player = player ?? new PlayerController(recipe, R, groundOct, renderedSurfaceR);
     player.setFly(true);
     player.reset(_spawn, 0, 0);
+    if (aimAtPlanet) player.aimAtPlanet(); // initial spawn: face the planet, not tangent/empty space
     controls.enabled = false;
     renderOrigin.copy(_spawn);
     targetWorld.copy(_spawn);
@@ -705,6 +716,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       controls.enabled = true;
       player?.setFly(false);
       held.forward = held.back = held.left = held.right = held.jump = held.sprint = held.down = false;
+      held.rollLeft = held.rollRight = held.level = held.brake = false;
       document.exitPointerLock?.();
     }
     applyPreset(p);
@@ -718,11 +730,16 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       case 'KeyD': held.right = true; break;
       case 'Space': held.jump = true; break;
       case 'ShiftLeft': case 'ShiftRight': held.sprint = true; break;
-      case 'ControlLeft': case 'ControlRight': held.down = true; break; // creative: descend
+      case 'ControlLeft': case 'ControlRight': held.down = true; break; // creative: descend (camera-down)
+      case 'KeyQ': held.rollLeft = true; break; // creative: roll/bank left
+      case 'KeyE': held.rollRight = true; break; // creative: roll/bank right
+      case 'KeyR': held.level = true; break; // creative: re-level upright to the planet
+      case 'KeyX': held.brake = true; break; // creative: instant full-stop
+      case 'KeyT': cycleTime(); break; // time rate: real-time 1× ↔ … ↔ 360× ↔ pause
       case 'KeyF': if (mode !== 'walk') enterWalk(); break;
       case 'KeyG': if (mode !== 'creative') enterCreative(); else exitToPreset(presets.orbit!); break;
-      case 'BracketRight': player?.cycleSpeed(1); break; // creative: faster
-      case 'BracketLeft': player?.cycleSpeed(-1); break; // creative: slower
+      case 'BracketRight': player?.cycleSpeed(1); break; // creative: throttle up
+      case 'BracketLeft': player?.cycleSpeed(-1); break; // creative: throttle down
       case 'Digit1': exitToPreset(presets.orbit!); break;
       case 'Digit2': exitToPreset(presets.mid!); break;
       case 'Digit3': exitToPreset(presets.surface!); break;
@@ -739,6 +756,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       case 'Space': held.jump = false; break;
       case 'ShiftLeft': case 'ShiftRight': held.sprint = false; break;
       case 'ControlLeft': case 'ControlRight': held.down = false; break;
+      case 'KeyQ': held.rollLeft = false; break;
+      case 'KeyE': held.rollRight = false; break;
+      case 'KeyR': held.level = false; break;
+      case 'KeyX': held.brake = false; break;
     }
   };
   const onClick = (): void => {
@@ -752,6 +773,14 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       player.addMouse(e.movementX, e.movementY);
     }
   };
+  // Creative: mouse wheel sets the throttle (wheel up = faster). In 'fly' mode the wheel is OrbitControls'
+  // zoom, so only intercept in creative. passive:false so we can preventDefault the page scroll.
+  const onWheel = (e: WheelEvent): void => {
+    if (mode === 'creative' && player) {
+      e.preventDefault();
+      player.cycleSpeed(e.deltaY < 0 ? 1 : -1);
+    }
+  };
   // Capture phase: receive WASD before any bubble-phase handler (e.g. a browser
   // extension content-script) can stopPropagation() and starve us — the asymmetry
   // that earlier looked like "mouse works, keys don't." Harmless when no such
@@ -760,6 +789,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   window.addEventListener('keyup', onKeyUp, { capture: true });
   canvas.addEventListener('click', onClick);
   window.addEventListener('mousemove', onMouseMove);
+  canvas.addEventListener('wheel', onWheel, { passive: false });
+
+  // Default to free 6DOF flight on load (the primary way to move). The orbit/preset camera (1/2/3) and
+  // walk (F) remain available; G toggles free-fly. applyPreset(orbit) above placed the camera at orbit
+  // distance; spawn free-fly there and aim at the planet (else you'd face tangent/empty space).
+  enterCreative(true);
 
   // Headless/debug hook: live player state for the walk verification harness.
   (window as unknown as { __nms_player?: () => unknown }).__nms_player = () =>
@@ -1062,21 +1097,22 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       const days = gameTimeS / 86_400;
       const dayH = (spinAngle(EARTH_SPIN_RATE, gameTimeS) / (2 * Math.PI)) * 24;
       const yearPct = ((gameTimeS / earthEl.period) % 1) * 100;
-      const sky = `sky  t ${days.toFixed(2)}d  spin ${dayH.toFixed(1)}h  orbit ${yearPct.toFixed(1)}%${noTime ? ' (frozen)' : ''}`;
+      const rateStr = noTime ? 'frozen' : timeScale === 0 ? 'paused' : `${timeScale}×`;
+      const sky = `sky  t ${days.toFixed(2)}d  spin ${dayH.toFixed(1)}h  orbit ${yearPct.toFixed(1)}%  time ${rateStr} (T)`;
       const base = `leaves ${s.live}  queue ${s.pending + s.ready}  busy ${s.inflight}  ${s.msPerLeaf.toFixed(0)} ms/leaf${morph}\n${sky}`;
       if (mode === 'walk' && player) {
         const dbg = clipDebug ? `  [${lastClip}]` : '';
         return `WALK  alt ${player.altitude().toFixed(1)} m  spd ${player.speed().toFixed(1)} m/s  (G: fly · click: look · 1/2/3: exit)${dbg}\n${base}`;
       }
       if (mode === 'creative' && player) {
-        const spd = player.flySpeed();
-        const spdStr = spd >= 1000 ? `${(spd / 1000).toFixed(0)} km/s` : `${spd.toFixed(0)} m/s`;
+        const fmtSpd = (v: number): string => (v >= 1000 ? `${(v / 1000).toFixed(0)} km/s` : `${v.toFixed(0)} m/s`);
         return (
-          `CREATIVE  alt ${fmtDist(player.altitudeAboveDatum())}  cruise ${spdStr}  ·  Moon ${fmtDist(hudDistMoon)}  Sun ${fmtDist(hudDistSun)}` +
-          `  (WASD+Space/Ctrl · Shift boost · [ ] throttle · F walk · 1/2/3 exit)\n${base}`
+          `FLY  alt ${fmtDist(player.altitudeAboveDatum())}  spd ${fmtSpd(player.speed())} / throttle ${fmtSpd(player.flySpeed())}` +
+          `  ·  Moon ${fmtDist(hudDistMoon)}  Sun ${fmtDist(hudDistSun)}` +
+          `  (WASD · Space/Ctrl up/down · QE roll · R level · X stop · Shift boost · [ ]/wheel throttle · F walk · 1/2/3 orbit)\n${base}`
         );
       }
-      return `FLY  (F: walk · G: creative fly)\n${base}`;
+      return `ORBIT  (drag to look · scroll zoom · G free-fly · F walk · 1/2/3 views)\n${base}`;
     },
     resize(width: number, height: number): void {
       vpHeight = height;
@@ -1090,6 +1126,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       window.removeEventListener('keyup', onKeyUp, { capture: true });
       window.removeEventListener('mousemove', onMouseMove);
       canvas.removeEventListener('click', onClick);
+      canvas.removeEventListener('wheel', onWheel);
       manager.dispose(); // disposes the shared terrain material it owns
       controls.dispose();
       backdropGeo.dispose();
