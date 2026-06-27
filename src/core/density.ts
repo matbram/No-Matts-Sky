@@ -27,6 +27,17 @@ export interface TerrainRecipe {
   gain: number;
   /** Domain-warp strength (1 iteration). 0 disables the warp. */
   warpStrength: number;
+  /** Continental mask: feature count of the low-frequency landmass field across the sphere
+   *  (≪ noiseScale → a few big continents, not islands). 0 disables continents. [T] */
+  contScale: number;
+  /** Continental elevation bias amplitude, in tv-units (× height m). Sets continent-vs-ocean relief. [T] */
+  contAmp: number;
+  /** Continental fBm octave count (low — continents are smooth, LOD-independent). [T] */
+  contOct: number;
+  /** Continental spline knees (in the continental fBm's ~[-1,1] value range): below contLo → ocean
+   *  basin, above contHi → continental shelf, the narrow band between is the coastline. [T] */
+  contLo: number;
+  contHi: number;
   /** The planet's terrain seed (seedchain: childSeed(planet, 0, SALT.terrain)). */
   seed: number;
 }
@@ -63,8 +74,30 @@ export function sliceTerrainRecipe(terrainSeed: number): TerrainRecipe {
     lacunarity: 2.0,
     gain: 0.5,
     warpStrength: 0.7,
+    // Continental mask: ~8 big landmasses across the sphere, biasing the surface ±contAmp·height so
+    // land/sea reads as coherent continents instead of uniform island-noise. Symmetric spline knees ⇒
+    // roughly half land / half ocean with a narrow coastline band; tune against the sea level.
+    contScale: 8,
+    contAmp: 0.6,
+    contOct: 3,
+    contLo: -0.15,
+    contHi: 0.15,
     seed: terrainSeed >>> 0,
   };
+}
+
+/** smoothstep(lo,hi,x): C¹ ramp 0→1; with smoothstepDeriv its analytic d/dx (0 outside the band). */
+function smoothstep(lo: number, hi: number, x: number): number {
+  let t = (x - lo) / (hi - lo);
+  if (t < 0) t = 0;
+  else if (t > 1) t = 1;
+  return t * t * (3 - 2 * t);
+}
+function smoothstepDeriv(lo: number, hi: number, x: number): number {
+  const inv = 1 / (hi - lo);
+  const t = (x - lo) * inv;
+  if (t <= 0 || t >= 1) return 0;
+  return 6 * t * (1 - t) * inv;
 }
 
 // Scratch buffers (single-threaded; the call chain densityAt→terrain→fbm3 never
@@ -74,6 +107,7 @@ const _wy = new Float64Array(4);
 const _wz = new Float64Array(4);
 const _n = new Float64Array(4);
 const _nLo = new Float64Array(4); // coarser (one-octave-dropped) main fBm value+gradient
+const _c = new Float64Array(4); // continental mask value+gradient (low-frequency landmass field)
 const _t = new Float64Array(4);
 
 /**
@@ -130,18 +164,40 @@ export function terrainAt(
   // gradient through the SAME warp Jacobian below so the morph normal is analytic.
   fbm3(s, qx, qy, qz, oMain, lac, g, _n, outLo ? _nLo : undefined);
 
-  const nx = _n[1]!;
-  const ny = _n[2]!;
-  const nz = _n[3]!;
-  out[0] = _n[0]!;
+  // ── Continental mask ───────────────────────────────────────────────────────
+  // A low-frequency landmass field of the SAME warped point (sampled at q·kc, kc=contScale/noiseScale,
+  // so it shares the domain warp → curved coastlines), remapped through a smooth spline and added as a
+  // bias to the terrain value: below contLo → ocean basin, above contHi → continental shelf. This is
+  // what makes land/sea read as coherent continents instead of uniform island-noise. The continental
+  // term is LOD-INDEPENDENT — identical for `out` and `outLo` — so it never participates in the geomorph
+  // (continents must not pop). Its gradient is accumulated in q-space (cg*) alongside the main fBm's, then
+  // BOTH run through the one warp Jacobian below, keeping the surface normal exactly analytic.
+  let contV = 0, cgx = 0, cgy = 0, cgz = 0;
+  if (recipe.contAmp !== 0) {
+    const kc = recipe.contScale / recipe.noiseScale;
+    fbm3((s ^ 0x5555_5555) >>> 0, qx * kc, qy * kc, qz * kc, recipe.contOct, lac, g, _c);
+    contV = recipe.contAmp * (2 * smoothstep(recipe.contLo, recipe.contHi, _c[0]!) - 1);
+    // ∂contV/∂q = contAmp·2·S'(c)·kc·∇c  (chain: spline ∘ rescale-by-kc ∘ fbm)
+    const cs = recipe.contAmp * 2 * smoothstepDeriv(recipe.contLo, recipe.contHi, _c[0]!) * kc;
+    cgx = cs * _c[1]!;
+    cgy = cs * _c[2]!;
+    cgz = cs * _c[3]!;
+  }
+
+  // q-space gradient of (main fBm + continents); the Jacobian Jᵀ maps it to p-space.
+  const nx = _n[1]! + cgx;
+  const ny = _n[2]! + cgy;
+  const nz = _n[3]! + cgz;
+  out[0] = _n[0]! + contV;
   out[1] = nx + A * (_wx[1]! * nx + _wy[1]! * ny + _wz[1]! * nz);
   out[2] = ny + A * (_wx[2]! * nx + _wy[2]! * ny + _wz[2]! * nz);
   out[3] = nz + A * (_wx[3]! * nx + _wy[3]! * ny + _wz[3]! * nz);
   if (outLo) {
-    // Same Jacobian (Jᵀ) applied to the coarser gradient → the parent surface's
-    // analytic terrain gradient. outLo[0] (value) is identical to the old behaviour.
-    const lx = _nLo[1]!, ly = _nLo[2]!, lz = _nLo[3]!;
-    outLo[0] = _nLo[0]!;
+    // Same Jacobian (Jᵀ) applied to the coarser gradient → the parent surface's analytic terrain
+    // gradient. The continental term (value + q-space gradient) is added UNCHANGED — identical to `out` —
+    // so a fully-morphed leaf keeps the same continents (only the finest detail octave fades).
+    const lx = _nLo[1]! + cgx, ly = _nLo[2]! + cgy, lz = _nLo[3]! + cgz;
+    outLo[0] = _nLo[0]! + contV;
     outLo[1] = lx + A * (_wx[1]! * lx + _wy[1]! * ly + _wz[1]! * lz);
     outLo[2] = ly + A * (_wx[2]! * lx + _wy[2]! * ly + _wz[2]! * lz);
     outLo[3] = lz + A * (_wx[3]! * lx + _wy[3]! * ly + _wz[3]! * lz);
