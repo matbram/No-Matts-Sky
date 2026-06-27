@@ -58,6 +58,10 @@ export interface SliceScene {
 // A fixed surface look-at direction for the close presets (some arbitrary spot).
 const SURFACE_DIR = new Vector3(0.2, 1, 0.15).normalize();
 
+// HUD distance formatter: m → km → AU, so the Moon/Sun readouts stay legible across scales.
+const fmtDist = (m: number): string =>
+  m >= 1e9 ? `${(m / 1.495978707e11).toFixed(3)} AU` : m >= 1000 ? `${Math.round(m / 1000)} km` : `${Math.round(m)} m`;
+
 // Finest quadtree depth. At Earth radius: depth 15 ≈ 9.5 m cells underfoot (depth
 // 14 ≈ 19 m, 16 ≈ 4.8 m) — enough near-field detail that walking shows parallax.
 // Paired with LOD-adaptive octaves (density.lodOctaves) so the fine cells actually
@@ -365,6 +369,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const _qSpinInv = new Quaternion(); // inertial → body (for the body-fixed cut camera in fly/orbit)
   const _skyV = new Vector3();
   const _spunOrigin = new Vector3(); // renderOrigin rotated by qSpin, for the slope-band `up` uniform
+  let hudDistMoon = 0; // true camera→body distances (scene space), for the HUD readout
+  let hudDistSun = 0;
 
   const skyGeo = (radius: number): BufferGeometry => {
     const s = buildCubeSphere(8, radius);
@@ -748,6 +754,9 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       sunDisc.scale.setScalar(SUN_RADIUS_M);
       moon.position.set(_moonPos[0]! - _spunOrigin.x, _moonPos[1]! - _spunOrigin.y, _moonPos[2]! - _spunOrigin.z);
       moon.scale.setScalar(MOON_RADIUS_M);
+      // True camera→body distances (both in scene space) for the HUD — so flight progress is legible.
+      hudDistMoon = camera.position.distanceTo(moon.position);
+      hudDistSun = camera.position.distanceTo(sunDisc.position);
       vel.copy(worldCam).sub(prevWorldCam); // world units / frame (body-fixed)
       prevWorldCam.copy(worldCam);
 
@@ -952,7 +961,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
         return `WALK  alt ${player.altitude().toFixed(1)} m  spd ${player.speed().toFixed(1)} m/s  (G: fly · click: look · 1/2/3: exit)${dbg}\n${base}`;
       }
       if (mode === 'creative' && player) {
-        return `CREATIVE  alt ${player.altitude().toFixed(0)} m  spd ${player.flySpeed()} m/s  (WASD+Space/Ctrl · Shift boost · [ ]: speed · F walk · 1/2/3 exit)\n${base}`;
+        const spd = player.flySpeed();
+        const spdStr = spd >= 1000 ? `${(spd / 1000).toFixed(0)} km/s` : `${spd.toFixed(0)} m/s`;
+        return (
+          `CREATIVE  alt ${fmtDist(player.altitudeAboveDatum())}  cruise ${spdStr}  ·  Moon ${fmtDist(hudDistMoon)}  Sun ${fmtDist(hudDistSun)}` +
+          `  (WASD+Space/Ctrl · Shift boost · [ ] throttle · F walk · 1/2/3 exit)\n${base}`
+        );
       }
       return `FLY  (F: walk · G: creative fly)\n${base}`;
     },

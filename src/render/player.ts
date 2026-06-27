@@ -62,10 +62,15 @@ const MAX_DT = 0.05; // clamp dt (s) so an alt-tab hitch can't fling/tunnel
 const BODY_R = 0.4; // m — footprint half-width (player body radius)
 const STEP_AHEAD = 0.5; // m — forward look-ahead probe along the move direction
 
-// Creative-flight [T]: free-fly, no gravity/collision. A speed LADDER (m/s) cycled by
-// keys so flight scales from terrain detail up to crossing the planet; Shift boosts.
-const FLY_SPEEDS = [30, 100, 500, 2000, 10_000] as const;
-const FLY_SPEED_DEFAULT = 1; // index into FLY_SPEEDS (→ 100 m/s)
+// Creative-flight [T]: spaceship-style AUTO-SCALING cruise (Space-Engine/Elite feel). Speed ramps with
+// ALTITUDE above the surface — slow + precise on the deck, blazing in deep space — so you reach the Moon
+// in seconds and the Sun in ~15 min without gear-shifting. `[`/`]` apply a manual throttle multiplier;
+// Shift boosts. Replaces the old fixed speed ladder (whose ~40 km/s top made the Moon ~2.7 h away).
+const FLY_MIN = 20; // m/s floor (fine control near the ground)
+const FLY_CAP = 0.3 * 299_792_458; // ≈ 8.99e7 m/s (0.3c) hard cap — interplanetary cruise, not instant
+const FLY_RATE = 0.7; // cruise ≈ altitudeAboveSurface × this per second (cross your altitude in ~1.4 s)
+const FLY_THROTTLES = [0.1, 0.25, 0.5, 1, 2, 4] as const; // `[`/`]` manual multiplier on the auto cruise
+const FLY_THROTTLE_DEFAULT = 3; // index → 1×
 const FLY_BOOST = 4; // Shift multiplier in fly
 // Octave counts the clip-debug probe samples alongside the collision count, to
 // quantify how far the surface moves per LOD level (the geomorph/streaming transient).
@@ -111,7 +116,7 @@ export class PlayerController {
   private _fpMaxR = 0; // max surface radius over the footprint (the collision floor)
   private _minGap = Infinity; // min radial eye→surface gap over the footprint (near clamp)
   private flyMode = false; // creative free-fly (no gravity/collision)
-  private flySpeedIdx = FLY_SPEED_DEFAULT; // index into FLY_SPEEDS
+  private flyThrottleIdx = FLY_THROTTLE_DEFAULT; // index into FLY_THROTTLES (manual cruise multiplier)
   private readonly _dbg = new Float64Array(7); // clip-debug probe scratch (debug-only)
 
   constructor(
@@ -151,9 +156,20 @@ export class PlayerController {
   setFly(on: boolean): void {
     this.flyMode = on;
   }
-  /** Cycle the fly speed ladder (dir +1/−1). No-op while walking. */
+  /** Cycle the manual throttle multiplier (`[`/`]`, dir +1/−1) on the auto cruise. No-op while walking. */
   cycleSpeed(dir: number): void {
-    this.flySpeedIdx = Math.max(0, Math.min(FLY_SPEEDS.length - 1, this.flySpeedIdx + Math.sign(dir)));
+    this.flyThrottleIdx = Math.max(0, Math.min(FLY_THROTTLES.length - 1, this.flyThrottleIdx + Math.sign(dir)));
+  }
+
+  /**
+   * Auto-scaling cruise speed (m/s): ramps with altitude above the surface (slow on the deck → fast in
+   * deep space) × the manual throttle, hard-capped at FLY_CAP (0.3c). The Shift boost is applied on top
+   * by the movement code. Pure read of the current position; safe to call from the HUD or the update.
+   */
+  private cruiseSpeed(): number {
+    const alt = Math.max(0, this.worldPos.length() - this.planetRadius); // altitude above mean radius
+    const base = Math.min(FLY_CAP, Math.max(FLY_MIN, alt * FLY_RATE));
+    return Math.min(FLY_CAP, base * FLY_THROTTLES[this.flyThrottleIdx]!);
   }
   isFlying(): boolean {
     return this.flyMode;
@@ -312,7 +328,7 @@ export class PlayerController {
       .multiplyScalar(Math.cos(this.pitch))
       .addScaledVector(this._up, Math.sin(this.pitch))
       .normalize();
-    const speed = FLY_SPEEDS[this.flySpeedIdx]! * (input.sprint ? FLY_BOOST : 1);
+    const speed = Math.min(FLY_CAP, this.cruiseSpeed() * (input.sprint ? FLY_BOOST : 1));
     this._move.set(0, 0, 0);
     if (input.forward) this._move.add(this._look);
     if (input.back) this._move.sub(this._look);
@@ -397,9 +413,9 @@ export class PlayerController {
   nearestSurfaceGap(): number {
     return this._minGap;
   }
-  /** Current fly speed (m/s), before Shift boost — for the HUD. */
+  /** Current cruise speed (m/s) at this altitude × throttle, before Shift boost — for the HUD. */
   flySpeed(): number {
-    return FLY_SPEEDS[this.flySpeedIdx]!;
+    return this.cruiseSpeed();
   }
   /**
    * Clip-debug snapshot for the `?clipdebug` console line (debug path only). Writes,
