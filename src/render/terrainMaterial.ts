@@ -185,10 +185,14 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
   mat.wireframe = !!opts.wireframe;
 
   // ── CDLOD geomorph ─────────────────────────────────────────────────────────
-  // Per-leaf bound radii (constant within a leaf), as two scalar attributes. dChild/dParent are the
-  // split/merge distances — 2·radius·kDist, matching selectCut's projected-size test exactly.
-  const lodR = float(attribute<'float'>('aLodR', 'float'));
-  const parentR = float(attribute<'float'>('aParentR', 'float'));
+  // Per-leaf CDLOD data (constant within a leaf) PACKED into ONE vec3 attribute: x=lodR, y=parentR,
+  // z=birthMs. WebGPU caps a pipeline at 8 vertex buffers; position+normal+morphTarget+morphTargetNormal
+  // (4) + aCenter + aCenterPhase (2) + three separate scalars would be 9 → the terrain pipeline fails to
+  // create and NO land renders. Packing the three scalars into one vec3 keeps us at 7 buffers.
+  // dChild/dParent are the split/merge distances — 2·radius·kDist, matching selectCut's projected-size test.
+  const lodPack = attribute<'vec3'>('aLodPack', 'vec3');
+  const lodR = lodPack.x;
+  const parentR = lodPack.y;
   const dChild = lodR.mul(2).mul(kDist);
   const dParent = parentR.mul(2).mul(kDist);
   const e0 = mix(dChild, dParent, MORPH_START_FRAC);
@@ -196,8 +200,9 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
   const mFactor = smoothstep(e0, dParent, dist); // 0 near (full detail) → 1 far (parent surface)
   // Birth-ease FLOOR: a freshly-live leaf starts at 1 (= the parent it replaced → invisible) and
   // decays to its distance-morph over BIRTH_MS, so a late arrival (mFactor already ≈0) fades up
-  // instead of snapping. aBirthMs is constant per leaf (set at upload = the go-live clock).
-  const birthMs = float(attribute<'float'>('aBirthMs', 'float'));
+  // instead of snapping. birthMs is constant per leaf (set at upload = the go-live clock), packed as
+  // aLodPack.z (see above).
+  const birthMs = lodPack.z;
   const birthFloor = uNow.sub(birthMs).div(BIRTH_MS).clamp(0, 1).oneMinus();
   const mFinal = mFactor.max(birthFloor); // 0 near (full) → 1 far (parent), floored while fresh
 

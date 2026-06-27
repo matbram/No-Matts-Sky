@@ -875,8 +875,6 @@ export class QuadtreeManager {
       const lodR = lodBoundRadius(depth, this.radius);
       const parentR = depth > 0 ? lodBoundRadius(depth - 1, this.radius) : lodR * 2;
       const vc = m.positions.length / 3;
-      geometry.setAttribute('aLodR', new BufferAttribute(new Float32Array(vc).fill(lodR), 1));
-      geometry.setAttribute('aParentR', new BufferAttribute(new Float32Array(vc).fill(parentR), 1));
       // Body-fixed per-leaf center — makes the surface SHADING (slope `up`, elevation band, procedural
       // detail) a function of the planet BODY frame, not the spinning inertial frame, so the detail stays
       // locked to the ground as the planet rotates (no "swim"). positionLocal (= m.positions) is relative
@@ -911,7 +909,14 @@ export class QuadtreeManager {
         }
       }
       const birthClock = mergeTarget ? this.clockMs - BIRTH_MS : this.clockMs;
-      geometry.setAttribute('aBirthMs', new BufferAttribute(new Float32Array(vc).fill(birthClock), 1));
+      // Pack the three per-leaf scalars (lodR, parentR, birthMs) into ONE vec3 attribute so the leaf
+      // geometry stays within WebGPU's 8-vertex-buffer limit: position + normal + morphTarget +
+      // morphTargetNormal (4) + aCenter + aCenterPhase (2) + aLodPack (1) = 7. Three separate scalars made
+      // it 9 → CreateRenderPipeline failed ("Vertex buffer count (9) exceeds the maximum (8)") and the
+      // terrain didn't render at all. The shader reads aLodPack.x/.y/.z (terrainMaterial.ts).
+      const aLodPack = new Float32Array(vc * 3);
+      for (let q = 0; q < vc; q++) { aLodPack[q * 3] = lodR; aLodPack[q * 3 + 1] = parentR; aLodPack[q * 3 + 2] = birthClock; }
+      geometry.setAttribute('aLodPack', new BufferAttribute(aLodPack, 3));
       // Render with the shared material. Debug-tint modes (?lodcolor/?skirtcolor/?morphcolor) clone
       // it and null its colorNode so a flat per-leaf colour shows (diagnostic + rare → clone cost is
       // fine, and the cloned graph still carries the morph nodes so the geomorph is unaffected).
@@ -1004,7 +1009,7 @@ export class QuadtreeManager {
         const sm = this.sharedMat as unknown as { positionNode: unknown; normalNode: unknown };
         console.log(
           `[NMS audit] wiring: morphTargetNormal=${!!geometry.getAttribute('morphTargetNormal')} ` +
-            `aLodR=${!!geometry.getAttribute('aLodR')} ` +
+            `aLodPack=${!!geometry.getAttribute('aLodPack')} aCenter=${!!geometry.getAttribute('aCenter')} ` +
             `positionNode=${!!sm.positionNode} normalNode=${!!sm.normalNode}`,
         );
       }
