@@ -257,6 +257,32 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
   `DoubleSide`, so the shadow-depth pass must reproduce the morphed surface; analytic sun-occlusion is the
   fallback); 60 fps holds. (commits `dbd2d51`, `500175b`, + this Step-5 render commit.)
 
+- **Step 5R — real reference-frame free flight (re-architecture; same branch).** The first Step 5 above took a
+  single-planet shortcut (planet pinned at the origin, Sun/Moon as ~5 km proxies, day/night faked by rotating the
+  light). That passes the literal checklist near one planet but blocks the actual goal — flying freely from surface
+  to Moon to Sun, every body a real object. So the render frame was rebuilt to the master-plan Part-4 hierarchy
+  (the orbit math, double precision, floating origin, and streaming all carry over unchanged):
+  - **R1** (`baa8c21`): the planet is a REAL spinning body. Terrain + backdrop live under a `planetGroup` whose
+    quaternion = the real spin `qSpin(t)`; players co-rotate (surface walkers turn WITH the planet — ground static,
+    sun moves); orbital viewers see it turn. Day/night = the real Sun direction on the genuinely-spinning surface.
+  - **R2** (`2050e7e`): real far Sun + Moon at TRUE distances (1 AU / 384,000 km, real radii), placed at
+    `bodySystemPos − spunOrigin` in scene space. The floating origin rides the camera, so flying out makes a body
+    GROW from a dot — no proxies. Log-depth far-plane held the terrain crisp. (Eclipse shadow now dormant — moon is
+    real-far, outside the shadow frustum; needs the analytic approach.)
+  - **R3a** (`8864890`): spaceship flight speed (user-chosen auto-scale + manual throttle). Cruise =
+    `clamp(altitude × 0.7, 20 m/s, 0.3c)` × throttle; `[`/`]` throttle, Shift boost. The Moon is reachable in
+    seconds, the Sun in ~minutes (the old ~40 km/s ladder made the Moon ~2.7 h away — that's why "fly to it" felt
+    broken). HUD shows cruise speed + distance-to-Moon/Sun.
+- **Step 6 (S1) — atmosphere sky + sun glow** (`src/render/atmosphere.ts`, this commit). A planet-centered shell
+  at `R·1.025` (BackSide, additive, depth-tested but not depth-writing) with an analytic single-scatter colour
+  (Rayleigh blue + limb/horizon brightening + a Mie forward-glow sun halo), fed the SAME real `_sunDir` as the
+  terrain. One mesh serves both views: from orbit a **glowing blue limb** wraps the planet (brighter on the sunlit
+  crescent, dark on the night side); from the surface **blue sky** overhead, brightening toward the horizon. The
+  camera `far` is now extended in EVERY mode (incl. walk) to reach the shell + the real Sun/Moon, so the sky is
+  consistent surface↔space (log depth keeps the surface crisp; ⚠ real-GPU: re-confirm no walk-surface z-fight).
+  `?noatmo` hides it for A/B. **Headless-confirmed** (`?webgl`): orbit limb + ground sky both render; typecheck +
+  129 tests (render-only) + build green; walk stays grounded (eye height 1.7 m) with the extended far plane.
+
 Measured-good on WebGPU (build the user ran): orbit→surface descent holds 60 fps / ~16.8 ms,
 `cov=96/96 holes=0` throughout, `fresh=0 refine=N` (sharpen-in-place, no pop), `bornM≈1.0`, largest cut ~466
 leaves (no spike), no rAF `[Violation]` stalls.
@@ -297,8 +323,20 @@ leaves (no spike), no rAF `[Violation]` stalls.
    fallback or a `?moonscale` demonstrative size); (b) optional: the full inertial flight model (currently the
    planet-locked frame satisfies the no-rocket-away gate). Tunables: `TIME_COMPRESSION` (constants.ts),
    `?timescale=N`/`?notime`/`?noshadow`, `SUN_PROXY_DIST`/`MOON_PROXY_DIST` (scene.ts).
-3. **Step 6 — atmosphere LUT + triplanar materials + lock 60fps** end-to-end (all of CLAUDE.md §7 at once). Also
-   fold in the audit's per-leaf constant-attribute fix (`aLodR`/`aParentR`/`aBirthMs` → per-mesh uniforms) here.
+3. **Step 6 — "make it beautiful" (in committed, screenshot-verifiable increments).**
+   - **S1 — atmosphere sky + sun glow: DONE** (`src/render/atmosphere.ts`; headless-confirmed orbit limb + ground
+     sky). ⚠ Real-GPU: confirm the limb/sky look + that the walk-mode far-plane extension doesn't z-fight the
+     surface (log depth should hold it; if not, split the far bodies into a layered pass — plan §4).
+   - **S2 — aerial perspective** (`terrainMaterial.ts`): mix the lit terrain toward the inscatter colour by
+     distance+altitude (reuse the existing `dist`; no extra noise tap), fading to 0 at orbit — haze the surface
+     into the atmosphere on descent (sells scale, hides the far LOD ring).
+   - **S3 — triplanar + altitude band + palette lock**: upgrade the single-coord detail to true triplanar (3 axis
+     samples weighted by the morph-normal) + a 3rd altitude/peak band; keep behind the noise-skip `If` + near gate;
+     pick a `SLOPE_PRESETS` winner.
+   - **S4 — lock 60fps + per-leaf attr fix**: profile `?perf`; move per-leaf constant attributes
+     (`aLodR`/`aParentR`/`aBirthMs`) → per-mesh uniforms (audit finding); confirm worstDt < 16.67 ms on a real GPU.
+   - Deferred refinements: velocity inheritance on launch; unify orbit presets into one seamless free-flight;
+     nearest-body speed scaling; un-swim surface detail under spin; analytic eclipse; Moon as a real landable body.
 
 ## 7. Reading the diagnostics (`?lodaudit`) — how to judge LOD health
 - `[NMS] cut: leaves=N lod={depth:count} maxNbrΔ=k` — the live cut. **`maxNbrΔ>1`** = a >1-level edge step →

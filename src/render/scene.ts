@@ -42,6 +42,7 @@ import { sliceFacts } from '../core/facts.ts';
 import { childSeed, SALT } from '../core/seedchain.ts';
 import { QuadtreeManager } from './quadtreeManager.ts';
 import { PlayerController, type WalkInput } from './player.ts';
+import { createAtmosphere } from './atmosphere.ts';
 
 // Injected by Vite at build time (git short hash + build time) — logged at startup
 // so we can tell a stale deploy from the latest fix during remote diagnosis.
@@ -245,6 +246,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     timeScale, // Step 5: game-time multiplier (?timescale=N; TIME_COMPRESSION default)
     noTime, // ?notime: freeze the spin/orbit clock
     noShadow, // ?noshadow: disable the moon's cast shadow
+    noatmo: params.has('noatmo'), // ?noatmo: hide the Step 6 atmosphere shell (A/B)
   });
 
   const R = EARTH_RADIUS_M;
@@ -342,6 +344,17 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const backdrop = new Mesh(backdropGeo, backdropMaterial);
   backdrop.visible = !params.has('noback'); // debug: hide → do the lines become black gaps?
   planetGroup.add(backdrop); // co-rotates with the planet (centered at planet center)
+
+  // ── Step 6 (S1): atmosphere shell ──────────────────────────────────────────
+  // A planet-centered sky shell whose analytic scatter (Rayleigh blue + limb/horizon
+  // brightening + sun halo) reads as a glowing limb from orbit and as blue sky from the
+  // surface, both from the SAME real `_sunDir`. It lives on `scene` (NOT planetGroup) — an
+  // unspun inertial shell positioned at the planet centre (= scene `−_spunOrigin`) each frame,
+  // exactly like the Sun/Moon bodies. ?noatmo hides it for A/B. The black `scene.background`
+  // stays: the additive shell only covers the planet+sky region, space elsewhere is black.
+  const atmosphere = createAtmosphere(R);
+  atmosphere.mesh.visible = !params.has('noatmo');
+  scene.add(atmosphere.mesh);
 
   // ── Step 5: real spin + orbit (day/night, moving sun, moon, optional cast shadow) ──
   // The RENDER frame stays PLANET-CENTERED (terrain/player body-fixed, planet at the origin, NEVER
@@ -746,6 +759,11 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       planetGroup.quaternion.copy(_qSpin);
       _spunOrigin.copy(renderOrigin).applyQuaternion(_qSpin);
       manager.setSpunOrigin([_spunOrigin.x, _spunOrigin.y, _spunOrigin.z]);
+      // S1: the atmosphere shell sits at the planet centre (scene `−_spunOrigin`, same frame as the
+      // Sun/Moon bodies) and consumes the REAL inertial sun direction — so day/night + the sun halo
+      // come from the same geometry as the lit terrain (no separate sky light).
+      atmosphere.mesh.position.set(-_spunOrigin.x, -_spunOrigin.y, -_spunOrigin.z);
+      atmosphere.sunDir.value.copy(_sunDir);
       // R2: place the Sun + Moon as REAL bodies at their true planet-centered inertial positions, in
       // scene space (= inertialPC − spunOrigin), at real radii. From the planet they're tiny discs at the
       // correct angular size + direction; in creative (G) the floating origin rides the camera, so flying
@@ -801,14 +819,20 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
         camera.near = Math.max(1, alt * 0.05);
         camera.far = horizon + recipe.height * 8 + alt * 0.1;
       }
-      // R2: in fly/orbit/creative, push `far` out to reach the real Sun/Moon (~1 AU) so they're visible
-      // and flyable-to; logarithmic depth (default on) keeps precision across the huge range. Left OFF in
-      // WALK so the carefully-tuned surface depth isn't perturbed. ⚠ GPU-tune: if terrain z-fights at the
-      // big far-plane, switch the far bodies to a separate layered render pass (plan subtask 4).
-      if (mode !== 'walk') {
-        const sunFar = Math.hypot(sunDisc.position.x, sunDisc.position.y, sunDisc.position.z) + SUN_RADIUS_M * 4;
-        if (sunFar > camera.far) camera.far = sunFar;
-      }
+      // S1 + R2: push `far` out to reach the sky elements in EVERY mode — first the atmosphere shell,
+      // then the real Sun/Moon (~1 AU) — so the sky (blue limb, sun halo, sun disc, moon) is consistent
+      // whether walking, flying, or in orbit (seamless surface↔space, the project goal). Logarithmic depth
+      // (default on) keeps the cm-scale surface crisp across the huge range; the previous build held WALK's
+      // far short out of caution, but the overhead sky needs the reach and log depth makes it safe. ⚠
+      // GPU-tune: if terrain z-fights at the big far-plane, split the far bodies into a layered pass (plan §4).
+      const atmFar = camera.position.distanceTo(atmosphere.mesh.position) + atmosphere.radius;
+      if (atmFar > camera.far) camera.far = atmFar;
+      const sunFar = Math.hypot(
+        sunDisc.position.x - camera.position.x,
+        sunDisc.position.y - camera.position.y,
+        sunDisc.position.z - camera.position.z,
+      ) + SUN_RADIUS_M * 4;
+      if (sunFar > camera.far) camera.far = sunFar;
       camera.updateProjectionMatrix();
 
       const distToTarget = worldCam.distanceTo(targetWorld);
@@ -990,6 +1014,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       sunDiscMat.dispose();
       moonGeo.dispose();
       moonMat.dispose();
+      atmosphere.dispose();
       renderer.dispose();
     },
   };
