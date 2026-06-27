@@ -1109,7 +1109,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
         return (
           `FLY  alt ${fmtDist(player.altitudeAboveDatum())}  spd ${fmtSpd(player.speed())} / throttle ${fmtSpd(player.flySpeed())}` +
           `  ·  Moon ${fmtDist(hudDistMoon)}  Sun ${fmtDist(hudDistSun)}` +
-          `  (WASD · Space/Ctrl up/down · QE roll · R level · X stop · Shift boost · [ ]/wheel throttle · F walk · 1/2/3 orbit)\n${base}`
+          `  (WASD · Space/Ctrl up/down · QE bank · R smooth-level · X stop · Shift boost · [ ]/wheel throttle · F walk · 1/2/3 orbit)\n${base}`
         );
       }
       return `ORBIT  (drag to look · scroll zoom · G free-fly · F walk · 1/2/3 views)\n${base}`;

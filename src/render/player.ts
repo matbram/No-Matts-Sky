@@ -82,12 +82,10 @@ const FLY_THROTTLE_DEFAULT = 6; // index → 20 km/s (perceptible from the orbit
 const FLY_BOOST = 4; // Shift multiplier on the throttle target
 const ACCEL_RATE = 3; // velocity ease rate (1/s): ~95% of target in ~1 s, no overshoot
 const ROLL_SPEED = 1.6; // rad/s bank rate (Q/E)
+const LEVEL_RATE = 6; // 1/s ease rate for the smooth "level out" (R) — roll → 0 over ~0.4 s
 
-// Canonical local axes for the free-fly quaternion math (shared immutables — never mutated).
-const AX_X = new Vector3(1, 0, 0);
-const AX_Y = new Vector3(0, 1, 0);
+// Camera local Z (= −look) — the bank axis for the fly roll (shared immutable; never mutated).
 const AX_Z = new Vector3(0, 0, 1);
-const ZERO = new Vector3(0, 0, 0);
 // Octave counts the clip-debug probe samples alongside the collision count, to
 // quantify how far the surface moves per LOD level (the geomorph/streaming transient).
 const DEBUG_OCTAVES = [14, 12, 10, 4] as const;
@@ -125,13 +123,14 @@ export class PlayerController {
   private readonly _zAxis = new Vector3();
   private readonly _m = new Matrix4();
   private readonly _quat = new Quaternion();
-  // Free 6DOF fly state: a free orientation quaternion + a persistent velocity eased toward the throttle
-  // target. Used only in fly mode; walk keeps yaw/pitch + the radial-up basis.
-  private readonly _flyQuat = new Quaternion();
+  // Fly state: a persistent velocity eased toward the throttle target, plus a bank `roll` angle. The LOOK
+  // reuses the same level yaw/pitch radial-up basis as walk (so mouse-look can't drift off-level); roll is
+  // banked only by Q/E and eased back to 0 by R (`_leveling`). Fly only; walk leaves roll 0.
+  private roll = 0; // bank angle (rad) about the look axis — fly only
+  private _leveling = false; // R-triggered smooth level-out in progress (roll → 0)
   private readonly _vel = new Vector3();
   private readonly _upCam = new Vector3();
   private readonly _dqA = new Quaternion();
-  private readonly _dqB = new Quaternion();
   private readonly _surf = new Float64Array(7);
   private readonly _probe = new Float64Array(7); // footprint sample scratch
   private readonly _moveDir = new Vector3(); // unit tangential move dir (0 when idle)
@@ -171,17 +170,11 @@ export class PlayerController {
     this.grounded = true;
     this.speedEst = 0;
     this._vel.set(0, 0, 0); // fly velocity reset on every (re)spawn / teleport
-    // Populate _surf/_centerSurfR + camera quaternion. Walk snaps to ground; fly stays put.
-    if (this.flyMode) {
-      // Seed the free 6DOF orientation from the radial-up basis at spawn (upright, facing the heading),
-      // so entering free-fly is seamless; it's fully free from then on.
-      this.basis();
-      this.orient();
-      this._flyQuat.copy(this._quat);
-      this.updateFly(0, NO_INPUT);
-    } else {
-      this.update(0, NO_INPUT);
-    }
+    this.roll = 0;
+    this._leveling = false;
+    // Populate _surf/_centerSurfR + camera quaternion. Walk snaps to ground; fly stays put (upright).
+    if (this.flyMode) this.updateFly(0, NO_INPUT);
+    else this.update(0, NO_INPUT);
   }
 
   /** Enter/leave creative free-fly (no gravity, no terrain collision). */
@@ -202,16 +195,9 @@ export class PlayerController {
     return this.flyMode;
   }
 
-  /** Accumulate mouse-look (pointer-lock movementX/Y, pixels). */
+  /** Accumulate mouse-look (pointer-lock movementX/Y, pixels). Walk AND fly use this stable yaw/pitch
+   *  around the radial up, so mouse-look NEVER induces roll (the horizon stays level). Banking is Q/E only. */
   addMouse(dx: number, dy: number): void {
-    if (this.flyMode) {
-      // Free 6DOF look: incremental LOCAL yaw (about camera up) + pitch (about camera right). No clamp,
-      // no forced planet-up — look anywhere, including straight up and over the top. Roll is via Q/E.
-      this._dqA.setFromAxisAngle(AX_Y, -dx * MOUSE_SENS);
-      this._dqB.setFromAxisAngle(AX_X, -dy * MOUSE_SENS);
-      this._flyQuat.multiply(this._dqA).multiply(this._dqB).normalize();
-      return;
-    }
     this.yaw += dx * MOUSE_SENS; // mouse-right turns right
     this.pitch -= dy * MOUSE_SENS; // mouse-up looks up
     if (this.pitch > PITCH_LIMIT) this.pitch = PITCH_LIMIT;
@@ -346,28 +332,36 @@ export class PlayerController {
     this._yAxis.crossVectors(this._zAxis, this._xAxis).normalize();
     this._m.makeBasis(this._xAxis, this._yAxis, this._zAxis);
     this._quat.setFromRotationMatrix(this._m);
+    // Fly bank: rotate the leveled orientation about the look axis (local Z) by `roll`. Walk keeps roll 0,
+    // so this is a no-op there and the horizon stays level; in fly, Q/E bank and R eases it back to 0.
+    if (this.roll !== 0) this._quat.multiply(this._dqA.setFromAxisAngle(AX_Z, this.roll));
   }
 
   /**
-   * Creative free-fly update — TRUE 6DOF (Superman). Orientation is a free quaternion (`_flyQuat`): mouse
-   * looks anywhere (no clamp), Q/E roll/bank, R re-levels to the planet. Movement is fully camera-relative
-   * (W/S along look, A/D along camera right, Space/Ctrl along CAMERA up — not the planet's). Speed is
-   * PLAYER-CONTROLLED: a velocity eased (critically-damped, no overshoot) toward `throttleSpeed × boost`
-   * along the thrust direction, so holding a key ramps up and releasing eases to a stop; X stops dead. NO
-   * gravity / collision (you pass through terrain — that's the point). One surfaceAt sample for the HUD.
+   * Creative free-fly update — free 6DOF MOVEMENT with an auto-LEVEL look (Superman). The look is the same
+   * stable yaw/pitch around the radial up as walk (so mouse-look never drifts off-level — the horizon stays
+   * level on its own); Q/E bank a `roll` that persists, R eases it smoothly back to 0. Movement is fully
+   * camera-relative (W/S along look, A/D along camera right, Space/Ctrl along CAMERA up — incl. the bank), so
+   * you fly exactly where you look. Speed is PLAYER-CONTROLLED: the velocity eases (critically-damped, no
+   * overshoot) toward `throttleSpeed × boost` along the thrust dir — hold to ramp up, release to ease to a
+   * stop; X stops dead. NO gravity/collision (you pass through terrain). One surfaceAt sample for the HUD.
    */
   updateFly(dtRaw: number, input: WalkInput): void {
     const dt = Math.min(Math.max(dtRaw, 0), MAX_DT);
-    // Roll (Q/E) about the camera's local forward; R eases back upright relative to the planet.
-    if (input.rollLeft) this._flyQuat.multiply(this._dqA.setFromAxisAngle(AX_Z, ROLL_SPEED * dt));
-    if (input.rollRight) this._flyQuat.multiply(this._dqA.setFromAxisAngle(AX_Z, -ROLL_SPEED * dt));
-    if (input.level) this.levelFly();
-    this._flyQuat.normalize();
+    // Bank: Q/E roll (persists); R starts a smooth ease back to level (roll → 0). Q/E cancels a level-out.
+    if (input.rollLeft) { this.roll += ROLL_SPEED * dt; this._leveling = false; }
+    if (input.rollRight) { this.roll -= ROLL_SPEED * dt; this._leveling = false; }
+    if (input.level) this._leveling = true;
+    if (this._leveling) {
+      this.roll += (0 - this.roll) * (1 - Math.exp(-LEVEL_RATE * dt)); // smooth ease to level
+      if (Math.abs(this.roll) < 1e-3) { this.roll = 0; this._leveling = false; }
+    }
 
-    // Camera-relative 6DOF axes from the free orientation.
-    this._fwd.set(0, 0, -1).applyQuaternion(this._flyQuat);
-    this._right.set(1, 0, 0).applyQuaternion(this._flyQuat);
-    this._upCam.set(0, 1, 0).applyQuaternion(this._flyQuat);
+    // Orientation = stable level yaw/pitch (no roll drift) + the bank; then derive the camera-relative axes.
+    this.orient();
+    this._fwd.set(0, 0, -1).applyQuaternion(this._quat);
+    this._right.set(1, 0, 0).applyQuaternion(this._quat);
+    this._upCam.set(0, 1, 0).applyQuaternion(this._quat);
 
     // Desired velocity = combined thrust direction × throttle target (× Shift boost), capped.
     this._move.set(0, 0, 0);
@@ -397,33 +391,8 @@ export class PlayerController {
     );
     this._centerSurfR = this._surf[0]!;
     this._fpMaxR = this._centerSurfR; // so altitude() (eye above surface) works in fly too
-    // Camera = the free orientation; look = forward.
-    this._quat.copy(this._flyQuat);
-    this._look.copy(this._fwd);
+    this._look.copy(this._fwd); // getForward() = the look direction (roll doesn't change forward)
     void spinAngle(); // Step 5 seam (identity now)
-  }
-
-  /**
-   * Re-level the free orientation to the planet: keep the current heading (forward projected onto the
-   * tangent plane) but set up = radial. For the R "level" key — recovers from a tumble. Instant (called
-   * each frame while R is held). Reuses the orient() scratch.
-   */
-  private levelFly(): void {
-    this._up.copy(this.worldPos).normalize(); // radial up
-    this._fwd.set(0, 0, -1).applyQuaternion(this._flyQuat); // current forward
-    this._look.copy(this._fwd).addScaledVector(this._up, -this._fwd.dot(this._up)); // tangent heading
-    if (this._look.lengthSq() < 1e-8) {
-      // Looking straight up/down → pick any tangent so the basis is well-defined.
-      if (Math.abs(this._up.y) < 0.99) this._ref.set(0, 1, 0);
-      else this._ref.set(1, 0, 0);
-      this._look.crossVectors(this._ref, this._up);
-    }
-    this._look.normalize();
-    this._zAxis.copy(this._look).multiplyScalar(-1);
-    this._xAxis.crossVectors(this._up, this._zAxis).normalize();
-    this._yAxis.crossVectors(this._zAxis, this._xAxis).normalize();
-    this._m.makeBasis(this._xAxis, this._yAxis, this._zAxis);
-    this._flyQuat.setFromRotationMatrix(this._m);
   }
 
   /**
@@ -456,14 +425,13 @@ export class PlayerController {
   }
 
   /** Aim the free-fly camera toward the planet centre (used for the initial spawn so you see the planet,
-   *  not empty space tangent to the surface). Fly mode only. */
+   *  not empty space tangent to the surface): pitch down toward the centre, level heading. Fly mode only. */
   aimAtPlanet(): void {
-    this._look.copy(this.worldPos).multiplyScalar(-1).normalize(); // direction toward the planet centre
-    this._ref.set(0, 1, 0);
-    if (Math.abs(this._look.dot(this._ref)) > 0.99) this._ref.set(1, 0, 0); // avoid a degenerate up
-    this._m.lookAt(ZERO, this._look, this._ref); // -Z → toward the centre
-    this._flyQuat.setFromRotationMatrix(this._m);
-    this._quat.copy(this._flyQuat);
+    this.yaw = 0;
+    this.pitch = -PITCH_LIMIT; // look (nearly) straight down the radial → the planet fills the view
+    this.roll = 0;
+    this._leveling = false;
+    this.orient();
   }
 
   getWorldPos(out: Vector3): void {

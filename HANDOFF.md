@@ -277,9 +277,11 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
     seconds, the Sun in ~minutes (the old ~40 km/s ladder made the Moon ~2.7 h away — that's why "fly to it" felt
     broken). HUD shows cruise speed + distance-to-Moon/Sun.
   - **FF (free-flight overhaul) — Phase 1 DONE** (`player.ts` + `scene.ts`): user feedback "stuck on an axis /
-    invisible guideline." Free-fly now has a **free orientation quaternion** (`_flyQuat`): mouse looks anywhere
-    (no pitch clamp, no forced planet-up), **Q/E roll/bank**, **R re-level**; movement is fully **camera-relative
-    6DOF** (W=look, A/D=camera right, Space/Ctrl=camera up). **Speed is player-controlled** (replaced altitude
+    invisible guideline." Movement is fully **camera-relative 6DOF** (W=look, A/D=camera right, Space/Ctrl=camera
+    up). The LOOK uses the **stable yaw/pitch radial-up basis** (same as walk) so mouse-look never drifts
+    off-level (an earlier free-quaternion look accumulated roll — "unlevel a lot" — and was reverted); **Q/E**
+    bank a `roll` that persists, **R** eases it smoothly back to level (`LEVEL_RATE`). Tradeoff: always-level
+    horizon, so no full inversion/looping (a free-look toggle can be added later if wanted). **Speed is player-controlled** (replaced altitude
     auto-scaling): an absolute **throttle ladder** (`[`/`]` + mouse wheel), the velocity **eases** toward the
     throttle target (critically-damped, no overshoot), **Shift** boosts, **X** full-stops. **Free-fly is the
     default camera on load** (aimed at the planet); orbit-drag + **1/2/3** presets and **F** walk remain; **G**
