@@ -409,7 +409,13 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // concentric with the terrain. ?noocean A/B.
   const _seaProbe = new Float64Array(7);
   surfaceAt(recipe, R, SURFACE_DIR.x, SURFACE_DIR.y, SURFACE_DIR.z, _seaProbe, groundOct);
-  const seaLevelR = Math.min(R + 4000, _seaProbe[0]! - 400);
+  // Sea level → balanced land/sea. The old R+4 km flooded ~64% of the ±14 km terrain (the "blue island
+  // world"); dropping it to ~1 km BELOW the mean radius splits the surface roughly half land / half ocean
+  // — large tan continents with blue ocean basins (the "balanced Earth-like" look). Still clamped below the
+  // walk spawn's terrain so the player spawns on land. ?sea=METERS overrides the offset from R (e.g.
+  // ?sea=4000 for the old mostly-ocean look, ?sea=-6000 for a mostly-land desert).
+  const seaOffset = params.has('sea') ? Number(params.get('sea')) : -1000;
+  const seaLevelR = Math.min(R + seaOffset, _seaProbe[0]! - 400);
   const ocean = createOcean(seaLevelR);
   ocean.mesh.visible = !params.has('noocean');
   scene.add(ocean.mesh);
@@ -446,7 +452,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const _qSpin = new Quaternion(); // planet spin: body → inertial (+theta about the tilted axis)
   const _qSpinInv = new Quaternion(); // inertial → body (for the body-fixed cut camera in fly/orbit)
   const _skyV = new Vector3();
-  const _spunOrigin = new Vector3(); // renderOrigin rotated by qSpin, for the slope-band `up` uniform
+  const _spunOrigin = new Vector3(); // renderOrigin rotated by qSpin, for atmosphere/ocean/clouds/body placement
+  const _sunDirBody = new Vector3(); // _qSpinInv·_sunDir — the BODY-frame sun for the terrain's aerial haze
   const _camUp = new Vector3(); // scene-space camera radial up (for the atmosphere ray-march), per frame
   let hudDistMoon = 0; // true camera→body distances (scene space), for the HUD readout
   let hudDistSun = 0;
@@ -849,7 +856,6 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       }
       planetGroup.quaternion.copy(_qSpin);
       _spunOrigin.copy(renderOrigin).applyQuaternion(_qSpin);
-      manager.setSpunOrigin([_spunOrigin.x, _spunOrigin.y, _spunOrigin.z]);
       // S1: the atmosphere shell sits at the planet centre (scene `−_spunOrigin`, same frame as the
       // Sun/Moon bodies) and consumes the REAL inertial sun direction — so day/night + the sun halo
       // come from the same geometry as the lit terrain (no separate sky light).
@@ -900,11 +906,13 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // Dynamic near/far from altitude + horizon distance, every frame.
       const distCenter = worldCam.length();
       const horizon = Math.sqrt(Math.max(0, distCenter * distCenter - R * R));
-      // S2: feed the terrain's aerial-perspective haze — the real sun direction (so ground haze matches the
-      // sky shell at the horizon) + the air density at this altitude (exp falloff; →0 by orbit so the planet
-      // reads crisp from space). Cheap; render-only.
+      // S2: feed the terrain's aerial-perspective haze — the BODY-frame sun direction (qSpinInv·_sunDir, so
+      // the haze day factor matches the now body-fixed surface `up`; the dot is rotation-invariant so the
+      // ground haze still agrees with the inertial sky shell at the horizon) + the air density at this
+      // altitude (exp falloff; →0 by orbit so the planet reads crisp from space). Cheap; render-only.
+      _sunDirBody.copy(_sunDir).applyQuaternion(_qSpinInv);
       manager.setAtmosphere(
-        [_sunDir.x, _sunDir.y, _sunDir.z],
+        [_sunDirBody.x, _sunDirBody.y, _sunDirBody.z],
         noHaze ? 0 : Math.exp(-Math.max(0, distCenter - R) / AERIAL_SCALE_H_M),
       );
 

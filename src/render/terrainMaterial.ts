@@ -18,14 +18,15 @@
 //    per-pixel function of distance, independent of chunk streaming) and no shimmer
 //    (each octave fades out before its features drop below a pixel).
 //
-// Precision (master plan Part 4): the morph's distance uses render-space positionWorld
-// (the floating-origin offset cancels). The detail COORDINATE needs an absolute, stable
-// world position; render-space positionWorld would "swim" when the origin recenters, and
-// the true absolute position is too large for float detail. So we add back a per-frame
-// `detailPhase = renderOrigin mod L` (reduced in DOUBLE on the CPU): positionWorld+phase
-// tracks the absolute position continuously through recenters yet stays small (< L) so
-// metre-scale detail stays float-precise. The slope `up` uses the full renderOrigin
-// (direction only — robust to the large magnitude).
+// Precision + spin (master plan Part 4): the morph's distance uses render-space positionWorld (the
+// floating-origin offset cancels there). Everything else — slope `up`, elevation, and the detail
+// COORDINATE — is computed in the planet BODY frame from per-leaf attributes (aCenter = the leaf's
+// body-fixed centre; aCenterPhase = that centre reduced mod L in DOUBLE on the CPU) plus positionLocal.
+// positionWorld bakes the planet's spin, so shading the surface there makes the detail/mottle "swim"
+// across the ground as the planet rotates; bodyAbs = positionLocal + aCenter is spin-invariant (and
+// recenter-invariant), and positionLocal + aCenterPhase keeps the detail coordinate small (< L) so
+// metre-scale detail stays float-precise. (Dot products are rotation-invariant, so body-frame slope ≡
+// inertial slope but constant under spin.)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { DoubleSide, Vector3 } from 'three';
@@ -92,7 +93,7 @@ export const DETAIL_B_FAR_M = 6_000;
 // vanishes from space and the planet reads crisp (only the atmosphere shell's limb remains). The blue
 // matches the atmosphere shell so the surface fades into the same colour it sits under.
 const HAZE_RAYLEIGH = [0.30, 0.55, 1.0] as const; // same tint as atmosphere.ts
-const HAZE_LUMA = 0.5; // inscatter brightness
+const HAZE_LUMA = 0.32; // inscatter brightness (reduced so near/mid desert land shows its tan instead of washing blue)
 const HAZE_RATE = 1 / 30_000; // 1/scale (m): at density 1, ~63% hazed by 30 km of view distance
 const HAZE_TWILIGHT = 0.1; // day floor so the terminator hazes softly instead of cutting to black
 
@@ -117,18 +118,18 @@ export interface SlopePreset {
 // the dominant per-fragment noise cost (the very cost S4 must bound) for no visible gain. The elevation
 // band is the S3 palette win instead; triplanar is the right tool only if a future 2D-textured archetype
 // is added.
-const PEAK_COLOR = [0.66, 0.62, 0.55] as const; // pale dusty highlands
-const LOW_COLOR = [0.33, 0.27, 0.23] as const; // darker lowland regolith
+const PEAK_COLOR = [0.78, 0.74, 0.66] as const; // pale dusty highlands (warm, near-white on the highest peaks)
+const LOW_COLOR = [0.30, 0.22, 0.15] as const; // dark warm regolith — shades valley/drainage basins (reads as river valleys)
 const PEAK_LO = 0.20; // elevation (× height amplitude) where highlands start to fade in
 const PEAK_HI = 0.85; // …and reach full highland colour
 const LOW_HI = -0.10; // lowland tint starts fading in as elevation drops below this
 const LOW_LO = -0.70; // …and reaches full lowland colour
 
 export const SLOPE_PRESETS: readonly SlopePreset[] = [
-  { lo: 0.55, hi: 0.82, rock: [0.40, 0.36, 0.33], sand: [0.62, 0.55, 0.45] }, // 0 current — hard mottle (A/B ref)
-  { lo: 0.25, hi: 0.98, rock: [0.40, 0.36, 0.33], sand: [0.62, 0.55, 0.45] }, // 1 wide band — flip → gradient, same colours
-  { lo: 0.55, hi: 0.82, rock: [0.47, 0.43, 0.39], sand: [0.57, 0.51, 0.44] }, // 2 low contrast — keeps definition, mutes black/tan
-  { lo: 0.30, hi: 0.95, rock: [0.47, 0.43, 0.39], sand: [0.57, 0.51, 0.44] }, // 3 soft — wide + low contrast (gentlest)
+  { lo: 0.55, hi: 0.82, rock: [0.40, 0.36, 0.33], sand: [0.62, 0.55, 0.45] }, // 0 grey low-contrast (A/B ref)
+  { lo: 0.25, hi: 0.98, rock: [0.40, 0.36, 0.33], sand: [0.62, 0.55, 0.45] }, // 1 grey wide band — gradient
+  { lo: 0.50, hi: 0.92, rock: [0.45, 0.34, 0.24], sand: [0.66, 0.53, 0.36] }, // 2 DESERT (default) — warm tan flats, browner rock, wide low-contrast band
+  { lo: 0.30, hi: 0.95, rock: [0.50, 0.40, 0.30], sand: [0.70, 0.58, 0.42] }, // 3 desert soft — paler, gentlest
 ];
 
 export interface TerrainMaterialOpts {
@@ -153,16 +154,11 @@ export interface TerrainMaterialHandle {
    * distance-morph band reaches the parent surface exactly at the split distance (no seams).
    */
   kDist: { value: number };
-  /** Full render origin (m). Set `.value` whenever the floating origin recenters. Used (direction
-   *  only) to reconstruct the per-pixel radial "up" for slope material bands. */
-  renderOrigin: { value: Vector3 };
-  /** renderOrigin reduced modulo DETAIL_PHASE_MOD_M IN DOUBLE (set with renderOrigin). Added back to
-   *  render-space positionWorld to give a stable, float-precise absolute coordinate for the detail. */
-  detailPhase: { value: Vector3 };
   /** Manager clock (ms). Set `.value` every frame; drives the per-leaf birth-ease floor. */
   now: { value: number };
-  /** Inertial planet→sun direction (same `_sunDir` the atmosphere uses). Set `.value` each frame —
-   *  gives the aerial-perspective haze a day/night factor that matches the sky. */
+  /** BODY-frame planet→sun direction (`_qSpinInv·_sunDir`). Set `.value` each frame — gives the
+   *  aerial-perspective haze a day/night factor consistent with the body-frame `up` (a body-frame sun
+   *  still sweeps as the planet spins, so day/night animates; bodyUp·bodySun ≡ inertialUp·inertialSun). */
   sunDir: { value: Vector3 };
   /** Air density at the camera altitude (0 at orbit → 1 at the surface). Set `.value` each frame;
    *  scales the aerial-perspective haze so it fades to nothing from space. */
@@ -176,10 +172,8 @@ export interface TerrainMaterialHandle {
  */
 export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMaterialHandle {
   const kDist = uniform(0);
-  const uRenderOrigin = uniform(new Vector3());
-  const uDetailPhase = uniform(new Vector3());
   const uNow = uniform(0); // manager clock (ms), for the per-leaf birth-ease floor
-  const uSunDir = uniform(new Vector3(1, 0, 0)); // inertial planet→sun dir (aerial-perspective day factor)
+  const uSunDir = uniform(new Vector3(1, 0, 0)); // BODY-frame planet→sun dir (aerial-perspective day factor)
   const uHazeDensity = uniform(0); // air density at the camera altitude (0 orbit → 1 surface); 0 = no haze
   const mat = new MeshStandardNodeMaterial({
     color: 0x9a8c7a,
@@ -216,14 +210,16 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     mFinal,
   ).normalize();
 
-  // Slope material bands (always). r = the fragment's inertial position (precision-robust as a direction);
-  // reused for both the radial `up` and the elevation band below. slope=1 where the surface faces straight
-  // up (flat) → sand; lower → rock.
-  const r = positionWorld.add(uRenderOrigin);
-  // One radial length, reused for BOTH the slope `up` (= r/|r|) and the elevation band below — saves a
-  // sqrt per fragment vs a separate normalize()+length() in the hottest (every-terrain-fragment) path.
-  const rLen = r.length();
-  const up = r.div(rLen);
+  // Slope material bands + elevation band (always), computed in the planet BODY frame so the surface
+  // shading stays LOCKED to the ground as the planet spins (no swim). bodyAbs = positionLocal + the leaf's
+  // body-fixed centre (aCenter) = the true body-absolute vertex; `up` is its radial direction, `rLen` its
+  // radius. slope = (body normal)·(body up) is rotation-invariant, so it equals the inertial slope but is
+  // constant under spin. slope=1 where the surface faces straight up (flat) → sand; lower → rock.
+  const bodyAbs = positionLocal.add(attribute('aCenter', 'vec3'));
+  // One radial length, reused for BOTH the slope `up` (= bodyAbs/|bodyAbs|) and the elevation band below —
+  // saves a sqrt per fragment vs a separate normalize()+length() in the hottest (every-fragment) path.
+  const rLen = bodyAbs.length();
+  const up = bodyAbs.div(rLen);
   const slope = nGeom.dot(up).clamp(0, 1);
   const sb = SLOPE_PRESETS[Math.min(Math.max((opts.slopePreset ?? 0) | 0, 0), SLOPE_PRESETS.length - 1)]!;
   const band = smoothstep(sb.lo, sb.hi, slope);
@@ -247,8 +243,11 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
   } else {
     // ── Surface detail (fades in with proximity, on the morph's schedule) ───────
     // ONE octave only (the fine 6 m octave was dropped — it only shows within ~6 km, rarely on screen).
-    // Stable, float-precise absolute coordinate (see header): render-space position + renderOrigin mod L.
-    const pDetail = positionWorld.add(uDetailPhase);
+    // Stable, float-precise BODY-fixed coordinate (see header): positionLocal + the leaf centre reduced
+    // mod L (aCenterPhase). Body-fixed ⇒ the detail is locked to the ground through the planet's spin AND
+    // through floating-origin recenters. The mod-L (100 km) wrap seam is body-fixed and off-screen — L ≫
+    // the 40 m detail scale and detail only renders within ~50 km, so a 100 km-spaced seam never shows.
+    const pDetail = positionLocal.add(attribute('aCenterPhase', 'vec3'));
     // Weight: tie to the geometry morph (off where geometry collapses to its parent, so the two never fight)
     // AND a distance gate (anti-alias: 0 before the feature drops below a pixel).
     const morphW = mFinal.oneMinus(); // 1 near (full geometry detail) → 0 far (parent)
@@ -308,8 +307,6 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
   return {
     material: mat,
     kDist: kDist as unknown as { value: number },
-    renderOrigin: uRenderOrigin as unknown as { value: Vector3 },
-    detailPhase: uDetailPhase as unknown as { value: Vector3 },
     now: uNow as unknown as { value: number },
     sunDir: uSunDir as unknown as { value: Vector3 },
     hazeDensity: uHazeDensity as unknown as { value: number },
