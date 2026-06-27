@@ -43,6 +43,7 @@ import { childSeed, SALT } from '../core/seedchain.ts';
 import { QuadtreeManager } from './quadtreeManager.ts';
 import { PlayerController, type WalkInput } from './player.ts';
 import { createAtmosphere } from './atmosphere.ts';
+import { createOcean } from './ocean.ts';
 
 // Injected by Vite at build time (git short hash + build time) — logged at startup
 // so we can tell a stale deploy from the latest fix during remote diagnosis.
@@ -259,6 +260,8 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     noShadow, // ?noshadow: disable the moon's cast shadow
     noatmo: params.has('noatmo'), // ?noatmo: hide the Step 6 atmosphere shell (A/B)
     noHaze, // ?nohaze: disable the terrain aerial-perspective haze (A/B)
+    daylit, // ?daylit: force the sun to the camera-facing hemisphere (atmosphere tuning aid)
+    noocean: params.has('noocean'), // ?noocean: hide the ocean (A/B)
   });
 
   const R = EARTH_RADIUS_M;
@@ -368,6 +371,19 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const atmosphere = createAtmosphere(R);
   atmosphere.mesh.visible = !params.has('noatmo');
   scene.add(atmosphere.mesh);
+
+  // ── Phase O: ocean ─────────────────────────────────────────────────────────
+  // A sea-level sphere; opaque + depth-tested so land/sea falls out of depth sorting (terrain above
+  // sea level shows land, below shows water; the coastline is where terrain crosses sea level). Sea
+  // level is ~4 km above the mean radius but clamped below the walk spawn's terrain so the player
+  // spawns on land (buoyancy/swim deferred). Lives on `scene` at the planet centre (−_spunOrigin),
+  // concentric with the terrain. ?noocean A/B.
+  const _seaProbe = new Float64Array(7);
+  surfaceAt(recipe, R, SURFACE_DIR.x, SURFACE_DIR.y, SURFACE_DIR.z, _seaProbe, groundOct);
+  const seaLevelR = Math.min(R + 4000, _seaProbe[0]! - 400);
+  const ocean = createOcean(seaLevelR);
+  ocean.mesh.visible = !params.has('noocean');
+  scene.add(ocean.mesh);
 
   // ── Step 5: real spin + orbit (day/night, moving sun, moon, optional cast shadow) ──
   // The RENDER frame stays PLANET-CENTERED (terrain/player body-fixed, planet at the origin, NEVER
@@ -790,6 +806,11 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       atmosphere.sunDir.value.copy(_sunDir);
       atmosphere.planetUp.value.copy(_camUp);
       atmosphere.camAlt.value = Math.max(0, camDist - R);
+      // Ocean: concentric with the terrain at the planet centre; same inertial sun + a real-time wave clock.
+      ocean.mesh.position.set(-_spunOrigin.x, -_spunOrigin.y, -_spunOrigin.z);
+      ocean.planetCenter.value.set(-_spunOrigin.x, -_spunOrigin.y, -_spunOrigin.z);
+      ocean.sunDir.value.copy(_sunDir);
+      ocean.time.value = now / 1000;
       // R2: place the Sun + Moon as REAL bodies at their true planet-centered inertial positions, in
       // scene space (= inertialPC − spunOrigin), at real radii. From the planet they're tiny discs at the
       // correct angular size + direction; in creative (G) the floating origin rides the camera, so flying
@@ -1048,6 +1069,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       moonGeo.dispose();
       moonMat.dispose();
       atmosphere.dispose();
+      ocean.dispose();
       renderer.dispose();
     },
   };

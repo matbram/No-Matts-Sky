@@ -362,6 +362,15 @@ leaves (no spike), no rAF `[Violation]` stalls.
        = graded blue sky + horizon desaturation; typecheck + 129 tests + build green. Thin limb at high orbit is
        realistic (dramatic at low orbit); brightness/richness come in Stages B (transmittance+sky-view LUT), C
        (multiscatter), E (preset lock). Then Phase O (ocean) + Phase C (clouds).
+   - **Phase O — ocean: DONE** (`src/render/ocean.ts`). An opaque, depth-tested sphere at sea level
+     (R+4 km, clamped below the walk spawn so it spawns on land) — land/sea falls out of depth sorting
+     (terrain above sea level = land, below = ocean; coastline where it crosses). Unlit water node: Fresnel
+     deep-blue→reflected-sky, a tight sun glint toward `_sunDir`, scrolling wave-normal sparkle, day/night
+     by radial-up·sun. Smooth without tessellation via a per-fragment analytic radial normal (coarse 64
+     cube-sphere). Lives on `scene` at the planet centre (−_spunOrigin), concentric with the terrain.
+     **Headless-confirmed (`?webgl&daylit`):** a blue ocean world with landmasses + sun glint + soft limb.
+     `?noocean` A/B. Deferred: depth-based shallow/teal colour (needs the scene depth texture), buoyancy/
+     swimming (visual-first), sky-view-LUT reflection (uses an analytic sky gradient for now).
    - **S4 — perf hygiene done; 60fps lock is the real-GPU gate.** Micro-opt: the terrain shader now reuses one
      radial length for both the slope `up` and the elevation band (one sqrt/fragment, not two — hottest path).
      Headless `?perf` (orbit→mid→surface) confirms S1–S3 added **no unbounded main-thread work**: recut ≈14–20 ms
