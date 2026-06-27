@@ -211,6 +211,14 @@ export function surfaceNets(
     for (let j = 0; j <= ny; j++) {
       for (let i = 0; i <= nx; i++) {
         const here = density[cIdx(i, j, k)]! >= 0;
+        // ⚠ LATENT OOB (flagged, NOT fixed here): this branch guards the lower bounds (j>=1,k>=1)
+        // but not the upper (j<ny, k<nz), so a boundary sign-change at j==ny/k==nz indexes cellVert
+        // past its nx·ny·nz extent. Adding `j<ny && k<nz` here (and the symmetric guards in the y/z
+        // branches) is NOT a no-op — it changes the frozen mesh digests (~68 fewer tris on the
+        // standard leaf), so the wrapped/boundary reads currently DO emit apron-boundary triangles.
+        // Fixing it is a deliberate change needing a golden re-bless + a real-GPU seam/coverage check,
+        // out of scope for the determinism-hardening pass (which must not re-bless). Latent today: the
+        // outer radial shell is air and the recipe is smooth, so it has not produced a visible defect.
         if (i < nx && j >= 1 && k >= 1 && (density[cIdx(i + 1, j, k)]! >= 0) !== here) {
           quad(
             cellVert[cellIdx(i, j - 1, k - 1)]!,

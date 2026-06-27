@@ -1,7 +1,8 @@
 # HANDOFF — No Matt's Sky (current build state)
 
 > Read **`CLAUDE.md`** first (it's the build spec + guardrails). This file is the companion: **what is
-> actually built right now, how to run/verify it, and what's next.** Last updated at commit `2227974`.
+> actually built right now, how to run/verify it, and what's next.** For the live commit/branch run
+> `git rev-parse --short HEAD` / `git branch --show-current` (don't trust a hard-coded hash here — it goes stale the next commit).
 >
 > **Authority:** the law lives in **`/design`** (7 docs). When they disagree, the order is
 > **Constitution → master plan → slice spec** (`CLAUDE.md` §1). This handoff describes the *build state*;
@@ -12,20 +13,33 @@ A real-scale (Earth = 6,371 km) procedurally-generated planet you can fly from o
 **walk on**, at a locked **60 fps**, with **seamless, pop-free CDLOD terrain** that "gets clearer" as you
 descend (no popping/flicker). The vertical-slice core (CLAUDE.md Steps 0–4) is done, plus an extensive
 LOD-quality pass (continuous distance-morph, speed/altitude-aware prefetch, always-resident coarse base,
-analytic morph normals). **Remaining slice work: Step 5 (real spin/orbit — day/night, moving sun, moon
-shadow, velocity-inheriting launch) and Step 6 (atmosphere LUT + triplanar materials + final 60fps lock).**
+analytic morph normals). **Steps 0–6 are now implemented** (Step 5 re-architected to the real reference-frame
+system — a genuinely spinning planet under a real far Sun + Moon you can fly to; Step 6 = a **soft
+ray-marched atmosphere** with transmittance + multiscatter-proxy **LUTs**, aerial-perspective haze, an
+elevation palette, an **ocean** at sea level, and lit drifting **clouds** — the full Earth-like look).
+Flight is now an **untethered full-6DOF free-fly** (the default camera) with a **player-controlled throttle**
+(no altitude auto-scaling), **runtime time-rate control** (T: 1×/…/360×/pause), and **solid-planet
+collision** (you can't fly through the ground — underwater is allowed). **All visual + 60 fps acceptance is a
+real-GPU gate** (headless software-WebGL confirms correctness/render only). Remaining: real-GPU confirmation
+pass + the deferred refinements (velocity inheritance on launch, analytic eclipse, Moon as a landable body —
+see §6).
 
 ## 2. First 5 minutes (new session)
 ```bash
 cd No-Matts-Sky
-git checkout claude/eloquent-tesla-98njmv && git pull
+git pull   # a fresh clone is already on the task's feature branch — don't hard-code a branch name (it changes per task)
 npm install
-npm test          # 6 suites: hash, noise, cubesphere, density, chunk, quadtree (golden/determinism)
+npm test          # 12 suites (golden/determinism): hash, noise, cubesphere, density, chunk, quadtree,
+                  #   seedchain, facts, surfacenets, core-boundary, digest, orbits
+npm run build     # tsc --noEmit && vite build (the same gates CI runs — .github/workflows/ci.yml)
 npm run typecheck # tsc --noEmit
 npm run dev       # open the printed localhost URL in a WebGPU browser (Chrome/Edge)
 ```
-- Camera presets: **1** = orbit, **2** = mid, **3** = surface. **F** = walk, **G** = creative fly. Drag =
-  orbit, scroll = zoom.
+- **Default = untethered 6DOF free-fly:** **WASD** + **Space/Ctrl** (up/down) move along the camera, mouse
+  looks (no clamp — full inversion), **Q/E** roll, **R** smoothly re-levels the horizon, **X** full-stop,
+  **Shift** boost, **`[`/`]`** or **mouse wheel** set the throttle target, **T** cycles the game-time rate
+  (1×/60×/360×/pause). **F** = walk, **G** = toggle free-fly. **1/2/3** = orbit/mid/surface presets
+  (drag = orbit, scroll = zoom while in preset mode).
 - To judge LOD behavior, open with **`?lodaudit`** and watch the console `[NMS audit]` lines (see §7).
 - Headless screenshots + console (no human/GPU): `npm run shoot` → writes to `.shots/`
   (`QUERY='?lodaudit' npm run shoot mytag`). Uses Playwright + software WebGPU (SwiftShader).
@@ -33,7 +47,9 @@ npm run dev       # open the printed localhost URL in a WebGPU browser (Chrome/E
 ## 3. Stack & repo facts
 - **TypeScript** + **Three.js WebGPU** (`three@^0.184`, `import { WebGPURenderer } from 'three/webgpu'`,
   TSL shaders) + **Vite 7** + **Vitest 3** + **Playwright** (headless harness only). **Node ≥ 20.19**.
-- Branch: **`claude/eloquent-tesla-98njmv`** (latest commit `2227974`, clean tree).
+- Branch: the task's feature branch (run `git branch --show-current`; `git rev-parse --short HEAD` for the commit). The
+  determinism/CI-hardening pass (seedchain/facts/production-seed/core-boundary/surfacenets/quadtree-cut/digest goldens +
+  `.github/workflows/ci.yml`) landed on `claude/app-audit-next-steps-0urxct`.
 - Scripts: `dev`, `build` (`tsc --noEmit && vite build`), `preview`, `typecheck`, `test`, `test:watch`,
   `shoot` (`node scripts/shoot.mjs [tag]`).
 - WebGPU init is **async** (`await renderer.init()`) and the loop uses `renderer.setAnimationLoop(fn)`.
@@ -54,13 +70,18 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
 | `chunk.ts` | `meshChunk`: 2-pass column-cache; per-corner density + `cornerNormal` + `cornerMorphNormal`; apron + conditioned skirts |
 | `constants.ts` | real radii (Earth 6.371e6, Moon 1.737e6, Mars 3.39e6 m) |
 | `facts.ts` | `PlaceFacts` schema + the slice's single barren planet (coordinate-seeded) |
+| `orbits.ts` | Kepler/NR (e≤0.8) `orbitalPosition`/`orbitalVelocity` + `spinAngle`; real Earth/Moon elements; frozen golden |
 
 | `/src/render` (Three.js) | role |
 |---|---|
 | `scene.ts` | render shell: WebGPU renderer, camera presets, floating-origin recentre, recut logic, prefetch/telemetry, all `?`-flags |
 | `terrainMaterial.ts` | the **ONE shared** terrain material (`createTerrainMaterial`): per-vertex CDLOD geomorph (position+normal, from `aLodR`/`aParentR` attrs + shared `kDist`) **and** distance-faded surface detail (slope bands + procedural `mx_noise` detail, faded by `1−mFinal`); `detailPhaseOf` = renderOrigin mod L (double) for swim-free, precise detail coords |
 | `quadtreeManager.ts` | streaming state machine (pending→inflight→ready→live→purged), worker pool, per-frame GPU upload budget; fills per-leaf `aLodR`/`aParentR` + renders every leaf with the shared material (clones only for debug tints), feeds the material's origin/detail-phase uniforms, all `[NMS …]` logging |
-| `player.ts` | character controller: walk/fly, ground collision via analytic `surfaceAt` probe |
+| `player.ts` | character controller: walk (gravity + ground collision) **and untethered 6DOF free-fly** (free-quaternion look, Q/E roll, smooth R, player throttle, **solid-planet collision**); collision via analytic `surfaceAt` probe |
+| `atmosphere.ts` | soft ray-marched single-scatter sky shell (Rayleigh+Mie+ozone) + aerial-perspective haze; LUT-fed |
+| `atmosphereLUT.ts` | one-time transmittance LUT (256×64 RGBA16F via `QuadMesh` pass) + multiscatter proxy; `?atmonolut` falls back to analytic |
+| `ocean.ts` | opaque sea-level water sphere (Fresnel sky-reflection, sun glint, day/night); land/sea by depth sort |
+| `clouds.ts` | lit, drifting fBm cloud shell at R+9 km (alpha-blended, depth-tested) |
 | `stats.ts` | FPS / frame-time overlay (turns red < 55 fps) |
 | `main.ts` | entry: WebGPU gate + animation loop |
 | `/src/workers/mesher.worker.ts` | off-thread meshing; returns mesh via **buffer transfer** (not copy) |
@@ -80,8 +101,9 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
   `e13cdf7`, `2227974`.)
 - **Gradual visual-transition pass ("plane approaching Earth" — this session, branch
   `claude/lod-visual-transition-audit-jeq2fz`):** (1) tuned for continuity — `MORPH_START_FRAC` 0.55→0.30
-  (wider fade band), `RECUT_MAX_MS` 400→200 (leaves trickle, not batch), `PREFETCH_S` 0.7→1.0 (born at the
-  parent surface); (2) **one shared material** (`terrainMaterial.ts`) — the per-leaf morph node-graph clone is
+  (wider fade band), `RECUT_MAX_MS` 400→300 (leaves trickle, not batch), `PREFETCH_S` kept at 0.7 (a 1.0
+  experiment was reverted — the live values are `RECUT_MAX_MS=300`, `PREFETCH_S=0.7`, see §7); (2) **one shared
+  material** (`terrainMaterial.ts`) — the per-leaf morph node-graph clone is
   gone (per-leaf data → `aLodR`/`aParentR` attrs), and the **time-based birth-ease was removed** (it faded a
   recut's batch in as a synchronized "wave"; the per-vertex distance morph alone carries leaves in now); (3)
   **distance-faded surface detail** — slope material bands + procedural `mx_noise` detail (coarse ~40 m, fine
@@ -218,6 +240,88 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
   not a regression; if the panel is ~57 Hz, 17.6 ms is already "locked to the display"). Deferred fallback if
   the recut still bites: move cut-selection to a worker (it's pure/worker-safe).
 
+- **Determinism + CI hardening pass (branch `claude/app-audit-next-steps-0urxct`, from the deep-audit next-steps
+  plan):** closed the guardrail-§6 gap the audit found — the `[S]` seed chain, the facts stub, and the
+  *production* seed path were on the live runtime path but unguarded by any frozen golden. Added **5 new test
+  suites + extensions** (91→**119 tests**), all render-output-unchanged (no golden re-bless): `seedchain.test.ts`
+  (freezes `MASTER_SEED`, the `SALT` map, `planetSeed`/`childSeed` incl. the production
+  `childSeed(sliceFacts().seed,0,SALT.terrain)`), `facts.test.ts` (the coordinate-keyed `sliceFacts` seam),
+  `chunk.test.ts` +production-seed golden (the real address→seed→recipe→mesh wire), `core-boundary.test.ts`
+  (asserts `/core` imports no three.js — guardrail §1 now self-policing, via `import.meta.glob('?raw')`),
+  `surfacenets.test.ts` (standalone manifold/watertight + frozen digest on a sphere SDF), `quadtree.test.ts`
+  +frozen orbit/mid/surface cut snapshots and a `packRegion`/`unpackPath` injectivity sweep (both now exported),
+  `digest.test.ts` (FNV-1a known-answer vectors). Plus **`.github/workflows/ci.yml`** (typecheck+test+build on
+  push/PR — the enforcement substrate behind every "frozen"/"convention-only" guard). Doc drift repaired
+  (HANDOFF/PERFORMANCE/CLAUDE: stale branch/commit, the failing checkout line, the `RECUT_MAX_MS`/`PREFETCH_S`
+  contradiction, the §6 dials, `aLevel`→`aLodR`/`aParentR`, seven→eight docs) and the `salt=0` structural-descent
+  convention documented + frozen. typecheck + 119 tests + build green.
+
+- **Step 5 — real spin + orbit (render integration; same branch).** `core/orbits.ts` (Kepler/NR e≤0.8,
+  `orbitalPosition`/`orbitalVelocity`, `spinAngle`, real Earth/Moon elements + frozen golden) is wired into
+  `scene.ts`: a game clock (`TIME_COMPRESSION`, `?timescale=N`, `?notime`) drives **day/night from REAL spin**
+  — each frame the heliocentric planet→sun direction is rotated into the body frame by the inverse spin about
+  the tilted axis (23.44°) and set as the `DirectionalLight` direction (NOT a moved light), so the terminator
+  sweeps as the planet rotates and drifts as it orbits. The **render frame stays planet-centered** (no AU-scale
+  double to the GPU; the surface→orbit **launch can't rocket the planet away** — gate satisfied by construction;
+  full inertial flight model deferred). A **Sol disc** (unlit billboard, real angular size, behind terrain) and
+  a **Moon proxy** (along its true direction) are rendered; the Moon's **cast shadow** is wired
+  (`renderer.shadowMap` + `sun.castShadow` + terrain `receiveShadow` via the new `ManagerOpts.receiveShadow`)
+  behind **`?noshadow`**. HUD shows game-day / time-of-day / orbit %. **Headless-confirmed:** `?webgl` renders the
+  day/night terminator cleanly (shadows on AND off), typecheck + 129 tests (render-only, no golden change) +
+  build green. ⚠ **Real-GPU confirm:** terminator ADVANCES over time; sun drifts over an orbit; the moon's cast
+  shadow lands during an eclipse (`?noshadow` to A/B — the terrain material overrides `positionNode` + is
+  `DoubleSide`, so the shadow-depth pass must reproduce the morphed surface; analytic sun-occlusion is the
+  fallback); 60 fps holds. (commits `dbd2d51`, `500175b`, + this Step-5 render commit.)
+
+- **Step 5R — real reference-frame free flight (re-architecture; same branch).** The first Step 5 above took a
+  single-planet shortcut (planet pinned at the origin, Sun/Moon as ~5 km proxies, day/night faked by rotating the
+  light). That passes the literal checklist near one planet but blocks the actual goal — flying freely from surface
+  to Moon to Sun, every body a real object. So the render frame was rebuilt to the master-plan Part-4 hierarchy
+  (the orbit math, double precision, floating origin, and streaming all carry over unchanged):
+  - **R1** (`baa8c21`): the planet is a REAL spinning body. Terrain + backdrop live under a `planetGroup` whose
+    quaternion = the real spin `qSpin(t)`; players co-rotate (surface walkers turn WITH the planet — ground static,
+    sun moves); orbital viewers see it turn. Day/night = the real Sun direction on the genuinely-spinning surface.
+  - **R2** (`2050e7e`): real far Sun + Moon at TRUE distances (1 AU / 384,000 km, real radii), placed at
+    `bodySystemPos − spunOrigin` in scene space. The floating origin rides the camera, so flying out makes a body
+    GROW from a dot — no proxies. Log-depth far-plane held the terrain crisp. (Eclipse shadow now dormant — moon is
+    real-far, outside the shadow frustum; needs the analytic approach.)
+  - **R3a** (`8864890`): spaceship flight speed (user-chosen auto-scale + manual throttle). Cruise =
+    `clamp(altitude × 0.7, 20 m/s, 0.3c)` × throttle; `[`/`]` throttle, Shift boost. The Moon is reachable in
+    seconds, the Sun in ~minutes (the old ~40 km/s ladder made the Moon ~2.7 h away — that's why "fly to it" felt
+    broken). HUD shows cruise speed + distance-to-Moon/Sun.
+  - **FF (free-flight overhaul) — Phase 1 + untethered look + planet collision DONE** (`player.ts` + `scene.ts`):
+    user feedback "stuck on an axis / invisible guideline." Movement is fully **camera-relative 6DOF** (W=look,
+    A/D=camera right, Space/Ctrl=camera up). The LOOK is now a **free orientation quaternion** (`_flyQuat`):
+    mouse yaw/pitch + **Q/E** roll all act in the camera's **LOCAL** frame — **untethered**, so you can point/fly
+    any direction incl. straight up, over the top, and inverted, and hold any bank. (A brief "stable-up" variant
+    was tried to keep the horizon level but felt re-tethered — "stuck on an invisible axis" — so per the user we
+    went **full 6DOF, no auto-level assist**.) Tradeoff the user accepted: circling the look can slowly tilt the
+    horizon; **R** smoothly re-levels it (slerp toward a leveled target that keeps the look dir, snaps within ~1°,
+    **cancels on any look input** so it never fights you). **Solid-planet collision** (newest ask — "can't fly
+    through the planet, under water maybe but not through it"): `collideFly()` clamps the radius above the SOLID
+    terrain surface (analytic footprint via `surfaceAt`, lifted to the rendered mesh when higher — never sea
+    level) and removes only the **inward radial velocity** so you **slide** along the ground, not stop dead. So
+    you can descend below sea level into the water but not through the seabed/ground; no gravity; `FLY_CLEARANCE`
+    keeps the near plane off the rock. (Per-frame radial clamp: robust vs radial tunnelling; lateral tunnelling at
+    relativistic throttle skimming the deck is out of slice scope.) **Speed is player-controlled** (replaced
+    altitude auto-scaling): an absolute **throttle ladder** (`[`/`]` + mouse wheel), the velocity **eases** toward
+    the throttle target (critically-damped, no overshoot), **Shift** boosts, **X** full-stops. **Free-fly is the
+    default camera on load** (aimed at the planet); orbit-drag + **1/2/3** presets and **F** walk remain; **G**
+    toggles. **T** cycles the game-time rate (1×/60×/360×/pause) so things run at real speed; HUD shows it. Walk
+    mode unchanged. Headless-confirmed: presets + walk still render, typecheck + 129 tests + build green. ⚠
+    Real-GPU: the 6DOF feel + collision (dive at land → stop & slide; dive at ocean → sink underwater, stop at
+    seabed). **Phase 2 (deferred):** altitude-aware frame — inertial in space (planet rotates beneath), body-fixed
+    + gravity in the atmosphere — with a smooth blend (gravity feel to be confirmed).
+- **Step 6 (S1) — atmosphere sky + sun glow** (`src/render/atmosphere.ts`, this commit). A planet-centered shell
+  at `R·1.025` (BackSide, additive, depth-tested but not depth-writing) with an analytic single-scatter colour
+  (Rayleigh blue + limb/horizon brightening + a Mie forward-glow sun halo), fed the SAME real `_sunDir` as the
+  terrain. One mesh serves both views: from orbit a **glowing blue limb** wraps the planet (brighter on the sunlit
+  crescent, dark on the night side); from the surface **blue sky** overhead, brightening toward the horizon. The
+  camera `far` is now extended in EVERY mode (incl. walk) to reach the shell + the real Sun/Moon, so the sky is
+  consistent surface↔space (log depth keeps the surface crisp; ⚠ real-GPU: re-confirm no walk-surface z-fight).
+  `?noatmo` hides it for A/B. **Headless-confirmed** (`?webgl`): orbit limb + ground sky both render; typecheck +
+  129 tests (render-only) + build green; walk stays grounded (eye height 1.7 m) with the extended far plane.
+
 Measured-good on WebGPU (build the user ran): orbit→surface descent holds 60 fps / ~16.8 ms,
 `cov=96/96 holes=0` throughout, `fresh=0 refine=N` (sharpen-in-place, no pop), `bornM≈1.0`, largest cut ~466
 leaves (no spike), no rAF `[Violation]` stalls.
@@ -229,7 +333,15 @@ leaves (no spike), no rAF `[Violation]` stalls.
 > GPU after any change.
 
 ## 6. What's NEXT (pick up here)
-1. **GATED: cube-face-corner `maxNbrΔ=2` transient.** With gated incremental refinement + the 2:1 `balanceCut`
+0. **FLAGGED (latent, not yet fixed): Surface Nets pass-2 upper-axis OOB.** Each tangential branch in
+   `surfacenets.ts` pass-2 guards the lower bounds (`j>=1,k>=1`) but not the upper (`j<ny,k<nz`), so a boundary
+   sign-change can index `cellVert` past its `nx·ny·nz` extent (the read wraps to a neighbouring cell or returns
+   undefined). Adding the upper guards is **NOT a no-op** — it changes the frozen mesh digests (~68 fewer tris on
+   the standard leaf), i.e. those boundary reads currently DO emit apron-boundary triangles. Latent today (the
+   outer radial shell is air + the recipe is smooth, so no visible defect), so the determinism-hardening pass left
+   it in place (it must not re-bless) and documented it in code. Fixing it is a deliberate change needing a golden
+   re-bless + a real-GPU seam/coverage check. (Audit finding, confirmed.)
+1. **(Audit: likely a NON-issue) cube-face-corner `maxNbrΔ=2` transient.** With gated incremental refinement + the 2:1 `balanceCut`
    (both now implemented), the cut is `maxNbrΔ≤1` in steady state and through almost every transition. The one
    exception is a **transient `maxNbrΔ=2` at a cube-face corner** during a fast climb: `balanceCut`'s
    cross-face neighbour probe (`maxNeighborDepth`/`coveringDepth` via `wrapFaceUV`) doesn't catch the
@@ -240,11 +352,97 @@ leaves (no spike), no rAF `[Violation]` stalls.
    (or add an explicit corner-neighbour pass), then it force-splits like any other edge. The watertight
    edge-lock fallback (per-vertex `edgeMask` + `effMorph=0` on boundary verts; conditioned skirts behind
    `?skirt`) remains available if a sub-pixel `gap` line shows at the one-level T-junctions.
-2. **Step 5 — real spin/orbit** (CLAUDE.md §5/§7): planet rotates (day/night from real spin), orbits a visible
-   Sol (sun moves over the orbit), Moon casts a **real shadow**, and surface→orbit launch **inherits the
-   planet's velocity** (it doesn't rocket away). Compute spin/orbit angles in **double, mod 2π, then cast to
-   float**; Kepler via Newton–Raphson, eccentricity capped 0.8. See master plan Parts 4 & 5.
-3. **Step 6 — atmosphere LUT + triplanar materials + lock 60fps** end-to-end (all of CLAUDE.md §7 at once).
+2. **Step 5 — real spin/orbit: IMPLEMENTED (render integration in `scene.ts` + `core/orbits.ts`); REMAINING =
+   real-GPU confirmation + the moon-shadow visual.** Done: day/night from real spin (headless-confirmed
+   terminator), sun drifts over the orbit, Sol disc + Moon proxy, planet-locked launch (no rocket-away),
+   double→mod 2π→float, Kepler/NR e≤0.8, frozen orbits golden. **To pick up:** (a) on a real WebGPU GPU confirm
+   the terminator ADVANCES, the sun drifts over a (time-compressed) orbit, and **the moon's cast shadow lands
+   during an eclipse** (`?noshadow` to A/B; the terrain material overrides `positionNode` + is `DoubleSide`, so
+   verify the shadow-depth pass reproduces the morphed surface — else switch to the analytic sun-occlusion
+   fallback or a `?moonscale` demonstrative size); (b) optional: the full inertial flight model (currently the
+   planet-locked frame satisfies the no-rocket-away gate). Tunables: `TIME_COMPRESSION` (constants.ts),
+   `?timescale=N`/`?notime`/`?noshadow`, `SUN_PROXY_DIST`/`MOON_PROXY_DIST` (scene.ts).
+3. **Step 6 — "make it beautiful" (in committed, screenshot-verifiable increments).**
+   - **S1 — atmosphere sky + sun glow: DONE** (`src/render/atmosphere.ts`; headless-confirmed orbit limb + ground
+     sky). ⚠ Real-GPU: confirm the limb/sky look + that the walk-mode far-plane extension doesn't z-fight the
+     surface (log depth should hold it; if not, split the far bodies into a layered pass — plan §4).
+   - **S2 — aerial perspective: DONE** (`terrainMaterial.ts` + manager `setAtmosphere` + scene wiring). The lit
+     surface is dimmed by transmittance and the sky's blue is added as **emissive** (unlit) inscatter, scaled by
+     view `dist` × air density; density = `exp(−alt/30 km)` (scene.ts), so haze is full at the surface, ~0.39 at
+     28 km, and ≈0 by orbit (planet reads crisp from space — only the shell's limb). Reuses the morph `dist` +
+     slope `up`, fed the same `_sunDir` as the shell (ground haze ↔ sky agree at the horizon). `?nohaze` A/B.
+     **Headless-confirmed:** orbit stays crisp (no wash); a t=0 A/B at the surface preset shows the haze adds
+     +9 blue-shift (B−R) to distant terrain — the aerial-perspective signature. ⚠ Real-GPU: the full daylit look
+     is best judged flying the **day-side equator** (the fixed headless spawn spot sits near the spin pole, so
+     it's perpetually grazing-lit/dim — not a bug, just the test view).
+   - **S3 — elevation palette band + slope-preset lock: DONE** (`terrainMaterial.ts`). A 3rd material tier on
+     top of the slope rock/sand — pale dusty **highlands** up high, darker **lowland** regolith down low — keyed
+     to the fragment's normalized height `(|p|−R)/heightAmp` (cheap: one length + two smoothsteps, no noise,
+     always on → reads as large-scale highland/lowland tinting from orbit and grounds the surface). Slope preset
+     locked to **2** (low-contrast — mutes preset 0's harsh black/tan salt-and-pepper; `?slopeband=N` overrides).
+     **Deliberately NOT literal 3-axis triplanar:** the detail is isotropic 3D gradient noise (`mx_noise_vec3` of
+     the world position) with no single-axis projection to stretch, so triplanar would only triple the dominant
+     per-fragment noise cost (the cost S4 must bound) for no visible gain — documented in code. **Headless-
+     confirmed:** orbit renders with softer mottle + warmer palette, no artifacts; typecheck + 129 tests + build
+     green. ⚠ Real-GPU: judge the elevation tiers up close in daylight.
+   - **ATMOSPHERE OVERHAUL (user feedback "hard edge"; chose LUT + Earth-like + clouds + ocean).** The S1
+     shell read as a hard-edged ring (a thin mesh + Fresnel term = a geometric silhouette). Replaced with a
+     ray-marched soft-limb sky; full plan (LUT atmosphere + ocean + clouds) in the approved plan file.
+     - **Stage A DONE** (`src/render/atmosphere.ts` rewrite): a BackSide shell at R+100km whose colour is an
+       analytic single-scatter ray-march (Rayleigh+Mie+ozone, exp density) → the limb fades SMOOTHLY into
+       space (no silhouette) and the surface gets a real graded blue sky (deep zenith → pale horizon).
+       Precision-safe near the surface: the CPU feeds the camera's radial `up` + altitude (`atmosphere.planetUp`
+       /`atmosphere.camAlt`); per-sample altitude uses the difference-of-squares form (no |oc|²−R² cancellation).
+       New `?daylit` dev toggle lights the camera-facing hemisphere for tuning (preset/spawn spots sit near the
+       dim pole/terminator). **Headless-confirmed (`?webgl`):** soft limb (no hard edge); `?daylit` ground view
+       = graded blue sky + horizon desaturation; typecheck + 129 tests + build green. Thin limb at high orbit is
+       realistic (dramatic at low orbit); brightness/richness come in Stages B (transmittance+sky-view LUT), C
+       (multiscatter), E (preset lock). Then Phase O (ocean) + Phase C (clouds).
+   - **Phase O — ocean: DONE** (`src/render/ocean.ts`). An opaque, depth-tested sphere at sea level
+     (R+4 km, clamped below the walk spawn so it spawns on land) — land/sea falls out of depth sorting
+     (terrain above sea level = land, below = ocean; coastline where it crosses). Unlit water node: Fresnel
+     deep-blue→reflected-sky, a tight sun glint toward `_sunDir`, scrolling wave-normal sparkle, day/night
+     by radial-up·sun. Smooth without tessellation via a per-fragment analytic radial normal (coarse 64
+     cube-sphere). Lives on `scene` at the planet centre (−_spunOrigin), concentric with the terrain.
+     **Headless-confirmed (`?webgl&daylit`):** a blue ocean world with landmasses + sun glint + soft limb.
+     `?noocean` A/B. Deferred: depth-based shallow/teal colour (needs the scene depth texture), buoyancy/
+     swimming (visual-first), sky-view-LUT reflection (uses an analytic sky gradient for now).
+   - **Stage B (transmittance LUT) + Stage C (multiscatter proxy): DONE** (`src/render/atmosphereLUT.ts` +
+     `atmosphere.ts`). The §5.7 LUT path is proven: a transmittance LUT (256×64 RGBA16F) is rendered ONCE to a
+     RenderTarget via a fullscreen `QuadMesh` pass (portable — no compute/storage textures) and the sky march
+     samples it for the sun term (physically-correct extinction + sunset reddening) instead of the airmass
+     approximation. **DEFAULT ON** (verified to render under `?webgl`); `?atmonolut` forces the analytic path,
+     and a try/catch around the one-time build falls back to analytic if a backend can't do HalfFloat RTs.
+     Stage C is a CHEAP multiscatter proxy (an isotropic skylight term gated by the sun's elevation) that lifts
+     the day sky and keeps twilight blue instead of black — not the full Hillaire multi-direction LUT.
+     **Headless-confirmed (`?webgl`):** ground sky graded blue via the LUT; default night-orbit shows a soft
+     sunrise limb (no hard edge); typecheck + 129 tests + build green; no LUT build errors. **Deferred (real-GPU
+     gated):** the per-frame SKY-VIEW LUT (a perf optimization — the analytic march + LUT tap is fine for now)
+     and the aerial-perspective LUT (Stage D — terrain still uses the old `HAZE_*`); Stage E preset tuning ongoing.
+   - **Phase C — clouds: DONE** (`src/render/clouds.ts`). A semi-transparent, sun-lit cloud deck at R+9 km:
+     two-octave fBm coverage of the SURFACE DIRECTION (stable on the globe, drifts only by a wind clock),
+     soft puffy alpha, lit white (day) / dark (night) / warm (terminator) by `_sunDir`; alpha-blended,
+     depth-tested (ground occludes it), drawn before the sky (renderOrder 5). **Headless-confirmed
+     (`?webgl&daylit`):** white drifting clouds over the blue ocean with gaps to the sea — the full
+     Earth-like look (atmosphere + ocean + clouds). `?noclouds` A/B. Volumetric clouds deferred (`?volclouds`).
+   - **S4 — perf hygiene done; 60fps lock is the real-GPU gate.** Micro-opt: the terrain shader now reuses one
+     radial length for both the slope `up` and the elevation band (one sqrt/fragment, not two — hottest path).
+     Headless `?perf` (orbit→mid→surface) confirms S1–S3 added **no unbounded main-thread work**: recut ≈14–20 ms
+     (one-off on a preset switch), upload ≈0.4–1.7 ms, tick ≈0.1–0.3 ms; live ≈72–104 draws (bounded), churn 1–2/s
+     (no thrash); the huge `gpu/other` is purely software-WebGL (SwiftShader CPU) fragment cost that a real GPU
+     eliminates. ⚠ **Real-GPU gate (unchanged):** `?perf` worstDt < 16.67 ms across surface→orbit→Moon→Sun; the
+     levers if it's tight are `?dpr=1`, `?nodetail`, `?noatmo`/`?nohaze`, lowering `MAX_DEPTH`.
+     - **Per-leaf attr → per-mesh uniform: deliberately DEFERRED (not the bottleneck; morph-risk).** The audit's
+       suggestion to move `aLodR`/`aParentR`/`aBirthMs` off per-vertex attributes was NOT done: (1) the measured
+       descent bottleneck is meshing throughput, not attribute upload (HANDOFF "Measured-good"); (2) per-mesh
+       uniforms don't bind cleanly to a SHARED Three-WebGPU node material (the per-vertex constant IS the standard
+       workaround — the alternative is a per-leaf material clone, which is what the shared material exists to
+       avoid); (3) `aParentR` can't be derived from `aLodR` in-shader (BOUND_FACTOR's parent/child ratio runs
+       1.52→2 by depth, not constant). Risking the load-bearing CDLOD morph for a one-time-per-leaf upload trim
+       that isn't the bottleneck violates the prime directive. Revisit only if a real-GPU `?perf` shows upload as
+       the spike, or when a 2D-textured archetype makes true triplanar (and per-mesh data) worthwhile.
+   - Deferred refinements: velocity inheritance on launch; unify orbit presets into one seamless free-flight;
+     nearest-body speed scaling; un-swim surface detail under spin; analytic eclipse; Moon as a real landable body.
 
 ## 7. Reading the diagnostics (`?lodaudit`) — how to judge LOD health
 - `[NMS] cut: leaves=N lod={depth:count} maxNbrΔ=k` — the live cut. **`maxNbrΔ>1`** = a >1-level edge step →
@@ -307,7 +505,8 @@ expensive O(live²) seam + O(96·live) coverage scans (off by default even under
 - Add/extend a **golden test** whenever you add a core generation function.
 
 ## 9. Tests
-`npm test` → `src/test/{hash,noise,cubesphere,density,chunk,quadtree}.test.ts`. Golden/determinism via
+`npm test` → `src/test/{hash,noise,cubesphere,density,chunk,quadtree,seedchain,facts,surfacenets,core-boundary,digest,orbits}.test.ts`
+(129 tests, 12 suites). Golden/determinism via
 `toMatchInlineSnapshot` + FNV-1a digest (`src/test/digest.ts`). These are **frozen** — if a golden value
 changes, the generation pipeline drifted (and the future Rust port would diverge); only re-bless
 deliberately (e.g. the planned `edgeMask` change will legitimately regenerate mesher digests).

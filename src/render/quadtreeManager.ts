@@ -14,7 +14,7 @@
 // altitude (full per-frame floating origin is Step 4).
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { Scene, Mesh, BufferGeometry, BufferAttribute, Color, Vector3, type Material } from 'three';
+import { type Object3D, Mesh, BufferGeometry, BufferAttribute, Color, Vector3, type Material } from 'three';
 import {
   selectCut,
   balanceCut,
@@ -117,6 +117,9 @@ export interface ManagerOpts {
   // OFF by default even under ?lodaudit: at ~500 live leaves they cost ~250k fBm evals and were
   // themselves a periodic main-thread spike (the diagnostics adding the lag they were measuring).
   debugChurn?: boolean; // ?perf: count meshes created/disposed per second (churnPerSec)
+  receiveShadow?: boolean; // Step 5: terrain leaves receive the moon's cast shadow (set per mesh). ⚠ the
+  // shared material overrides positionNode (CDLOD morph) + is DoubleSide — confirm the WebGPU shadow-depth
+  // pass reproduces the morphed surface on a real GPU (analytic sun-occlusion is the fallback).
 }
 
 export interface StreamStats {
@@ -206,6 +209,8 @@ export class QuadtreeManager {
   private readonly matRenderOrigin: { value: Vector3 };
   private readonly matDetailPhase: { value: Vector3 };
   private readonly matNow: { value: number }; // manager clock → per-leaf birth-ease floor
+  private readonly matSunDir: { value: Vector3 }; // inertial sun dir → aerial-perspective day factor
+  private readonly matHazeDensity: { value: number }; // air density at camera altitude → haze strength
   private kDist = 0;
   private camX = 0;
   private camY = 0;
@@ -222,20 +227,30 @@ export class QuadtreeManager {
   private readonly _tB = new Float64Array(4);
 
   constructor(
-    private readonly scene: Scene,
+    // Step 5: a container Object3D (a planetGroup the render shell spins by qSpin) — was the Scene.
+    // Leaves are added to it; the group's rotation makes the planet a real spinning body.
+    private readonly scene: Object3D,
     private readonly recipe: TerrainRecipe,
     private readonly radius: number,
     private readonly opts: ManagerOpts,
   ) {
     this.heightMargin = recipe.height * 1.6;
-    // The ONE shared terrain material (per-leaf data rides in the `aLevel` attribute); its kDist
+    // The ONE shared terrain material (per-leaf data rides in the `aLodR`/`aParentR` attributes); its kDist
     // uniform is updated each frame via setMorphParams.
-    const handle = createTerrainMaterial({ wireframe: opts.wireframe, slopePreset: opts.slopePreset, noDetail: opts.noDetail });
+    const handle = createTerrainMaterial({
+      wireframe: opts.wireframe,
+      slopePreset: opts.slopePreset,
+      noDetail: opts.noDetail,
+      radius, // S3 elevation band: mean planet radius + terrain amplitude as shader constants
+      heightAmp: recipe.height,
+    });
     this.sharedMat = handle.material;
     this.kDistUniform = handle.kDist;
     this.matRenderOrigin = handle.renderOrigin;
     this.matDetailPhase = handle.detailPhase;
     this.matNow = handle.now;
+    this.matSunDir = handle.sunDir;
+    this.matHazeDensity = handle.hazeDensity;
     const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
     // Pool size. The descent bottleneck is meshing THROUGHPUT (real-GPU ?lodaudit showed reqLat ~700–870ms
     // with busy6/6 saturated + a 100–170 request backlog on zoom-in), so default to 10 workers — still
@@ -262,6 +277,28 @@ export class QuadtreeManager {
     for (const e of this.entries.values()) {
       if (e.mesh) e.mesh.position.set(e.center[0] - o[0], e.center[1] - o[1], e.center[2] - o[2]);
     }
+  }
+
+  /**
+   * Step 5: the terrain renders under a planetGroup the shell spins by qSpin, so the slope-band `up`
+   * (reconstructed in the material as normalize(positionWorld + uRenderOrigin)) needs the render origin
+   * ROTATED by the same spin — otherwise the bands swim as the planet turns. The shell passes
+   * qSpin·renderOrigin here each frame. Leaf POSITIONS stay body-fixed (origin − renderOrigin); only the
+   * group's rotation places them in the inertial frame, so this just keeps the lighting `up` consistent.
+   */
+  setSpunOrigin(o: [number, number, number]): void {
+    this.matRenderOrigin.value.set(o[0], o[1], o[2]);
+  }
+
+  /**
+   * Step 6 (S2): feed the aerial-perspective haze. `sunDir` is the inertial planet→sun direction (the same
+   * `_sunDir` the atmosphere shell uses — the shell and the ground haze then agree at the horizon); `density`
+   * is the air density at the camera altitude (~1 at the surface, →0 at orbit), which scales the haze so it
+   * fades to nothing from space. Render-only; no effect on the cut/streaming.
+   */
+  setAtmosphere(sunDir: [number, number, number], density: number): void {
+    this.matSunDir.value.set(sunDir[0], sunDir[1], sunDir[2]);
+    this.matHazeDensity.value = density;
   }
 
   /**
@@ -847,7 +884,7 @@ export class QuadtreeManager {
       geometry.setAttribute('morphTargetNormal', new BufferAttribute(m.morphTargetNormals, 3));
       geometry.setIndex(new BufferAttribute(m.indices, 1));
       // Per-leaf CDLOD level (lodR, parentR) as a constant-per-leaf vertex attribute. The ONE shared
-      // material's morph graph (terrainMaterial.ts) reads `aLevel` to build this leaf's split/merge
+      // material's morph graph (terrainMaterial.ts) reads `aLodR`/`aParentR` to build this leaf's split/merge
       // distances — so every leaf renders with the same material (no per-leaf clone / node-graph
       // rebuild). lodBoundRadius matches selectCut's metric, so the per-vertex distance-morph band
       // aligns with the cut's split distance exactly. dChild=2·lodR·kDist, dParent=2·parentR·kDist.
@@ -893,6 +930,7 @@ export class QuadtreeManager {
         ownMat = clone;
       }
       const mesh = new Mesh(geometry, mat);
+      if (this.opts.receiveShadow) mesh.receiveShadow = true; // Step 5: catch the moon's cast shadow
       mesh.position.set(
         m.origin[0] - this.renderOrigin[0],
         m.origin[1] - this.renderOrigin[1],
@@ -962,7 +1000,7 @@ export class QuadtreeManager {
       }
       if (this.opts.debugAudit && !this.wiringLogged) {
         // One-time sanity: confirm the geomorph is wired on this build — geometry carries the
-        // morph attributes (incl. the per-leaf aLevel + morphTargetNormal) AND the shared material
+        // morph attributes (incl. the per-leaf aLodR/aParentR + morphTargetNormal) AND the shared material
         // overrides both position & normal nodes.
         this.wiringLogged = true;
         const sm = this.sharedMat as unknown as { positionNode: unknown; normalNode: unknown };

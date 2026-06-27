@@ -51,6 +51,7 @@ Good state: `ms/leaf` low single digits, `queue` near 0 while moving, fps green.
 | 8 | **Deferred LOD removal + inset backdrop.** Old leaves kept until replacements are live; a single inset backdrop sphere fills any residual gap → no black/holes. | `core/quadtree.ts` `retainedShouldRemove`, `render/*` | invisible pop-in |
 | 9 | **Geometry LOD morph (single opaque surface).** New leaves are born at a one-octave-smoother surface and morph to full detail over ~0.35 s — a per-vertex `morphTarget` attribute lerped to `position` by a per-leaf TSL morph uniform 0→1. Unlike a dithered/alpha cross-fade, only ONE opaque surface is ever on screen, so there is no stipple/terracing and no skirt see-through (the earlier `alphaHash` fade drew seams by blending two different surfaces). The morph target is `fbm3`'s value minus its finest octave — captured free in the same pass and a pure function of direction, so neighbours agree exactly and the morph opens no seams mid-transition. Retained leaf kept until the replacement's morph *completes*; morphing leaf gets a camera-ward `polygonOffset` to win depth over it. | gradual detail, no snap, no seams |
 | 10 | **Logarithmic depth buffer.** `WebGPURenderer({ logarithmicDepthBuffer: true })` (default on; `?nolog` to disable, `?revz` to try reversed-Z). At real scale the near:far ratio is ~1:30, so plain float32 depth resolves only ~1 m near the surface and the apron-overlap + skirt geometry z-fought into thin seam lines at every leaf/cube-face boundary — the classic real-scale-planet depth problem (Cesium/Outerra hit the same). Log depth redistributes precision across the whole range and clears the z-fighting in both backends; small per-fragment cost, 60fps-fine. (Reversed-Z is the cheaper variant of the same idea, but its Three r184 WebGPU path is buggy — it dithered the inset backdrop through the terrain in big patches — so it's opt-in only.) Diagnosed with `scripts/shoot.mjs` (headless screenshots): seams prominent under WebGPU, faint under WebGL2 — a depth-precision tell, not geometry. | no boundary seam z-fighting |
+| 11 | **Packed-integer region keys.** The hot recut Sets (`balanceCut`/`clampCutToReachableFrontier`/`coveringDepth`) are keyed by a single JS-safe integer (`packRegion`: face·2³⁴ + depth·2³⁰ + path-bits) instead of freshly-concatenated strings → **byte-identical cuts**, ~8× faster recut at deep zoom (kills ~10⁵ string allocs/recut). | `core/quadtree.ts` `packRegion`/`coveringDepth` | ~8× recut, no GC churn |
 
 > Determinism note: #1 changes leaf positions only at the sub-micron (float
 > roundoff) level — it uses the exact `faceDirection` rather than re-normalizing
@@ -65,7 +66,7 @@ Good state: `ms/leaf` low single digits, `queue` near 0 while moving, fps green.
 | **2-octave domain warp** (warp offset doesn't need 4 octaves) | ~1.6× meshing | **Changes terrain appearance** (re-tune) | `core/density.ts` `terrainAt` (3 warp `fbm3` calls) |
 | **Gradient-table noise** (replace per-corner gradient `normalize` — 8 `sqrt`/call — with a ~16-entry table) | ~20–30% of `gradNoise3` | **Changes terrain appearance** + small risk of faint grid-aligned streaks (use the standard 12-gradient set); the current random-normalized gradients are marginally more isotropic | `core/noise.ts` `gradNoise3` (line ~74) |
 | **LOD hysteresis** (split at `splitPx`, merge at ~`0.5·splitPx`) | avoids re-mesh thrash when the camera drifts near a threshold | low impact now (deferred removal hides any flash; only wastes CPU) | `core/quadtree.ts` `selectCut` (needs previous cut) |
-| **Packed-integer node address** (face<<bits \| depth \| path-bits) | removes path-array copies + string Map keys in `selectCut`/`chunkKey` | moderate refactor across quadtree + manager | `core/quadtree.ts`, `core/chunk.ts` |
+| **Packed-integer node address** — *DONE for the quadtree cut keys* (`packRegion`, see §3 #11). Remaining: the render manager's `Map<string>` entries + `chunkKey` (`core/chunk.ts:84` still returns a string) | removes the last path-array copies + string Map keys in the manager | moderate refactor across the manager (cross the `packRegion` layout over the core↔render boundary) | `render/quadtreeManager.ts`, `core/chunk.ts` `chunkKey` |
 | **Surface Nets typed-array output** (preallocate to an upper bound, `subarray`) instead of `number[]` + `.from()` | marginal (small vs noise) | loose upper bound wastes memory; marginal after #1 | `core/surfacenets.ts` |
 | **Worker recipe-cache** (send the recipe once, not per job) | marginal (recipe is tiny) | protocol churn for little gain | `render/quadtreeManager.ts`, `src/workers/mesher.worker.ts` |
 | **fBm normalization constant** (closed form per recipe vs running sum) | marginal | risk of changing noise output (avoid) | `core/noise.ts` `fbm3` |
@@ -91,11 +92,12 @@ live shared universe (master plan Part 1.3).
 | Dial | File | Current | Effect |
 |---|---|---|---|
 | Chunk grid (tangential / radial) | `core/chunk.ts` | 32 / 12 | detail vs mesh cost per leaf |
-| `splitPx` | `render/scene.ts` | 300 | LOD aggressiveness (smaller = finer/earlier) |
-| `maxDepth` | `render/scene.ts` | 10 | finest leaf / leaf-count cap |
-| Cull margin | `render/scene.ts` | 1.2 | pre-mesh ring width (smaller = shallower queue) |
-| LOD morph duration (`MORPH_MS`) | `render/quadtreeManager.ts` | 350 ms | how gradually detail resolves in |
-| Worker pool size | `render/quadtreeManager.ts` | `min(6, cores−1)` | parallel meshing throughput |
-| Upload budget / frame | `render/scene.ts` | 4 | meshes added to GPU per frame |
+| `splitPx` (per mode) | `render/scene.ts` | 300 fly / 420 walk / 520 creative | LOD aggressiveness (smaller = finer/earlier) |
+| `maxDepth` (`MAX_DEPTH`) | `render/scene.ts` | 15 | finest leaf / leaf-count cap (≈9.5 m cells) |
+| `baseDepth` (`BASE_DEPTH`) | `render/scene.ts` | 2 | always-resident coarse base (96 leaves, never culled) |
+| Cull margin | `render/scene.ts` | 1.2 (fly) / 1.4 (walk) | pre-mesh ring width (smaller = shallower queue) |
+| LOD birth-ease (`BIRTH_MS`) + `MORPH_START_FRAC` | `render/terrainMaterial.ts` | 500 ms / 0.30 | how gradually each one-level cohort fades in (the per-vertex distance morph carries the rest — this replaced the old time-based `MORPH_MS`) |
+| Worker pool size | `render/quadtreeManager.ts` | `min(10, cores−1)` | parallel meshing throughput |
+| Upload budget / frame | `render/scene.ts` | 4 steady / 24 burst (first fill) | meshes added to GPU per frame (`UPLOAD_PER_FRAME` / `BURST_PER_FRAME`) |
 | Generate-ahead | `render/scene.ts` | velocity × 30 frames | pre-mesh along motion |
 | Terrain recipe (scale/height/octaves/warp) | `core/density.ts` | 140 / 14 km / 4 / 0.7 | terrain look ([T] tunable) |
