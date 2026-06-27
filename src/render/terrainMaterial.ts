@@ -118,12 +118,13 @@ export interface SlopePreset {
 // the dominant per-fragment noise cost (the very cost S4 must bound) for no visible gain. The elevation
 // band is the S3 palette win instead; triplanar is the right tool only if a future 2D-textured archetype
 // is added.
-const PEAK_COLOR = [0.78, 0.74, 0.66] as const; // pale dusty highlands (warm, near-white on the highest peaks)
-const LOW_COLOR = [0.30, 0.22, 0.15] as const; // dark warm regolith — shades valley/drainage basins (reads as river valleys)
-const PEAK_LO = 0.20; // elevation (× height amplitude) where highlands start to fade in
-const PEAK_HI = 0.85; // …and reach full highland colour
-const LOW_HI = -0.10; // lowland tint starts fading in as elevation drops below this
-const LOW_LO = -0.70; // …and reaches full lowland colour
+// Exported so the ?landlog diagnostic (scene.ts) can mirror this exact palette on the CPU.
+export const PEAK_COLOR = [0.78, 0.74, 0.66] as const; // pale dusty highlands (warm, near-white on the highest peaks)
+export const LOW_COLOR = [0.30, 0.22, 0.15] as const; // dark warm regolith — shades valley/drainage basins (reads as river valleys)
+export const PEAK_LO = 0.20; // elevation (× height amplitude) where highlands start to fade in
+export const PEAK_HI = 0.85; // …and reach full highland colour
+export const LOW_HI = -0.10; // lowland tint starts fading in as elevation drops below this
+export const LOW_LO = -0.70; // …and reaches full lowland colour
 
 export const SLOPE_PRESETS: readonly SlopePreset[] = [
   { lo: 0.55, hi: 0.82, rock: [0.40, 0.36, 0.33], sand: [0.62, 0.55, 0.45] }, // 0 grey low-contrast (A/B ref)
