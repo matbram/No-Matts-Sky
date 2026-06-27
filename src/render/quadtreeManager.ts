@@ -231,7 +231,9 @@ export class QuadtreeManager {
     private readonly radius: number,
     private readonly opts: ManagerOpts,
   ) {
-    this.heightMargin = recipe.height * 1.6;
+    // Match the mesher's radial shell (chunk.ts): the LOD bound must cover the full terrain relief
+    // (base fBm + continents + ridges) so tall peaks aren't under-tessellated or horizon-culled early.
+    this.heightMargin = recipe.height * (1.6 + recipe.contAmp + recipe.ridgeAmp);
     // The ONE shared terrain material (per-leaf data rides in the `aLodR`/`aParentR` attributes); its kDist
     // uniform is updated each frame via setMorphParams.
     const handle = createTerrainMaterial({

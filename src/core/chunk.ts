@@ -118,8 +118,11 @@ export function meshChunk(
   const cdir = faceDirection(req.face, uc, vc);
   const origin: [number, number, number] = [cdir[0] * radius, cdir[1] * radius, cdir[2] * radius];
 
-  // Radial range straddles the surface (r ≈ radius + height·noise, noise ∈ ~[-1,1]).
-  const margin = recipe.height * 1.6;
+  // Radial range straddles the surface. tv = base fBm (∈[-1,1]) + continental bias (±contAmp) + ridged
+  // mountains (+ridgeAmp), so the shell must reach |tv|·height at the extremes or tall peaks/deep basins
+  // clip flat against the grid top/bottom. 1.6 keeps the original 0.6 headroom over the base fBm; the
+  // macro amplitudes widen it. Byte-identical to the old `·1.6` when contAmp=ridgeAmp=0.
+  const margin = recipe.height * (1.6 + recipe.contAmp + recipe.ridgeAmp);
   const rMin = radius - margin;
   const rMax = radius + margin;
 

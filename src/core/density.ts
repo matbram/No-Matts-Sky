@@ -25,8 +25,21 @@ export interface TerrainRecipe {
   octaves: number;
   lacunarity: number;
   gain: number;
-  /** Domain-warp strength (1 iteration). 0 disables the warp. */
+  /** Domain-warp strength (1st iteration). 0 disables the warp. */
   warpStrength: number;
+  /** 2nd domain-warp iteration strength (master plan §5.2 allows 1–2). 0 skips it (cheaper). [T] */
+  warpStrength2: number;
+  /** Ridged mountains: feature count of the ridge field across the sphere (mid-frequency → ranges, not
+   *  peaks). 0 disables ridges. [T] */
+  ridgeScale: number;
+  /** Ridge amplitude in tv-units (× height m). One-sided (ridges only ADD relief). [T] */
+  ridgeAmp: number;
+  /** Ridge fBm octave count. [T] */
+  ridgeOct: number;
+  /** Ridge land-mask knees (in the continental value ∈ [-1,1]): ridges fade in from maskLo→maskHi so
+   *  mountain ranges rise on continents, not on the ocean floor. [T] */
+  maskLo: number;
+  maskHi: number;
   /** Continental mask: feature count of the low-frequency landmass field across the sphere
    *  (≪ noiseScale → a few big continents, not islands). 0 disables continents. [T] */
   contScale: number;
@@ -74,6 +87,14 @@ export function sliceTerrainRecipe(terrainSeed: number): TerrainRecipe {
     lacunarity: 2.0,
     gain: 0.5,
     warpStrength: 0.7,
+    // 2nd domain-warp iteration (modest — "more gets mushy", master plan §5.2) for twistier geology.
+    warpStrength2: 0.35,
+    // Ridged mountains: ~50 ranges across the sphere, rising up to ridgeAmp·height on continents only.
+    ridgeScale: 50,
+    ridgeAmp: 0.45,
+    ridgeOct: 4,
+    maskLo: -0.2,
+    maskHi: 0.5,
     // Continental mask: ~8 big landmasses across the sphere, biasing the surface ±contAmp·height so
     // land/sea reads as coherent continents instead of uniform island-noise. Symmetric spline knees ⇒
     // roughly half land / half ocean with a narrow coastline band; tune against the sea level.
@@ -105,10 +126,35 @@ function smoothstepDeriv(lo: number, hi: number, x: number): number {
 const _wx = new Float64Array(4);
 const _wy = new Float64Array(4);
 const _wz = new Float64Array(4);
+const _wx2 = new Float64Array(4); // 2nd domain-warp channels (evaluated at the once-warped point q₁)
+const _wy2 = new Float64Array(4);
+const _wz2 = new Float64Array(4);
 const _n = new Float64Array(4);
 const _nLo = new Float64Array(4); // coarser (one-octave-dropped) main fBm value+gradient
 const _c = new Float64Array(4); // continental mask value+gradient (low-frequency landmass field)
+const _m = new Float64Array(4); // ridge fBm value+gradient (mountain field)
+const _ja = new Float64Array(3); // scratch: Jᵀ-transformed gradient (out)
+const _jb = new Float64Array(3); // scratch: Jᵀ-transformed gradient (outLo)
 const _t = new Float64Array(4);
+
+/** Apply one warp Jacobian transpose to a gradient: (Jᵀg)_i = g_i + A·Σⱼ wⱼ.d[i]·gⱼ, where `wx/wy/wz`
+ *  hold the three warp channels' value+gradient (`w*[1..3]` = ∂channel/∂axis). Writes the 3-vector into
+ *  `dst`. This is the chain-rule step for `f(p + A·w(p))`; composing two of them gives the 2-iteration
+ *  domain-warp gradient `J₁ᵀ·J₂ᵀ·∇f`. */
+function jacT(
+  A: number,
+  wx: Float64Array,
+  wy: Float64Array,
+  wz: Float64Array,
+  gx: number,
+  gy: number,
+  gz: number,
+  dst: Float64Array,
+): void {
+  dst[0] = gx + A * (wx[1]! * gx + wy[1]! * gy + wz[1]! * gz);
+  dst[1] = gy + A * (wx[2]! * gx + wy[2]! * gy + wz[2]! * gz);
+  dst[2] = gz + A * (wx[3]! * gx + wy[3]! * gy + wz[3]! * gz);
+}
 
 /**
  * Warped fBm sampled at a point on the (scaled) unit sphere — the direction-only
@@ -142,65 +188,104 @@ export function terrainAt(
   octaveCount?: number,
 ): void {
   const A = recipe.warpStrength;
+  const A2 = recipe.warpStrength2;
   const s = recipe.seed;
   const o = recipe.octaves;
   const oMain = octaveCount ?? o;
   const lac = recipe.lacunarity;
   const g = recipe.gain;
 
-  // Three decorrelated warp channels (distinct seeds + offsets). Warp octaves stay
-  // fixed at the recipe's count so the warped sample point q(p) is identical for
-  // every leaf regardless of LOD → adjacent leaves agree, the geomorph only has to
-  // hide the MAIN fBm's finest octave.
+  // ── Domain warp (1–2 iterations) ───────────────────────────────────────────
+  // Three decorrelated warp channels per iteration (distinct seeds + offsets). Warp octaves stay fixed at
+  // the recipe's count so the warped sample point q(p) is identical for every leaf regardless of LOD →
+  // adjacent leaves agree, the geomorph only has to hide the MAIN fBm's finest octave. q₁ = p + A₁·w₁(p);
+  // q₂ = q₁ + A₂·w₂(q₁) (skipped when A₂=0). All fields below are sampled at q₂, and their gradient is
+  // mapped back to p with the composed Jacobian J₁ᵀ·J₂ᵀ (jacT applied twice).
   fbm3((s ^ 0x1111_1111) >>> 0, px + 11.5, py + 5.2, pz + 19.3, o, lac, g, _wx);
   fbm3((s ^ 0x2222_2222) >>> 0, px + 7.7, py + 13.1, pz + 3.9, o, lac, g, _wy);
   fbm3((s ^ 0x3333_3333) >>> 0, px + 2.4, py + 9.8, pz + 27.1, o, lac, g, _wz);
+  const q1x = px + A * _wx[0]!;
+  const q1y = py + A * _wy[0]!;
+  const q1z = pz + A * _wz[0]!;
+  let qx = q1x, qy = q1y, qz = q1z;
+  if (A2 !== 0) {
+    fbm3((s ^ 0x6666_6666) >>> 0, q1x + 4.3, q1y + 22.7, q1z + 8.1, o, lac, g, _wx2);
+    fbm3((s ^ 0x7777_7777) >>> 0, q1x + 19.6, q1y + 1.4, q1z + 12.8, o, lac, g, _wy2);
+    fbm3((s ^ 0x8888_8888) >>> 0, q1x + 9.2, q1y + 15.5, q1z + 3.6, o, lac, g, _wz2);
+    qx = q1x + A2 * _wx2[0]!;
+    qy = q1y + A2 * _wy2[0]!;
+    qz = q1z + A2 * _wz2[0]!;
+  }
 
-  const qx = px + A * _wx[0]!;
-  const qy = py + A * _wy[0]!;
-  const qz = pz + A * _wz[0]!;
-  // Same warp for the morph target → its only difference from `out` is the dropped
-  // finest octave. fbm3 writes the coarser value+gradient into _nLo; we run that
-  // gradient through the SAME warp Jacobian below so the morph normal is analytic.
+  // Main fBm at the twice-warped point. fbm3 writes the coarser value+gradient into _nLo (the geomorph
+  // target — same warp/continents/ridges, only the finest detail octave dropped).
   fbm3(s, qx, qy, qz, oMain, lac, g, _n, outLo ? _nLo : undefined);
 
   // ── Continental mask ───────────────────────────────────────────────────────
-  // A low-frequency landmass field of the SAME warped point (sampled at q·kc, kc=contScale/noiseScale,
-  // so it shares the domain warp → curved coastlines), remapped through a smooth spline and added as a
-  // bias to the terrain value: below contLo → ocean basin, above contHi → continental shelf. This is
-  // what makes land/sea read as coherent continents instead of uniform island-noise. The continental
-  // term is LOD-INDEPENDENT — identical for `out` and `outLo` — so it never participates in the geomorph
-  // (continents must not pop). Its gradient is accumulated in q-space (cg*) alongside the main fBm's, then
-  // BOTH run through the one warp Jacobian below, keeping the surface normal exactly analytic.
-  let contV = 0, cgx = 0, cgy = 0, cgz = 0;
+  // A low-frequency landmass field of the warped point (sampled at q·kc, kc=contScale/noiseScale, so it
+  // shares the domain warp → curved coastlines), remapped through a smooth spline into a terrain bias:
+  // below contLo → ocean basin, above contHi → continental shelf. This is what makes land/sea read as
+  // coherent continents instead of island-noise. `cont` (∈[-1,1]) and its q-space gradient `dcont*` are
+  // also reused as the ridge land-mask below. LOD-INDEPENDENT (identical in out/outLo → never morphs).
+  let cont = 0, dcontx = 0, dconty = 0, dcontz = 0;
   if (recipe.contAmp !== 0) {
     const kc = recipe.contScale / recipe.noiseScale;
     fbm3((s ^ 0x5555_5555) >>> 0, qx * kc, qy * kc, qz * kc, recipe.contOct, lac, g, _c);
-    contV = recipe.contAmp * (2 * smoothstep(recipe.contLo, recipe.contHi, _c[0]!) - 1);
-    // ∂contV/∂q = contAmp·2·S'(c)·kc·∇c  (chain: spline ∘ rescale-by-kc ∘ fbm)
-    const cs = recipe.contAmp * 2 * smoothstepDeriv(recipe.contLo, recipe.contHi, _c[0]!) * kc;
-    cgx = cs * _c[1]!;
-    cgy = cs * _c[2]!;
-    cgz = cs * _c[3]!;
+    cont = 2 * smoothstep(recipe.contLo, recipe.contHi, _c[0]!) - 1;
+    // ∂cont/∂q = 2·S'(c)·kc·∇c  (chain: spline ∘ rescale-by-kc ∘ fbm)
+    const cs = 2 * smoothstepDeriv(recipe.contLo, recipe.contHi, _c[0]!) * kc;
+    dcontx = cs * _c[1]!;
+    dconty = cs * _c[2]!;
+    dcontz = cs * _c[3]!;
+  }
+  const contV = recipe.contAmp * cont;
+  let cgx = recipe.contAmp * dcontx, cgy = recipe.contAmp * dconty, cgz = recipe.contAmp * dcontz;
+
+  // ── Ridged mountains ───────────────────────────────────────────────────────
+  // A mid-frequency ridge field folded `(1−|m|)²` (sharp crests, C¹ amplitude → continuous normals),
+  // multiplied by a continental land-mask so ranges rise on land, not the ocean floor. One-sided (adds
+  // relief only). LOD-INDEPENDENT (macro relief never morphs). Its q-space gradient adds into cg*.
+  let ridgeV = 0;
+  if (recipe.ridgeAmp !== 0) {
+    const kr = recipe.ridgeScale / recipe.noiseScale;
+    fbm3((s ^ 0x9999_9999) >>> 0, qx * kr, qy * kr, qz * kr, recipe.ridgeOct, lac, g, _m);
+    const mv = _m[0]!;
+    const absm = mv >= 0 ? mv : -mv;
+    const sgn = mv >= 0 ? 1 : -1;
+    const oneMinus = 1 - absm;
+    const ridge = oneMinus * oneMinus;
+    const mask = smoothstep(recipe.maskLo, recipe.maskHi, cont);
+    const maskD = smoothstepDeriv(recipe.maskLo, recipe.maskHi, cont);
+    ridgeV = recipe.ridgeAmp * ridge * mask;
+    // ∂(ridge·mask)/∂q = mask·∂ridge/∂q + ridge·∂mask/∂q
+    //   ∂ridge/∂q = 2(1−|m|)·(−sgn)·kr·∇m ;  ∂mask/∂q = maskD·∂cont/∂q
+    const rd = 2 * oneMinus * -sgn * kr;
+    cgx += recipe.ridgeAmp * (mask * rd * _m[1]! + ridge * maskD * dcontx);
+    cgy += recipe.ridgeAmp * (mask * rd * _m[2]! + ridge * maskD * dconty);
+    cgz += recipe.ridgeAmp * (mask * rd * _m[3]! + ridge * maskD * dcontz);
   }
 
-  // q-space gradient of (main fBm + continents); the Jacobian Jᵀ maps it to p-space.
-  const nx = _n[1]! + cgx;
-  const ny = _n[2]! + cgy;
-  const nz = _n[3]! + cgz;
-  out[0] = _n[0]! + contV;
-  out[1] = nx + A * (_wx[1]! * nx + _wy[1]! * ny + _wz[1]! * nz);
-  out[2] = ny + A * (_wx[2]! * nx + _wy[2]! * ny + _wz[2]! * nz);
-  out[3] = nz + A * (_wx[3]! * nx + _wy[3]! * ny + _wz[3]! * nz);
+  const macroV = contV + ridgeV; // continents + ridges — identical for out and outLo (never morphs)
+
+  // out: q-space gradient of (main fBm + macro terms) → p-space via J₁ᵀ·J₂ᵀ.
+  let gx = _n[1]! + cgx, gy = _n[2]! + cgy, gz = _n[3]! + cgz;
+  if (A2 !== 0) { jacT(A2, _wx2, _wy2, _wz2, gx, gy, gz, _ja); gx = _ja[0]!; gy = _ja[1]!; gz = _ja[2]!; }
+  jacT(A, _wx, _wy, _wz, gx, gy, gz, _ja);
+  out[0] = _n[0]! + macroV;
+  out[1] = _ja[0]!;
+  out[2] = _ja[1]!;
+  out[3] = _ja[2]!;
   if (outLo) {
-    // Same Jacobian (Jᵀ) applied to the coarser gradient → the parent surface's analytic terrain
-    // gradient. The continental term (value + q-space gradient) is added UNCHANGED — identical to `out` —
-    // so a fully-morphed leaf keeps the same continents (only the finest detail octave fades).
-    const lx = _nLo[1]! + cgx, ly = _nLo[2]! + cgy, lz = _nLo[3]! + cgz;
-    outLo[0] = _nLo[0]! + contV;
-    outLo[1] = lx + A * (_wx[1]! * lx + _wy[1]! * ly + _wz[1]! * lz);
-    outLo[2] = ly + A * (_wx[2]! * lx + _wy[2]! * ly + _wz[2]! * lz);
-    outLo[3] = lz + A * (_wx[3]! * lx + _wy[3]! * ly + _wz[3]! * lz);
+    // Same composed warp + same macro terms applied to the coarser main gradient → the morph target's
+    // analytic gradient (a fully-morphed leaf keeps the same continents/mountains; only the finest detail
+    // octave fades).
+    let lx = _nLo[1]! + cgx, ly = _nLo[2]! + cgy, lz = _nLo[3]! + cgz;
+    if (A2 !== 0) { jacT(A2, _wx2, _wy2, _wz2, lx, ly, lz, _jb); lx = _jb[0]!; ly = _jb[1]!; lz = _jb[2]!; }
+    jacT(A, _wx, _wy, _wz, lx, ly, lz, _jb);
+    outLo[0] = _nLo[0]! + macroV;
+    outLo[1] = _jb[0]!;
+    outLo[2] = _jb[1]!;
+    outLo[3] = _jb[2]!;
   }
 }
 

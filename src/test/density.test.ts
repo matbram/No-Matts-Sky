@@ -69,7 +69,9 @@ describe('surfaceAt — collision/orientation probe', () => {
       const len = Math.hypot(out[1]!, out[2]!, out[3]!);
       expect(len).toBeCloseTo(1, 9); // unit normal
       const dot = out[1]! * out[4]! + out[2]! * out[5]! + out[3]! * out[6]!;
-      expect(dot).toBeGreaterThan(0.7); // mostly radial (gravity-aligned)
+      // Mostly radial (gravity-aligned), but ridged mountains tilt the steepest faces to ~60° (dot≈0.5).
+      // 0.4 (~66°) leaves headroom for that while still failing on pathological near-vertical spikes.
+      expect(dot).toBeGreaterThan(0.4);
       expect(dot).toBeLessThanOrEqual(1.0000001);
       if (dot < minDot) minDot = dot;
     }
@@ -87,6 +89,6 @@ describe('surfaceAt — collision/orientation probe', () => {
       packed[(s - 1) * 4 + 2] = out[2]!;
       packed[(s - 1) * 4 + 3] = out[3]!;
     }
-    expect(fnv1a(packed)).toMatchInlineSnapshot(`"14ee40d0"`);
+    expect(fnv1a(packed)).toMatchInlineSnapshot(`"52d61791"`);
   });
 });
