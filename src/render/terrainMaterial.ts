@@ -85,6 +85,17 @@ export const DETAIL_A_FAR_M = 50_000;
 export const DETAIL_B_NEAR_M = 200;
 export const DETAIL_B_FAR_M = 6_000;
 
+// ── Aerial perspective (S2) ──────────────────────────────────────────────────
+// Haze the surface into the sky with distance: out-scatter DIMS the lit surface (× transmittance),
+// in-scatter ADDS the sky's blue as unlit emission. Both scale with the air density along the view ray,
+// approximated by the density at the camera (uHazeDensity, ~1 at the surface → 0 at orbit), so the haze
+// vanishes from space and the planet reads crisp (only the atmosphere shell's limb remains). The blue
+// matches the atmosphere shell so the surface fades into the same colour it sits under.
+const HAZE_RAYLEIGH = [0.30, 0.55, 1.0] as const; // same tint as atmosphere.ts
+const HAZE_LUMA = 0.5; // inscatter brightness
+const HAZE_RATE = 1 / 30_000; // 1/scale (m): at density 1, ~63% hazed by 30 km of view distance
+const HAZE_TWILIGHT = 0.1; // day floor so the terminator hazes softly instead of cutting to black
+
 // One archetype's palette (barren): flatter ground reads as light regolith (SAND), steeper faces as
 // darker rock. The slope-band smoothstep(lo,hi) maps surface tilt → albedo; a NARROW band + HIGH contrast
 // (preset 0) turns tiny normal variation into a high-contrast salt-and-pepper mottle, so these presets let
@@ -129,6 +140,12 @@ export interface TerrainMaterialHandle {
   detailPhase: { value: Vector3 };
   /** Manager clock (ms). Set `.value` every frame; drives the per-leaf birth-ease floor. */
   now: { value: number };
+  /** Inertial planet→sun direction (same `_sunDir` the atmosphere uses). Set `.value` each frame —
+   *  gives the aerial-perspective haze a day/night factor that matches the sky. */
+  sunDir: { value: Vector3 };
+  /** Air density at the camera altitude (0 at orbit → 1 at the surface). Set `.value` each frame;
+   *  scales the aerial-perspective haze so it fades to nothing from space. */
+  hazeDensity: { value: number };
 }
 
 /**
@@ -141,6 +158,8 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
   const uRenderOrigin = uniform(new Vector3());
   const uDetailPhase = uniform(new Vector3());
   const uNow = uniform(0); // manager clock (ms), for the per-leaf birth-ease floor
+  const uSunDir = uniform(new Vector3(1, 0, 0)); // inertial planet→sun dir (aerial-perspective day factor)
+  const uHazeDensity = uniform(0); // air density at the camera altitude (0 orbit → 1 surface); 0 = no haze
   const mat = new MeshStandardNodeMaterial({
     color: 0x9a8c7a,
     roughness: 0.92,
@@ -229,6 +248,19 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     mat.normalNode = nGeom.add(pertTang.mul(0.3)).normalize();
   }
 
+  // ── Aerial perspective (S2): haze the surface into the atmosphere ────────────
+  // Composite over whatever colour the branch above produced: out-scatter dims the lit surface (×
+  // transmittance = 1−hazeFrac), in-scatter ADDS the sky blue as EMISSIVE (unlit — so the haze doesn't
+  // pick up the surface normal/shadow, it just sits in front like air). hazeFrac grows with view distance
+  // × air density; uHazeDensity → 0 at orbit makes the whole effect vanish from space (crisp planet, only
+  // the shell's limb). Reuses the morph `dist` + slope `up` (no extra noise tap). dayFactor matches the
+  // shell's day term so ground haze and sky agree at the horizon.
+  const surfaceColor = mat.colorNode!; // the lit albedo set by the noDetail/detail branch above
+  const hazeFrac = dist.mul(uHazeDensity).mul(HAZE_RATE).negate().exp().oneMinus().clamp(0, 1);
+  const dayFactor = up.dot(uSunDir).max(0).mul(1 - HAZE_TWILIGHT).add(HAZE_TWILIGHT);
+  mat.colorNode = surfaceColor.mul(hazeFrac.oneMinus());
+  mat.emissiveNode = vec3(...HAZE_RAYLEIGH).mul(HAZE_LUMA).mul(dayFactor).mul(hazeFrac);
+
   // Bias the finer leaf toward the camera so it wins the depth test over a coarser ancestor still
   // retained for the brief moment until purge (surfaces match there, so nothing fights). NOT in wireframe:
   // WebGPU rejects a non-zero depthBias on LineList topology (the ?wire pipeline errors out otherwise).
@@ -244,6 +276,8 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     renderOrigin: uRenderOrigin as unknown as { value: Vector3 },
     detailPhase: uDetailPhase as unknown as { value: Vector3 },
     now: uNow as unknown as { value: number },
+    sunDir: uSunDir as unknown as { value: Vector3 },
+    hazeDensity: uHazeDensity as unknown as { value: number },
   };
 }
 

@@ -327,9 +327,15 @@ leaves (no spike), no rAF `[Violation]` stalls.
    - **S1 — atmosphere sky + sun glow: DONE** (`src/render/atmosphere.ts`; headless-confirmed orbit limb + ground
      sky). ⚠ Real-GPU: confirm the limb/sky look + that the walk-mode far-plane extension doesn't z-fight the
      surface (log depth should hold it; if not, split the far bodies into a layered pass — plan §4).
-   - **S2 — aerial perspective** (`terrainMaterial.ts`): mix the lit terrain toward the inscatter colour by
-     distance+altitude (reuse the existing `dist`; no extra noise tap), fading to 0 at orbit — haze the surface
-     into the atmosphere on descent (sells scale, hides the far LOD ring).
+   - **S2 — aerial perspective: DONE** (`terrainMaterial.ts` + manager `setAtmosphere` + scene wiring). The lit
+     surface is dimmed by transmittance and the sky's blue is added as **emissive** (unlit) inscatter, scaled by
+     view `dist` × air density; density = `exp(−alt/30 km)` (scene.ts), so haze is full at the surface, ~0.39 at
+     28 km, and ≈0 by orbit (planet reads crisp from space — only the shell's limb). Reuses the morph `dist` +
+     slope `up`, fed the same `_sunDir` as the shell (ground haze ↔ sky agree at the horizon). `?nohaze` A/B.
+     **Headless-confirmed:** orbit stays crisp (no wash); a t=0 A/B at the surface preset shows the haze adds
+     +9 blue-shift (B−R) to distant terrain — the aerial-perspective signature. ⚠ Real-GPU: the full daylit look
+     is best judged flying the **day-side equator** (the fixed headless spawn spot sits near the spin pole, so
+     it's perpetually grazing-lit/dim — not a bug, just the test view).
    - **S3 — triplanar + altitude band + palette lock**: upgrade the single-coord detail to true triplanar (3 axis
      samples weighted by the morph-normal) + a 3rd altitude/peak band; keep behind the noise-skip `If` + near gate;
      pick a `SLOPE_PRESETS` winner.

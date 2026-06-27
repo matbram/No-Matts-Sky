@@ -209,6 +209,8 @@ export class QuadtreeManager {
   private readonly matRenderOrigin: { value: Vector3 };
   private readonly matDetailPhase: { value: Vector3 };
   private readonly matNow: { value: number }; // manager clock → per-leaf birth-ease floor
+  private readonly matSunDir: { value: Vector3 }; // inertial sun dir → aerial-perspective day factor
+  private readonly matHazeDensity: { value: number }; // air density at camera altitude → haze strength
   private kDist = 0;
   private camX = 0;
   private camY = 0;
@@ -241,6 +243,8 @@ export class QuadtreeManager {
     this.matRenderOrigin = handle.renderOrigin;
     this.matDetailPhase = handle.detailPhase;
     this.matNow = handle.now;
+    this.matSunDir = handle.sunDir;
+    this.matHazeDensity = handle.hazeDensity;
     const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
     // Pool size. The descent bottleneck is meshing THROUGHPUT (real-GPU ?lodaudit showed reqLat ~700–870ms
     // with busy6/6 saturated + a 100–170 request backlog on zoom-in), so default to 10 workers — still
@@ -278,6 +282,17 @@ export class QuadtreeManager {
    */
   setSpunOrigin(o: [number, number, number]): void {
     this.matRenderOrigin.value.set(o[0], o[1], o[2]);
+  }
+
+  /**
+   * Step 6 (S2): feed the aerial-perspective haze. `sunDir` is the inertial planet→sun direction (the same
+   * `_sunDir` the atmosphere shell uses — the shell and the ground haze then agree at the horizon); `density`
+   * is the air density at the camera altitude (~1 at the surface, →0 at orbit), which scales the haze so it
+   * fades to nothing from space. Render-only; no effect on the cut/streaming.
+   */
+  setAtmosphere(sunDir: [number, number, number], density: number): void {
+    this.matSunDir.value.set(sunDir[0], sunDir[1], sunDir[2]);
+    this.matHazeDensity.value = density;
   }
 
   /**

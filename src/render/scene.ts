@@ -59,6 +59,11 @@ export interface SliceScene {
 // A fixed surface look-at direction for the close presets (some arbitrary spot).
 const SURFACE_DIR = new Vector3(0.2, 1, 0.15).normalize();
 
+// Aerial-perspective scale height (m): the air density used by the terrain haze decays as
+// exp(−altitude/AERIAL_SCALE_H) — ~1 at the surface, 0.39 at 28 km, ≈0 by orbit — so the haze
+// (terrainMaterial.ts) fades to a crisp planet from space, leaving only the atmosphere shell's limb.
+const AERIAL_SCALE_H_M = 30_000;
+
 // HUD distance formatter: m → km → AU, so the Moon/Sun readouts stay legible across scales.
 const fmtDist = (m: number): string =>
   m >= 1e9 ? `${(m / 1.495978707e11).toFixed(3)} AU` : m >= 1000 ? `${Math.round(m / 1000)} km` : `${Math.round(m)} m`;
@@ -194,6 +199,9 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   })();
   const noTime = params.has('notime');
   const noShadow = params.has('noshadow');
+  // Step 6: ?noatmo hides the atmosphere shell; ?nohaze disables the terrain's aerial-perspective haze
+  // (forces air density 0). Both are render-only A/B levers — handy on a real GPU to judge the look.
+  const noHaze = params.has('nohaze');
   const renderer = new WebGPURenderer({
     canvas,
     antialias: true,
@@ -247,6 +255,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     noTime, // ?notime: freeze the spin/orbit clock
     noShadow, // ?noshadow: disable the moon's cast shadow
     noatmo: params.has('noatmo'), // ?noatmo: hide the Step 6 atmosphere shell (A/B)
+    noHaze, // ?nohaze: disable the terrain aerial-perspective haze (A/B)
   });
 
   const R = EARTH_RADIUS_M;
@@ -788,6 +797,13 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // Dynamic near/far from altitude + horizon distance, every frame.
       const distCenter = worldCam.length();
       const horizon = Math.sqrt(Math.max(0, distCenter * distCenter - R * R));
+      // S2: feed the terrain's aerial-perspective haze — the real sun direction (so ground haze matches the
+      // sky shell at the horizon) + the air density at this altitude (exp falloff; →0 by orbit so the planet
+      // reads crisp from space). Cheap; render-only.
+      manager.setAtmosphere(
+        [_sunDir.x, _sunDir.y, _sunDir.z],
+        noHaze ? 0 : Math.exp(-Math.max(0, distCenter - R) / AERIAL_SCALE_H_M),
+      );
 
       // Speed-aware prefetch: track how fast the camera is closing on the planet centre
       // (descent rate, m/s, EMA-smoothed). ~0 for lateral orbit/walk, large on a plunge — finer
