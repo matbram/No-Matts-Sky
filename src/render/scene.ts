@@ -341,8 +341,15 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // `aLodR`/`aParentR` attributes, so there is no per-leaf material clone.
   // splitPx 300 (smaller, gentler LOD steps — affordable after the ~13× meshing
   // speedup); maxDepth = MAX_DEPTH gives meter-scale near-field cells for walking.
+  // ?split=N overrides the fly/orbit split threshold LIVE (smaller = finer tiles load at altitude =
+  // sharper silhouette + crisper coastlines, but more leaves/draw-calls → costs frame budget). Default
+  // stays 300; this lets the perf/quality tradeoff be A/B'd on a real GPU (watch ?perf worstDt) without a
+  // redeploy. Clamped ≥120 so a typo can't melt the budget. Used for BOTH the cut and the morph kDist below.
+  const flySplitPx = params.has('split')
+    ? Math.max(120, Number(params.get('split')) || FLY_SPLIT_PX)
+    : FLY_SPLIT_PX;
   const manager = new QuadtreeManager(planetGroup, recipe, R, {
-    splitPx: FLY_SPLIT_PX,
+    splitPx: flySplitPx,
     maxDepth: MAX_DEPTH,
     wireframe: params.has('wire'), // debug: see the tessellation / where lines fall
     // ?slopeband=N: pick a slope-band "look" preset (0=hard, 1=wide, 2=low-contrast, 3=soft).
@@ -926,7 +933,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // CDLOD: feed the per-vertex distance-morph the same projected-size constant the cut
       // uses (kDist = (vpH/(2·tan(fovY/2)))/splitPx for the current mode), so detail fades in
       // continuously with distance and reaches the parent surface exactly at the split distance.
-      const curSplitPx = mode === 'walk' ? WALK_SPLIT_PX : mode === 'creative' ? CREATIVE_SPLIT_PX : FLY_SPLIT_PX;
+      const curSplitPx = mode === 'walk' ? WALK_SPLIT_PX : mode === 'creative' ? CREATIVE_SPLIT_PX : flySplitPx;
       const kDist = vpHeight / (2 * Math.tan(fovY / 2)) / curSplitPx;
       manager.setMorphParams(kDist, worldCam.x, worldCam.y, worldCam.z, approachRateEMA);
 
