@@ -35,12 +35,14 @@ import {
   Vector3,
   BackSide,
   NormalBlending,
+  type Texture,
 } from 'three';
 import { MeshBasicNodeMaterial } from 'three/webgpu';
 import {
   Fn,
   Loop,
   float,
+  vec2,
   vec3,
   vec4,
   uniform,
@@ -48,22 +50,28 @@ import {
   cameraPosition,
   smoothstep,
   exp,
+  texture,
 } from 'three/tsl';
 import { buildCubeSphere } from '../core/cubesphere.ts';
 
 // ── "Breathable" (Earth-like) preset — Bruneton coefficients, per-metre, metres. ──
 // Tuned for real blue sky + white horizon + sunset reddening. [T] cosmetic (Stage E locks these).
-const ATM_THICKNESS_M = 100_000; // atmosphere top = R + 100 km (generous so the limb reads)
-const HR = 8_000; // Rayleigh scale height (m)
-const HM = 1_200; // Mie scale height (m)
-const BETA_R: readonly [number, number, number] = [5.802e-6, 13.558e-6, 33.1e-6]; // Rayleigh scatter=extinction
-const BETA_M_SCAT = 3.996e-6; // Mie scattering
-const BETA_M_EXT = 4.4e-6; // Mie extinction (scatter + a little absorption)
-const MIE_G = 0.8; // Mie anisotropy (forward sun glow)
-const BETA_OZ: readonly [number, number, number] = [0.65e-6, 1.881e-6, 0.085e-6]; // ozone absorption
-const OZ_CENTER = 25_000; // ozone tent centre (m)
-const OZ_WIDTH = 15_000; // ozone tent half-width (m)
-const SUN_INTENSITY = 40; // HDR sun illuminance (one brightness knob; ACESFilmic, exposure 1.0) [Stage E tunes]
+// Exported so the LUT builder (atmosphereLUT.ts) shares the exact same "breathable" preset.
+export const ATM_THICKNESS_M = 100_000; // atmosphere top = R + 100 km (generous so the limb reads)
+export const HR = 8_000; // Rayleigh scale height (m)
+export const HM = 1_200; // Mie scale height (m)
+export const BETA_R: readonly [number, number, number] = [5.802e-6, 13.558e-6, 33.1e-6]; // Rayleigh scatter=extinction
+export const BETA_M_SCAT = 3.996e-6; // Mie scattering
+export const BETA_M_EXT = 4.4e-6; // Mie extinction (scatter + a little absorption)
+export const MIE_G = 0.8; // Mie anisotropy (forward sun glow)
+export const BETA_OZ: readonly [number, number, number] = [0.65e-6, 1.881e-6, 0.085e-6]; // ozone absorption
+export const OZ_CENTER = 25_000; // ozone tent centre (m)
+export const OZ_WIDTH = 15_000; // ozone tent half-width (m)
+export const SUN_INTENSITY = 40; // HDR sun illuminance (one brightness knob; ACESFilmic, exposure 1.0) [Stage E tunes]
+// Cheap multiscatter proxy (Stage C): an isotropic skylight term present even where the direct sun is
+// extinguished, gated by the SUN's elevation at the camera — lifts the day sky and keeps twilight from
+// going black (single-scatter alone makes twilight dead). A fraction of the local scattering; [T] tune.
+const MS_AMBIENT = 0.35;
 const PRIMARY_STEPS = 16; // view-ray march samples (analytic sun transmittance → no nested loop)
 const ATM_SUBDIV = 24; // shell tessellation (round silhouette; the colour is per-pixel ray math)
 
@@ -81,8 +89,12 @@ export interface AtmosphereHandle {
   dispose(): void;
 }
 
-/** Build the soft-limb sky. `planetRadius` is the terrain's mean radius (m). */
-export function createAtmosphere(planetRadius: number): AtmosphereHandle {
+/**
+ * Build the soft-limb sky. `planetRadius` is the terrain's mean radius (m). If `transmittanceTex` is
+ * given (Stage B LUT), the march samples it for the sun term (physically-correct extinction); otherwise
+ * it uses the analytic airmass approximation (the `?atmonolut` fallback path).
+ */
+export function createAtmosphere(planetRadius: number, transmittanceTex?: Texture): AtmosphereHandle {
   const Rtop = planetRadius + ATM_THICKNESS_M;
   const s = buildCubeSphere(ATM_SUBDIV, Rtop);
   const geo = new BufferGeometry();
@@ -139,6 +151,8 @@ export function createAtmosphere(planetRadius: number): AtmosphereHandle {
     const g2 = g.mul(g);
     const denom = g2.add(1).sub(g.mul(2).mul(cosT)).max(1e-4).pow(1.5);
     const phaseM = float(0.0796).mul(g2.oneMinus()).div(denom); // 1/(4π)(1−g²)/(1+g²−2g cosθ)^1.5
+    // Whole-sky ambient gate (multiscatter proxy): 1 in daylight → 0 at night, by the sun's elevation.
+    const skyDay = smoothstep(-0.25, 0.15, up.dot(sun));
 
     const odR = float(0).toVar(); // accumulated VIEW optical depths
     const odM = float(0).toVar();
@@ -163,21 +177,32 @@ export function createAtmosphere(planetRadius: number): AtmosphereHandle {
       const tauV = betaR.mul(odR).add(betaMe.mul(odM)).add(betaOz.mul(odO));
       transView.assign(expVec(tauV.negate()));
 
-      // SUN transmittance (analytic vertical column × airmass — no nested march). Column above
-      // altitude a for scale height H is H·exp(−a/H); ozone column ≈ βO·dO·width. Airmass = 1/cosSun.
-      const upS = up.mul(r0).add(d.mul(t)).normalize(); // radial up AT the sample
+      // SUN transmittance: the LUT (Stage B) gives physically-correct extinction; the analytic fallback
+      // (?atmonolut) uses a vertical-column × airmass approximation. `upS` = radial up AT the sample.
+      const upS = up.mul(r0).add(d.mul(t)).normalize();
       const cosSun = upS.dot(sun);
-      const airmass = float(1).div(cosSun.max(0.05));
-      const colR = betaR.mul(HR).mul(dR);
-      const colM = betaMe.mul(HM).mul(dM);
-      const colO = betaOz.mul(dO).mul(OZ_WIDTH);
-      const tauS = colR.add(colM).add(colO).mul(airmass);
-      const sunVis = smoothstep(-0.1, 0.1, cosSun); // fade to 0 past the terminator (no light from below)
-      const transSun = expVec(tauS.negate()).mul(sunVis);
+      let transSun;
+      if (transmittanceTex) {
+        // LUT uv: x = sunCos*0.5+0.5, y = sqrt(altitude/thickness) (inverse of the builder's packing).
+        const luv = vec2(cosSun.mul(0.5).add(0.5), a.div(ATM_THICKNESS_M).clamp(0, 1).sqrt());
+        transSun = texture(transmittanceTex, luv).xyz;
+      } else {
+        const airmass = float(1).div(cosSun.max(0.05));
+        const colR = betaR.mul(HR).mul(dR);
+        const colM = betaMe.mul(HM).mul(dM);
+        const colO = betaOz.mul(dO).mul(OZ_WIDTH);
+        const tauS = colR.add(colM).add(colO).mul(airmass);
+        const sunVis = smoothstep(-0.1, 0.1, cosSun); // fade past the terminator (no light from below)
+        transSun = expVec(tauS.negate()).mul(sunVis);
+      }
 
       // In-scatter at the sample = viewT · sunT · (βR·dR·phaseR + βMs·dM·phaseM) · stepLen.
       const scat = betaR.mul(dR).mul(phaseR).add(betaMs.mul(dM).mul(phaseM));
       inscat.addAssign(transView.mul(transSun).mul(scat).mul(stepLen));
+      // Multiscatter proxy: isotropic skylight (no sun-visibility term), gated by the sun's elevation —
+      // lifts the day sky and keeps twilight blue instead of black.
+      const ambient = betaR.mul(dR).add(betaMs.mul(dM)).mul(MS_AMBIENT).mul(skyDay);
+      inscat.addAssign(transView.mul(ambient).mul(stepLen));
     });
 
     const color = inscat.mul(SUN_INTENSITY);

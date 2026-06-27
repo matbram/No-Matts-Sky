@@ -43,6 +43,7 @@ import { childSeed, SALT } from '../core/seedchain.ts';
 import { QuadtreeManager } from './quadtreeManager.ts';
 import { PlayerController, type WalkInput } from './player.ts';
 import { createAtmosphere } from './atmosphere.ts';
+import { createAtmosphereLUT } from './atmosphereLUT.ts';
 import { createOcean } from './ocean.ts';
 import { createClouds } from './clouds.ts';
 
@@ -207,6 +208,9 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // ?daylit: force the sun to the camera-facing hemisphere so the viewed side is fully lit — an
   // atmosphere tuning aid, since the fixed preset/spawn spots otherwise sit near the dim pole/terminator.
   const daylit = params.has('daylit');
+  // Atmosphere LUT (Stage B) is ON by default (verified to render headless); ?atmonolut forces the pure
+  // analytic march. If the one-time LUT build throws on some backend, we fall back to analytic anyway.
+  const useLut = !params.has('atmonolut');
   const renderer = new WebGPURenderer({
     canvas,
     antialias: true,
@@ -264,6 +268,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     daylit, // ?daylit: force the sun to the camera-facing hemisphere (atmosphere tuning aid)
     noocean: params.has('noocean'), // ?noocean: hide the ocean (A/B)
     noclouds: params.has('noclouds'), // ?noclouds: hide the cloud deck (A/B)
+    lut: useLut, // atmosphere transmittance LUT on (default); ?atmonolut disables it
   });
 
   const R = EARTH_RADIUS_M;
@@ -370,7 +375,19 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // lives on `scene` (unspun, inertial), positioned at the planet centre (scene `−_spunOrigin`)
   // each frame and fed the camera's radial `up`/altitude + `_sunDir`. ?noatmo hides it for A/B.
   // The black `scene.background` stays for the space beyond the soft limb.
-  const atmosphere = createAtmosphere(R);
+  // Stage B atmosphere LUT (design §5.7): precomputed transmittance, rendered once to a HalfFloat RT.
+  // ?lut opts in (real-GPU gate); the analytic march (atmosphere.ts) is the default so the sky is never black.
+  const atmoLUT = createAtmosphereLUT(R);
+  let lutOk = false;
+  if (useLut) {
+    try {
+      atmoLUT.build(renderer); // renderer already init()'d above; one-time fullscreen pass to the RT
+      lutOk = true;
+    } catch (e) {
+      console.warn('[NMS] atmosphere LUT build failed — falling back to analytic sky', e);
+    }
+  }
+  const atmosphere = createAtmosphere(R, lutOk ? atmoLUT.transmittance.texture : undefined);
   atmosphere.mesh.visible = !params.has('noatmo');
   scene.add(atmosphere.mesh);
 
@@ -1082,7 +1099,9 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       moonGeo.dispose();
       moonMat.dispose();
       atmosphere.dispose();
+      atmoLUT.dispose();
       ocean.dispose();
+      clouds.dispose();
       renderer.dispose();
     },
   };

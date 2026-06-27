@@ -371,6 +371,18 @@ leaves (no spike), no rAF `[Violation]` stalls.
      **Headless-confirmed (`?webgl&daylit`):** a blue ocean world with landmasses + sun glint + soft limb.
      `?noocean` A/B. Deferred: depth-based shallow/teal colour (needs the scene depth texture), buoyancy/
      swimming (visual-first), sky-view-LUT reflection (uses an analytic sky gradient for now).
+   - **Stage B (transmittance LUT) + Stage C (multiscatter proxy): DONE** (`src/render/atmosphereLUT.ts` +
+     `atmosphere.ts`). The §5.7 LUT path is proven: a transmittance LUT (256×64 RGBA16F) is rendered ONCE to a
+     RenderTarget via a fullscreen `QuadMesh` pass (portable — no compute/storage textures) and the sky march
+     samples it for the sun term (physically-correct extinction + sunset reddening) instead of the airmass
+     approximation. **DEFAULT ON** (verified to render under `?webgl`); `?atmonolut` forces the analytic path,
+     and a try/catch around the one-time build falls back to analytic if a backend can't do HalfFloat RTs.
+     Stage C is a CHEAP multiscatter proxy (an isotropic skylight term gated by the sun's elevation) that lifts
+     the day sky and keeps twilight blue instead of black — not the full Hillaire multi-direction LUT.
+     **Headless-confirmed (`?webgl`):** ground sky graded blue via the LUT; default night-orbit shows a soft
+     sunrise limb (no hard edge); typecheck + 129 tests + build green; no LUT build errors. **Deferred (real-GPU
+     gated):** the per-frame SKY-VIEW LUT (a perf optimization — the analytic march + LUT tap is fine for now)
+     and the aerial-perspective LUT (Stage D — terrain still uses the old `HAZE_*`); Stage E preset tuning ongoing.
    - **Phase C — clouds: DONE** (`src/render/clouds.ts`). A semi-transparent, sun-lit cloud deck at R+9 km:
      two-octave fBm coverage of the SURFACE DIRECTION (stable on the globe, drifts only by a wind clock),
      soft puffy alpha, lit white (day) / dark (night) / warm (terminator) by `_sunDir`; alpha-blended,
