@@ -256,12 +256,12 @@ describe('meshChunk', () => {
       triangleCount: m.triangleCount,
     }).toMatchInlineSnapshot(`
       {
-        "indices": "5188bbfb",
-        "morphTargetNormals": "36ea2ec0",
-        "normals": "748e40ee",
-        "positions": "aed48954",
-        "triangleCount": 1558,
-        "vertexCount": 800,
+        "indices": "d782f66f",
+        "morphTargetNormals": "117d106a",
+        "normals": "58486331",
+        "positions": "574876e8",
+        "triangleCount": 1474,
+        "vertexCount": 753,
       }
     `);
   });
@@ -341,7 +341,7 @@ describe('meshChunk morph targets (LOD geomorph)', () => {
     const m = meshChunk(req, RECIPE, R, 16, 10);
     // RE-BLESSED for the parent-grid morph fix: the morph target is now the parent LEAF's grid surface
     // (so morph=1 is a true no-op swap), not the coarser field on this leaf's finer grid.
-    expect(fnv1a(m.morphTargets)).toMatchInlineSnapshot(`"ef5ca200"`);
+    expect(fnv1a(m.morphTargets)).toMatchInlineSnapshot(`"49b1737f"`);
   });
 
   it('emits one UNIT morph-target NORMAL per vertex (geomorph shading source)', () => {
@@ -531,9 +531,9 @@ describe('swapDelta (residual morph=1 vs parent leaf — diagnostic)', () => {
     }).toMatchInlineSnapshot(`
       {
         "dNrmAvgDeg": 0.2,
-        "dNrmMaxDeg": 0.45,
-        "dPosAvg": 23.06,
-        "dPosMax": 58.81,
+        "dNrmMaxDeg": 0.38,
+        "dPosAvg": 23.07,
+        "dPosMax": 56.98,
         "samples": 16,
       }
     `);
@@ -566,12 +566,12 @@ describe('production seed path (the live planet, end-to-end determinism)', () =>
       triangleCount: m.triangleCount,
     }).toMatchInlineSnapshot(`
       {
-        "indices": "b511b6b1",
-        "morphTargets": "b7cd549f",
-        "normals": "5fc3e7b0",
-        "positions": "14a3f407",
-        "triangleCount": 1460,
-        "vertexCount": 761,
+        "indices": "c933f2cd",
+        "morphTargets": "00b3e718",
+        "normals": "040444ac",
+        "positions": "dd1cbd0b",
+        "triangleCount": 1430,
+        "vertexCount": 745,
       }
     `);
   });

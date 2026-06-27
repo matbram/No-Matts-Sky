@@ -87,12 +87,7 @@ export const DETAIL_A_FAR_M = 50_000;
 export const DETAIL_B_NEAR_M = 200;
 export const DETAIL_B_FAR_M = 6_000;
 
-// ── Triplanar detail + strata (Phase B materials, master plan §5.8) ──────────
-// Blend three axis-plane noise projections of the BODY-fixed detail coord, weighted by the (body-fixed)
-// surface normal^TRIPLANAR_SHARP, so the procedural detail conforms to the surface on every cube face with
-// no UV stretch on cliffs. Costs 3 mx_noise taps vs 1 — gated behind the same per-fragment wA branch as
-// the old single tap, so orbit/altitude (wA≈0) still pays nothing; only the near surface pays. [T]
-const TRIPLANAR_SHARP = 4;
+// ── Detail strata + anti-pop reveal (Phase B materials) ──────────────────────
 // Sedimentary strata: altitude-banded layering, analytic (a sine of normalized elevation — NO noise tap),
 // shown only on the steep rock zones so cliffs read as layered rock instead of one flat tone. [T]
 const STRATA_FREQ = 38; // ~bands per unit elevation (height m); ~700–900 m strata spacing
@@ -280,22 +275,15 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     const morphW = mFinal.oneMinus(); // 1 near (full geometry detail) → 0 far (parent)
     const wA = morphW.mul(smoothstep(DETAIL_A_FAR_M, DETAIL_A_NEAR_M, dist));
     const rc = pDetail.mul(1 / DETAIL_A_SCALE_M);
-    // TRIPLANAR detail (§5.8): three axis-plane noise projections of the body-fixed coord, blended by the
-    // body normal^TRIPLANAR_SHARP, so the procedural relief conforms to the surface on any cube face with no
-    // UV stretch on cliffs. The three mx_noise taps are the dominant per-fragment fill cost, and at
-    // orbit/altitude wA is 0 — so gate them behind a per-fragment branch (a Fn establishes the build stack
-    // If() needs; the compiler emits a REAL WGSL `if`, so the taps are genuinely SKIPPED where wA≈0). The
-    // branch is coherent per-leaf (wA ~constant across a leaf) → negligible GPU divergence. Returns the
-    // blended vec3 ∈ ~[-1,1]³ (reused for albedo mottle + roughness + normal perturbation), 0 when skipped.
+    // ONE gradient-noise vec3 (≈[-1,1]³, reused for albedo mottle + roughness + normal perturbation). The
+    // mx_noise tap is the dominant per-fragment fill cost and at orbit/altitude wA is 0, so gate it behind a
+    // per-fragment branch (a Fn establishes the build stack If() needs; the compiler emits a REAL WGSL `if`,
+    // so the noise is genuinely SKIPPED where wA≈0). Returns 0 when skipped. (Triplanar was tried — 3 taps,
+    // ~3× the fill cost — but for ISOTROPIC noise the gain over a single 3D tap is marginal, so reverted.)
     const ndA = Fn(() => {
       const out = vec3(0).toVar();
       If(wA.greaterThan(0.001), () => {
-        const w = nGeom.abs().pow(vec3(TRIPLANAR_SHARP));
-        const ws = w.x.add(w.y).add(w.z).max(1e-4);
-        const sX = mx_noise_vec3(vec3(rc.y, rc.z, rc.x.mul(0.37))); // project onto the YZ plane (X-facing)
-        const sY = mx_noise_vec3(vec3(rc.z, rc.x, rc.y.mul(0.37)));
-        const sZ = mx_noise_vec3(vec3(rc.x, rc.y, rc.z.mul(0.37)));
-        out.assign(sX.mul(w.x).add(sY.mul(w.y)).add(sZ.mul(w.z)).div(ws));
+        out.assign(mx_noise_vec3(rc));
       });
       return out;
     })();

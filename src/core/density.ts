@@ -87,11 +87,13 @@ export function sliceTerrainRecipe(terrainSeed: number): TerrainRecipe {
     lacunarity: 2.0,
     gain: 0.5,
     warpStrength: 0.7,
-    // 2nd domain-warp iteration (modest — "more gets mushy", master plan §5.2) for twistier geology.
-    warpStrength2: 0.35,
+    // 2nd domain-warp iteration OFF: stacked on the 1st (0.7) it over-warped the terrain into a mushy,
+    // spiky mess (master plan §5.2: "more gets mushy"). The single warp already gives plenty of character.
+    warpStrength2: 0,
     // Ridged mountains: ~50 ranges across the sphere, rising up to ridgeAmp·height on continents only.
+    // GENTLE amplitude — 0.45 made jagged 60° spikes that read as harsh salt-and-pepper under the sun.
     ridgeScale: 50,
-    ridgeAmp: 0.45,
+    ridgeAmp: 0.2,
     ridgeOct: 4,
     maskLo: -0.2,
     maskHi: 0.5,
