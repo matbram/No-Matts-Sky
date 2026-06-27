@@ -14,7 +14,7 @@
 // altitude (full per-frame floating origin is Step 4).
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { Scene, Mesh, BufferGeometry, BufferAttribute, Color, Vector3, type Material } from 'three';
+import { type Object3D, Mesh, BufferGeometry, BufferAttribute, Color, Vector3, type Material } from 'three';
 import {
   selectCut,
   balanceCut,
@@ -225,7 +225,9 @@ export class QuadtreeManager {
   private readonly _tB = new Float64Array(4);
 
   constructor(
-    private readonly scene: Scene,
+    // Step 5: a container Object3D (a planetGroup the render shell spins by qSpin) — was the Scene.
+    // Leaves are added to it; the group's rotation makes the planet a real spinning body.
+    private readonly scene: Object3D,
     private readonly recipe: TerrainRecipe,
     private readonly radius: number,
     private readonly opts: ManagerOpts,
@@ -265,6 +267,17 @@ export class QuadtreeManager {
     for (const e of this.entries.values()) {
       if (e.mesh) e.mesh.position.set(e.center[0] - o[0], e.center[1] - o[1], e.center[2] - o[2]);
     }
+  }
+
+  /**
+   * Step 5: the terrain renders under a planetGroup the shell spins by qSpin, so the slope-band `up`
+   * (reconstructed in the material as normalize(positionWorld + uRenderOrigin)) needs the render origin
+   * ROTATED by the same spin — otherwise the bands swim as the planet turns. The shell passes
+   * qSpin·renderOrigin here each frame. Leaf POSITIONS stay body-fixed (origin − renderOrigin); only the
+   * group's rotation places them in the inertial frame, so this just keeps the lighting `up` consistent.
+   */
+  setSpunOrigin(o: [number, number, number]): void {
+    this.matRenderOrigin.value.set(o[0], o[1], o[2]);
   }
 
   /**

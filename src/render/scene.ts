@@ -24,6 +24,7 @@ import {
   Color,
   Vector3,
   Quaternion,
+  Group,
   Raycaster,
   DoubleSide,
   ACESFilmicToneMapping,
@@ -247,6 +248,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const scene = new Scene();
   scene.background = new Color(0x05070d);
 
+  // Step 5: the planet (terrain + backdrop) lives under this group, whose quaternion = the planet's
+  // real spin each frame — so the planet is a REAL spinning body (visible turning from orbit), not a
+  // faked moving light. The Sun/Moon stay on `scene` (inertial), so day/night = real geometry.
+  const planetGroup = new Group();
+  scene.add(planetGroup);
+
   const camera = new PerspectiveCamera(55, 1, R * 0.4, R * 8);
   const fovY = (camera.fov * Math.PI) / 180;
 
@@ -274,7 +281,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // `aLodR`/`aParentR` attributes, so there is no per-leaf material clone.
   // splitPx 300 (smaller, gentler LOD steps — affordable after the ~13× meshing
   // speedup); maxDepth = MAX_DEPTH gives meter-scale near-field cells for walking.
-  const manager = new QuadtreeManager(scene, recipe, R, {
+  const manager = new QuadtreeManager(planetGroup, recipe, R, {
     splitPx: FLY_SPLIT_PX,
     maxDepth: MAX_DEPTH,
     wireframe: params.has('wire'), // debug: see the tessellation / where lines fall
@@ -330,7 +337,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   });
   const backdrop = new Mesh(backdropGeo, backdropMaterial);
   backdrop.visible = !params.has('noback'); // debug: hide → do the lines become black gaps?
-  scene.add(backdrop);
+  planetGroup.add(backdrop); // co-rotates with the planet (centered at planet center)
 
   // ── Step 5: real spin + orbit (day/night, moving sun, moon, optional cast shadow) ──
   // The RENDER frame stays PLANET-CENTERED (terrain/player body-fixed, planet at the origin, NEVER
@@ -351,10 +358,12 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const MOON_PROXY_DIST = 4000; // render-space distance for the Moon proxy (between sun light + terrain)
   const _planetPos = new Float64Array(3);
   const _moonPos = new Float64Array(3);
-  const _sunDirBody = new Vector3();
-  const _moonDirBody = new Vector3();
-  const _spinQ = new Quaternion();
+  const _sunDir = new Vector3(); // REAL inertial planet→sun direction (no spin applied — terrain spins instead)
+  const _moonDir = new Vector3(); // REAL inertial geocentric moon direction
+  const _qSpin = new Quaternion(); // planet spin: body → inertial (+theta about the tilted axis)
+  const _qSpinInv = new Quaternion(); // inertial → body (for the body-fixed cut camera in fly/orbit)
   const _skyV = new Vector3();
+  const _spunOrigin = new Vector3(); // renderOrigin rotated by qSpin, for the slope-band `up` uniform
 
   const skyGeo = (radius: number): BufferGeometry => {
     const s = buildCubeSphere(8, radius);
@@ -403,24 +412,27 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // Advance the clock + place the sun/moon each frame (driven from render()).
   function updateSky(dtMs: number): void {
     if (!noTime) gameTimeS += (dtMs / 1000) * timeScale;
-    const theta = spinAngle(EARTH_SPIN_RATE, gameTimeS);
-    _spinQ.setFromAxisAngle(spinAxis, -theta); // inertial → body (the planet spins under the sky)
+    // Planet spin: body → inertial, +theta about the tilted axis. The render shell applies this to
+    // planetGroup so the planet REALLY rotates (no light-rotation trick); day/night then falls out of
+    // the real sun direction below sweeping across the spinning surface.
+    _qSpin.setFromAxisAngle(spinAxis, spinAngle(EARTH_SPIN_RATE, gameTimeS));
 
-    // Sun: heliocentric planet position → planet→sun direction (Sol at the system origin).
+    // Sun: heliocentric planet position → REAL planet→sun direction (Sol at the system origin), in the
+    // inertial frame (NOT spun — the terrain spins instead). Drives the DirectionalLight + the Sol disc.
     orbitalPosition(earthEl, gameTimeS, _planetPos);
     const sunDist = Math.hypot(_planetPos[0]!, _planetPos[1]!, _planetPos[2]!) || 1;
     _skyV.set(-_planetPos[0]!, -_planetPos[1]!, -_planetPos[2]!);
     if (_skyV.lengthSq() < 1e-12) _skyV.set(1, 0, 0);
-    _sunDirBody.copy(_skyV).normalize().applyQuaternion(_spinQ);
-    sun.position.copy(_sunDirBody).multiplyScalar(SUN_PROXY_DIST);
+    _sunDir.copy(_skyV).normalize();
+    sun.position.copy(_sunDir).multiplyScalar(SUN_PROXY_DIST);
     sunDisc.position.copy(sun.position);
     sunDisc.scale.setScalar(Math.max(8, SUN_PROXY_DIST * (SUN_RADIUS_M / sunDist))); // real angular size
 
-    // Moon: geocentric position → direction in the body frame; proxy clamped into the frustum.
+    // Moon: REAL geocentric direction (inertial). (R2 will place it at its true distance to fly to.)
     orbitalPosition(moonEl, gameTimeS, _moonPos);
     const moonDist = Math.hypot(_moonPos[0]!, _moonPos[1]!, _moonPos[2]!) || 1;
-    _moonDirBody.set(_moonPos[0]!, _moonPos[1]!, _moonPos[2]!).normalize().applyQuaternion(_spinQ);
-    moon.position.copy(_moonDirBody).multiplyScalar(MOON_PROXY_DIST);
+    _moonDir.set(_moonPos[0]!, _moonPos[1]!, _moonPos[2]!).normalize();
+    moon.position.copy(_moonDir).multiplyScalar(MOON_PROXY_DIST);
     moon.scale.setScalar(Math.max(4, MOON_PROXY_DIST * (MOON_RADIUS_M / moonDist))); // real angular size
   }
 
@@ -715,8 +727,26 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
         controls.update();
       }
 
-      worldCam.copy(camera.position).add(renderOrigin);
-      vel.copy(worldCam).sub(prevWorldCam); // world units / frame
+      // Step 5: the terrain renders under planetGroup(qSpin) (a real spinning body). Derive the
+      // BODY-FIXED camera position (worldCam) the cut/streaming use (terrain is body-fixed), place the
+      // camera to match the spun frame, and feed the slope-band `up` the spun origin.
+      const playerCam = (mode === 'walk' || mode === 'creative') && player !== null;
+      _qSpinInv.copy(_qSpin).invert();
+      if (playerCam) {
+        // camera.position is still body-relative (playerWorld − renderOrigin); body-fixed cut pos = +origin.
+        worldCam.copy(camera.position).add(renderOrigin);
+        // Co-rotate the camera into the inertial frame so a surface walker turns WITH the planet (the
+        // ground looks static, the sun moves) instead of the terrain sliding under a fixed camera.
+        camera.position.applyQuaternion(_qSpin);
+        camera.quaternion.premultiply(_qSpin);
+      } else {
+        // OrbitControls camera is an inertial observer of the spinning planet; un-spin to body-fixed.
+        worldCam.copy(camera.position).applyQuaternion(_qSpinInv).add(renderOrigin);
+      }
+      planetGroup.quaternion.copy(_qSpin);
+      _spunOrigin.copy(renderOrigin).applyQuaternion(_qSpin);
+      manager.setSpunOrigin([_spunOrigin.x, _spunOrigin.y, _spunOrigin.z]);
+      vel.copy(worldCam).sub(prevWorldCam); // world units / frame (body-fixed)
       prevWorldCam.copy(worldCam);
 
       // CDLOD: feed the per-vertex distance-morph the same projected-size constant the cut
