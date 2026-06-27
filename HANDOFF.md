@@ -371,6 +371,12 @@ leaves (no spike), no rAF `[Violation]` stalls.
      **Headless-confirmed (`?webgl&daylit`):** a blue ocean world with landmasses + sun glint + soft limb.
      `?noocean` A/B. Deferred: depth-based shallow/teal colour (needs the scene depth texture), buoyancy/
      swimming (visual-first), sky-view-LUT reflection (uses an analytic sky gradient for now).
+   - **Phase C — clouds: DONE** (`src/render/clouds.ts`). A semi-transparent, sun-lit cloud deck at R+9 km:
+     two-octave fBm coverage of the SURFACE DIRECTION (stable on the globe, drifts only by a wind clock),
+     soft puffy alpha, lit white (day) / dark (night) / warm (terminator) by `_sunDir`; alpha-blended,
+     depth-tested (ground occludes it), drawn before the sky (renderOrder 5). **Headless-confirmed
+     (`?webgl&daylit`):** white drifting clouds over the blue ocean with gaps to the sea — the full
+     Earth-like look (atmosphere + ocean + clouds). `?noclouds` A/B. Volumetric clouds deferred (`?volclouds`).
    - **S4 — perf hygiene done; 60fps lock is the real-GPU gate.** Micro-opt: the terrain shader now reuses one
      radial length for both the slope `up` and the elevation band (one sqrt/fragment, not two — hottest path).
      Headless `?perf` (orbit→mid→surface) confirms S1–S3 added **no unbounded main-thread work**: recut ≈14–20 ms

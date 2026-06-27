@@ -44,6 +44,7 @@ import { QuadtreeManager } from './quadtreeManager.ts';
 import { PlayerController, type WalkInput } from './player.ts';
 import { createAtmosphere } from './atmosphere.ts';
 import { createOcean } from './ocean.ts';
+import { createClouds } from './clouds.ts';
 
 // Injected by Vite at build time (git short hash + build time) — logged at startup
 // so we can tell a stale deploy from the latest fix during remote diagnosis.
@@ -262,6 +263,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     noHaze, // ?nohaze: disable the terrain aerial-perspective haze (A/B)
     daylit, // ?daylit: force the sun to the camera-facing hemisphere (atmosphere tuning aid)
     noocean: params.has('noocean'), // ?noocean: hide the ocean (A/B)
+    noclouds: params.has('noclouds'), // ?noclouds: hide the cloud deck (A/B)
   });
 
   const R = EARTH_RADIUS_M;
@@ -384,6 +386,13 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const ocean = createOcean(seaLevelR);
   ocean.mesh.visible = !params.has('noocean');
   scene.add(ocean.mesh);
+
+  // ── Phase C: clouds ────────────────────────────────────────────────────────
+  // A drifting, sun-lit cloud deck at R+9 km (alpha-blended, depth-tested, drawn before the sky).
+  // White swirls over the ocean from orbit; a moving ceiling from the surface. ?noclouds A/B.
+  const clouds = createClouds(R);
+  clouds.mesh.visible = !params.has('noclouds');
+  scene.add(clouds.mesh);
 
   // ── Step 5: real spin + orbit (day/night, moving sun, moon, optional cast shadow) ──
   // The RENDER frame stays PLANET-CENTERED (terrain/player body-fixed, planet at the origin, NEVER
@@ -811,6 +820,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       ocean.planetCenter.value.set(-_spunOrigin.x, -_spunOrigin.y, -_spunOrigin.z);
       ocean.sunDir.value.copy(_sunDir);
       ocean.time.value = now / 1000;
+      clouds.mesh.position.set(-_spunOrigin.x, -_spunOrigin.y, -_spunOrigin.z);
+      clouds.planetCenter.value.set(-_spunOrigin.x, -_spunOrigin.y, -_spunOrigin.z);
+      clouds.sunDir.value.copy(_sunDir);
+      clouds.time.value = now / 1000;
       // R2: place the Sun + Moon as REAL bodies at their true planet-centered inertial positions, in
       // scene space (= inertialPC − spunOrigin), at real radii. From the planet they're tiny discs at the
       // correct angular size + direction; in creative (G) the floating origin rides the camera, so flying
