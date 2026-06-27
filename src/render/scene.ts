@@ -354,12 +354,13 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // Spin axis in the inertial/ecliptic frame: the pole tilted by the obliquity (in the x–y plane).
   const spinAxis = new Vector3(Math.sin(EARTH_AXIAL_TILT_RAD), Math.cos(EARTH_AXIAL_TILT_RAD), 0).normalize();
   let gameTimeS = 0;
-  const SUN_PROXY_DIST = 5000; // render-space distance for the Sol billboard + light direction
-  const MOON_PROXY_DIST = 4000; // render-space distance for the Moon proxy (between sun light + terrain)
+  // The DirectionalLight is parallel (only its DIRECTION matters); placed this far along the real Sun
+  // direction so the optional shadow camera stays sane. The VISIBLE Sun/Moon are placed at their TRUE
+  // planet-centered distances (R2) so you can fly to them — not at this proxy distance.
+  const SUN_PROXY_DIST = 5000;
   const _planetPos = new Float64Array(3);
   const _moonPos = new Float64Array(3);
   const _sunDir = new Vector3(); // REAL inertial planet→sun direction (no spin applied — terrain spins instead)
-  const _moonDir = new Vector3(); // REAL inertial geocentric moon direction
   const _qSpin = new Quaternion(); // planet spin: body → inertial (+theta about the tilted axis)
   const _qSpinInv = new Quaternion(); // inertial → body (for the body-fixed cut camera in fly/orbit)
   const _skyV = new Vector3();
@@ -417,23 +418,16 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
     // the real sun direction below sweeping across the spinning surface.
     _qSpin.setFromAxisAngle(spinAxis, spinAngle(EARTH_SPIN_RATE, gameTimeS));
 
-    // Sun: heliocentric planet position → REAL planet→sun direction (Sol at the system origin), in the
-    // inertial frame (NOT spun — the terrain spins instead). Drives the DirectionalLight + the Sol disc.
+    // Orbital state (planet-centered INERTIAL frame): the planet's heliocentric position (so the Sun is
+    // at −_planetPos relative to the planet) and the Moon's geocentric position. The Sun/Moon MESHES are
+    // placed at these true positions in render() (after the floating origin is known); here we just keep
+    // the data + the REAL parallel-light direction (drives day/night on the spinning terrain).
     orbitalPosition(earthEl, gameTimeS, _planetPos);
-    const sunDist = Math.hypot(_planetPos[0]!, _planetPos[1]!, _planetPos[2]!) || 1;
+    orbitalPosition(moonEl, gameTimeS, _moonPos);
     _skyV.set(-_planetPos[0]!, -_planetPos[1]!, -_planetPos[2]!);
     if (_skyV.lengthSq() < 1e-12) _skyV.set(1, 0, 0);
     _sunDir.copy(_skyV).normalize();
-    sun.position.copy(_sunDir).multiplyScalar(SUN_PROXY_DIST);
-    sunDisc.position.copy(sun.position);
-    sunDisc.scale.setScalar(Math.max(8, SUN_PROXY_DIST * (SUN_RADIUS_M / sunDist))); // real angular size
-
-    // Moon: REAL geocentric direction (inertial). (R2 will place it at its true distance to fly to.)
-    orbitalPosition(moonEl, gameTimeS, _moonPos);
-    const moonDist = Math.hypot(_moonPos[0]!, _moonPos[1]!, _moonPos[2]!) || 1;
-    _moonDir.set(_moonPos[0]!, _moonPos[1]!, _moonPos[2]!).normalize();
-    moon.position.copy(_moonDir).multiplyScalar(MOON_PROXY_DIST);
-    moon.scale.setScalar(Math.max(4, MOON_PROXY_DIST * (MOON_RADIUS_M / moonDist))); // real angular size
+    sun.position.copy(_sunDir).multiplyScalar(SUN_PROXY_DIST); // DirectionalLight: direction only
   }
 
   // ── Camera presets (the gate's "static camera positions") ──────────────────
@@ -746,6 +740,14 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       planetGroup.quaternion.copy(_qSpin);
       _spunOrigin.copy(renderOrigin).applyQuaternion(_qSpin);
       manager.setSpunOrigin([_spunOrigin.x, _spunOrigin.y, _spunOrigin.z]);
+      // R2: place the Sun + Moon as REAL bodies at their true planet-centered inertial positions, in
+      // scene space (= inertialPC − spunOrigin), at real radii. From the planet they're tiny discs at the
+      // correct angular size + direction; in creative (G) the floating origin rides the camera, so flying
+      // out toward one makes it GROW from a dot into a real body (no proxies). Doubles → small float.
+      sunDisc.position.set(-_planetPos[0]! - _spunOrigin.x, -_planetPos[1]! - _spunOrigin.y, -_planetPos[2]! - _spunOrigin.z);
+      sunDisc.scale.setScalar(SUN_RADIUS_M);
+      moon.position.set(_moonPos[0]! - _spunOrigin.x, _moonPos[1]! - _spunOrigin.y, _moonPos[2]! - _spunOrigin.z);
+      moon.scale.setScalar(MOON_RADIUS_M);
       vel.copy(worldCam).sub(prevWorldCam); // world units / frame (body-fixed)
       prevWorldCam.copy(worldCam);
 
@@ -789,6 +791,14 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
         const alt = Math.max(distCenter - R, 1);
         camera.near = Math.max(1, alt * 0.05);
         camera.far = horizon + recipe.height * 8 + alt * 0.1;
+      }
+      // R2: in fly/orbit/creative, push `far` out to reach the real Sun/Moon (~1 AU) so they're visible
+      // and flyable-to; logarithmic depth (default on) keeps precision across the huge range. Left OFF in
+      // WALK so the carefully-tuned surface depth isn't perturbed. ⚠ GPU-tune: if terrain z-fights at the
+      // big far-plane, switch the far bodies to a separate layered render pass (plan subtask 4).
+      if (mode !== 'walk') {
+        const sunFar = Math.hypot(sunDisc.position.x, sunDisc.position.y, sunDisc.position.z) + SUN_RADIUS_M * 4;
+        if (sunFar > camera.far) camera.far = sunFar;
       }
       camera.updateProjectionMatrix();
 
