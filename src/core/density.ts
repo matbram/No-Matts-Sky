@@ -98,13 +98,14 @@ export function sliceTerrainRecipe(terrainSeed: number): TerrainRecipe {
     maskLo: -0.2,
     maskHi: 0.5,
     // Continental mask: ~8 big landmasses across the sphere, biasing the surface ±contAmp·height so
-    // land/sea reads as coherent continents instead of uniform island-noise. Symmetric spline knees ⇒
-    // roughly half land / half ocean with a narrow coastline band; tune against the sea level.
+    // land/sea reads as coherent continents instead of uniform island-noise. The spline knees are WIDE
+    // (±0.35, not ±0.15) so continental margins are gradual SLOPES, not the sharp shelves/cliffs that
+    // produced spiky cross-LOD triangles when streaming; lower amplitude (0.45) keeps the relief modest.
     contScale: 8,
-    contAmp: 0.6,
+    contAmp: 0.45,
     contOct: 3,
-    contLo: -0.15,
-    contHi: 0.15,
+    contLo: -0.35,
+    contHi: 0.35,
     seed: terrainSeed >>> 0,
   };
 }

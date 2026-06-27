@@ -256,12 +256,12 @@ describe('meshChunk', () => {
       triangleCount: m.triangleCount,
     }).toMatchInlineSnapshot(`
       {
-        "indices": "d782f66f",
-        "morphTargetNormals": "117d106a",
-        "normals": "58486331",
-        "positions": "574876e8",
-        "triangleCount": 1474,
-        "vertexCount": 753,
+        "indices": "ab946eb6",
+        "morphTargetNormals": "ef55f701",
+        "normals": "333f977e",
+        "positions": "a85ed3cc",
+        "triangleCount": 1176,
+        "vertexCount": 608,
       }
     `);
   });
@@ -341,7 +341,7 @@ describe('meshChunk morph targets (LOD geomorph)', () => {
     const m = meshChunk(req, RECIPE, R, 16, 10);
     // RE-BLESSED for the parent-grid morph fix: the morph target is now the parent LEAF's grid surface
     // (so morph=1 is a true no-op swap), not the coarser field on this leaf's finer grid.
-    expect(fnv1a(m.morphTargets)).toMatchInlineSnapshot(`"49b1737f"`);
+    expect(fnv1a(m.morphTargets)).toMatchInlineSnapshot(`"10f7f30e"`);
   });
 
   it('emits one UNIT morph-target NORMAL per vertex (geomorph shading source)', () => {
@@ -531,7 +531,7 @@ describe('swapDelta (residual morph=1 vs parent leaf — diagnostic)', () => {
     }).toMatchInlineSnapshot(`
       {
         "dNrmAvgDeg": 0.2,
-        "dNrmMaxDeg": 0.38,
+        "dNrmMaxDeg": 0.36,
         "dPosAvg": 23.07,
         "dPosMax": 56.98,
         "samples": 16,
@@ -566,12 +566,12 @@ describe('production seed path (the live planet, end-to-end determinism)', () =>
       triangleCount: m.triangleCount,
     }).toMatchInlineSnapshot(`
       {
-        "indices": "c933f2cd",
-        "morphTargets": "00b3e718",
-        "normals": "040444ac",
-        "positions": "dd1cbd0b",
-        "triangleCount": 1430,
-        "vertexCount": 745,
+        "indices": "0581fb04",
+        "morphTargets": "64a68f52",
+        "normals": "65aa4699",
+        "positions": "b9a24c81",
+        "triangleCount": 1172,
+        "vertexCount": 608,
       }
     `);
   });
