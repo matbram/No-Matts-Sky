@@ -19,6 +19,7 @@ import {
   selectCut,
   balanceCut,
   clampCutToReachableFrontier,
+  completeCoverage,
   maxNeighborDelta as maxNeighborDeltaCore,
   nodeBounds,
   lodBoundRadius,
@@ -381,7 +382,14 @@ export class QuadtreeManager {
     let clampedDepth = 0;
     for (const c of clamped) clampedDepth += c.path.length;
     this.frontierActive = clampedDepth < idealDepth;
-    const cut = balanceCut(clamped, this.opts.maxDepth);
+    // Coverage completion (BEFORE balanceCut): tile the uncovered slivers of any partially-tiled base
+    // cell so the cut is a COMPLETE partition — closes the cull-edge (limb) coverage hole that showed as
+    // random black pop-in when the camera moved (see completeCoverage in /core). Runs on the clamped cut
+    // and before balance so balance force-splits any >1-level step a coarse fill leaf introduces. The
+    // frontierActive accounting above is measured on the PRE-completion clamped cut (the fill must not
+    // perturb the "still climbing" signal). No-op when baseDepth=0.
+    const completed = completeCoverage(clamped, baseDepth);
+    const cut = balanceCut(completed, this.opts.maxDepth);
 
     const wanted = new Set<string>();
     for (const node of cut) {

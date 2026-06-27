@@ -254,6 +254,101 @@ export function clampCutToReachableFrontier(
   return out;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// completeCoverage — the cull-edge coverage hole fix (the "random black pop-in").
+//
+// The cut is supposed to be a COMPLETE partition of the sphere: the always-resident base
+// (depth `baseDepth`) keeps every region covered, so a finer leaf always has a parent and there
+// is never a black gap. selectCut's backfill (end of selectCut) guarantees this ONLY for
+// WHOLE-missing base cells — it keys coverage by the base-depth PREFIX, so a base cell that is
+// only PARTIALLY tiled reads as "covered" and is skipped. That blind spot opens a hole at a CULL
+// EDGE (the view-cone edge in fly mode = the planet's limb; same at the horizon edge): once a base
+// cell `[a,b]` has refined to its children `P0..P3` (all live, the depth-2 leaf purged) and the
+// cull edge sweeps across it, the out-of-cone children (e.g. `P2,P3`, depth > baseDepth) are CULLED
+// from the cut — and neither the backfill (the cell's prefix is still "covered" by `P0,P1`) nor
+// clamp/balance re-adds them. `retainedShouldRemove` then finds no wanted leaf overlapping the
+// now-unwanted live `P2,P3` (`anyOverlap=false`) and deletes them the same frame → that sliver is
+// covered by NOTHING → black space shows through, then re-covers as the camera moves on.
+//
+// completeCoverage closes it: it makes the cut a complete partition again by tiling the UNCOVERED
+// sub-regions of every PARTIALLY-tiled base cell with the COARSEST leaves that fit (one leaf per
+// maximal empty quadrant). Those fill leaves enter `wanted`, so `retainedShouldRemove` keeps the
+// old leaves until the fill streams live, then removes them cleanly — no hole.
+//
+// Applied RENDER-SIDE in quadtreeManager.update(), on the CLAMPED cut and BEFORE the single
+// balanceCut — so balance force-splits any >1-level step a coarse fill leaf introduces next to deep
+// in-cone detail (preserving the "balanced regardless of input order" invariant), and the fill stays
+// inside the shallow, paced regime the clamp established (so retainedShouldRemove's "exactly one
+// level" assumption holds). PURE + deterministic (path/packed-key space only, no Three.js, no
+// allocations beyond the result). `baseDepth=0` ⇒ identity (determinism guard, like selectCut). It
+// only touches base cells that have ≥1 descendant leaf, so it's DISJOINT from selectCut's
+// whole-missing-cell backfill (no double-add). selectCut/clamp/balanceCut are untouched, so their
+// golden tests are unaffected; this gets its own test.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Emit the coarsest leaves covering the EMPTY parts of region (face,path,depth): if no cut leaf
+ *  has this region as a prefix it's wholly empty → one fill leaf here; if a leaf sits exactly here
+ *  it's already tiled → stop; otherwise descend into the 4 children. */
+function fillEmptyRegions(
+  out: QuadNode[],
+  coverRegion: Set<number>,
+  leafExact: Set<number>,
+  face: number,
+  path: number[],
+  depth: number,
+): void {
+  const key = packRegion(face, path, depth);
+  if (!coverRegion.has(key)) {
+    out.push({ face, path: path.slice() }); // maximal empty quadrant → single coarse fill leaf
+    return;
+  }
+  if (leafExact.has(key)) return; // a cut leaf sits exactly here → already tiled, no descent
+  for (let q = 0; q < 4; q++) {
+    path.push(q);
+    fillEmptyRegions(out, coverRegion, leafExact, face, path, depth + 1);
+    path.pop();
+  }
+}
+
+/**
+ * Make `cut` a complete partition of the sphere by filling the uncovered sub-regions of any
+ * PARTIALLY-tiled base cell with the coarsest leaves that fit (see block comment above). Pure +
+ * deterministic; `baseDepth=0` ⇒ identity. Output is sorted by packed key so it's stable regardless
+ * of Set iteration order (a clean golden). Originals are preserved (the result is a superset).
+ */
+export function completeCoverage(cut: ReadonlyArray<QuadNode>, baseDepth: number): QuadNode[] {
+  if (baseDepth <= 0) return cut.slice(); // off ⇒ identity (determinism guard, like selectCut)
+
+  // Index the cut by EVERY prefix at depths [baseDepth .. leaf.depth] (coverRegion), by exact leaf
+  // region (leafExact), and by base-depth prefix of any touched cell (baseTouched). Packed-int keys
+  // (packRegion) — no string allocation. coverRegion.has(P) ⟺ some leaf has region P as a prefix.
+  const coverRegion = new Set<number>();
+  const leafExact = new Set<number>();
+  const baseTouched = new Set<number>();
+  for (const lf of cut) {
+    const D = lf.path.length;
+    if (D < baseDepth) continue; // shallower-than-base can't happen post-clamp; skip defensively
+    for (let d = baseDepth; d <= D; d++) coverRegion.add(packRegion(lf.face, lf.path, d));
+    leafExact.add(packRegion(lf.face, lf.path, D));
+    baseTouched.add(packRegion(lf.face, lf.path, baseDepth));
+  }
+
+  const out: QuadNode[] = cut.slice();
+  // For each TOUCHED base cell that isn't already a single base leaf, fill its empty quadrants.
+  // Whole-MISSING base cells (no descendant) aren't in baseTouched — selectCut's backfill owns those.
+  for (const key of baseTouched) {
+    if (leafExact.has(key)) continue; // the cell is exactly one base leaf → fully tiled already
+    const face = Math.floor(key / REGION_FACE_UNIT);
+    const pathBits = key - face * REGION_FACE_UNIT - baseDepth * REGION_DEPTH_UNIT;
+    const basePath = unpackPath(pathBits, baseDepth);
+    fillEmptyRegions(out, coverRegion, leafExact, face, basePath, baseDepth);
+  }
+
+  // Stable order (Set-iteration-independent) so the golden is deterministic.
+  out.sort((a, b) => packRegion(a.face, a.path, a.path.length) - packRegion(b.face, b.path, b.path.length));
+  return out;
+}
+
 // Conservative bounding-radius factor per quadtree depth. A depth-d face quadrant
 // is largest (least cube-sphere distortion) at the face CENTER, where a uv
 // half-size h=1/2^d maps to a corner at distance |normalize(h,h,1) − (0,0,1)| from

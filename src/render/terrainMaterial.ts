@@ -93,7 +93,7 @@ export const DETAIL_B_FAR_M = 6_000;
 // vanishes from space and the planet reads crisp (only the atmosphere shell's limb remains). The blue
 // matches the atmosphere shell so the surface fades into the same colour it sits under.
 const HAZE_RAYLEIGH = [0.30, 0.55, 1.0] as const; // same tint as atmosphere.ts
-const HAZE_LUMA = 0.32; // inscatter brightness (reduced so near/mid desert land shows its tan instead of washing blue)
+const HAZE_LUMA = 0.5; // inscatter brightness
 const HAZE_RATE = 1 / 30_000; // 1/scale (m): at density 1, ~63% hazed by 30 km of view distance
 const HAZE_TWILIGHT = 0.1; // day floor so the terminator hazes softly instead of cutting to black
 
@@ -119,18 +119,18 @@ export interface SlopePreset {
 // band is the S3 palette win instead; triplanar is the right tool only if a future 2D-textured archetype
 // is added.
 // Exported so the ?landlog diagnostic (scene.ts) can mirror this exact palette on the CPU.
-export const PEAK_COLOR = [0.78, 0.74, 0.66] as const; // pale dusty highlands (warm, near-white on the highest peaks)
-export const LOW_COLOR = [0.30, 0.22, 0.15] as const; // dark warm regolith — shades valley/drainage basins (reads as river valleys)
+export const PEAK_COLOR = [0.66, 0.62, 0.55] as const; // pale dusty highlands
+export const LOW_COLOR = [0.33, 0.27, 0.23] as const; // darker lowland regolith
 export const PEAK_LO = 0.20; // elevation (× height amplitude) where highlands start to fade in
 export const PEAK_HI = 0.85; // …and reach full highland colour
 export const LOW_HI = -0.10; // lowland tint starts fading in as elevation drops below this
 export const LOW_LO = -0.70; // …and reaches full lowland colour
 
 export const SLOPE_PRESETS: readonly SlopePreset[] = [
-  { lo: 0.55, hi: 0.82, rock: [0.40, 0.36, 0.33], sand: [0.62, 0.55, 0.45] }, // 0 grey low-contrast (A/B ref)
-  { lo: 0.25, hi: 0.98, rock: [0.40, 0.36, 0.33], sand: [0.62, 0.55, 0.45] }, // 1 grey wide band — gradient
-  { lo: 0.50, hi: 0.92, rock: [0.45, 0.34, 0.24], sand: [0.66, 0.53, 0.36] }, // 2 DESERT (default) — warm tan flats, browner rock, wide low-contrast band
-  { lo: 0.30, hi: 0.95, rock: [0.50, 0.40, 0.30], sand: [0.70, 0.58, 0.42] }, // 3 desert soft — paler, gentlest
+  { lo: 0.55, hi: 0.82, rock: [0.40, 0.36, 0.33], sand: [0.62, 0.55, 0.45] }, // 0 current — hard mottle (A/B ref)
+  { lo: 0.25, hi: 0.98, rock: [0.40, 0.36, 0.33], sand: [0.62, 0.55, 0.45] }, // 1 wide band — flip → gradient, same colours
+  { lo: 0.55, hi: 0.82, rock: [0.47, 0.43, 0.39], sand: [0.57, 0.51, 0.44] }, // 2 low contrast — keeps definition, mutes black/tan
+  { lo: 0.30, hi: 0.95, rock: [0.47, 0.43, 0.39], sand: [0.57, 0.51, 0.44] }, // 3 soft — wide + low contrast (gentlest)
 ];
 
 export interface TerrainMaterialOpts {

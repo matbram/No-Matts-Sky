@@ -428,12 +428,10 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // concentric with the terrain. ?noocean A/B.
   const _seaProbe = new Float64Array(7);
   surfaceAt(recipe, R, SURFACE_DIR.x, SURFACE_DIR.y, SURFACE_DIR.z, _seaProbe, groundOct);
-  // Sea level → balanced land/sea. The old R+4 km flooded ~64% of the ±14 km terrain (the "blue island
-  // world"); dropping it to ~1 km BELOW the mean radius splits the surface roughly half land / half ocean
-  // — large tan continents with blue ocean basins (the "balanced Earth-like" look). Still clamped below the
-  // walk spawn's terrain so the player spawns on land. ?sea=METERS overrides the offset from R (e.g.
-  // ?sea=4000 for the old mostly-ocean look, ?sea=-6000 for a mostly-land desert).
-  const seaOffset = params.has('sea') ? Number(params.get('sea')) : -1000;
+  // Sea level → the blue-ocean world: ~R+4 km floods most of the ±14 km terrain into ocean with island
+  // continents (the look the user chose to revert to). Still clamped below the walk spawn's terrain so the
+  // player spawns on land. ?sea=METERS overrides the offset from R (e.g. ?sea=-6000 for a mostly-land look).
+  const seaOffset = params.has('sea') ? Number(params.get('sea')) : 4000;
   const seaLevelR = Math.min(R + seaOffset, _seaProbe[0]! - 400);
   const ocean = createOcean(seaLevelR);
   ocean.mesh.visible = !params.has('noocean');

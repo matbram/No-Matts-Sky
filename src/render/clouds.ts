@@ -23,7 +23,6 @@ import { Mesh, BufferGeometry, BufferAttribute, Vector3, NormalBlending } from '
 import { MeshBasicNodeMaterial } from 'three/webgpu';
 import {
   Fn,
-  float,
   vec3,
   vec4,
   uniform,
@@ -36,12 +35,11 @@ import { buildCubeSphere } from '../core/cubesphere.ts';
 
 const CLOUD_ALT_M = 9_000; // cloud deck altitude (m)
 const CLOUD_SUBDIV = 64; // coarse — the puffy pattern is per-fragment noise, not geometry
-const COVER_LO = 0.17; // fBm value where cloud starts — raised so clouds are SPARSE (lots of clear sky between puffs)
-const COVER_HI = 0.40; // …and reaches full opacity; tighter LO→HI band = crisper puff edges (still soft, not hard)
-const CLOUD_OPACITY = 0.95; // max alpha of a dense puff
-const FREQ_A = 5.0; // base coverage frequency — smaller cells ⇒ many discrete puffs, not continent-scale swirls
-const FREQ_B = 15.0; // detail octave (puff shaping)
-const FREQ_C = 34.0; // fine billow octave (cauliflower edges)
+const COVER_LO = 0.06; // fBm value where cloud starts (lower → more cloud)
+const COVER_HI = 0.5; // …and reaches full opacity (soft puffy edges between)
+const CLOUD_OPACITY = 0.92; // max alpha of dense cloud
+const FREQ_A = 2.6; // base coverage frequency (features across the globe)
+const FREQ_B = 7.0; // detail octave
 const WIND = 0.006; // drift speed (per second, in noise space)
 const DAY_COLOR = [1.0, 1.0, 1.02] as const; // sunlit cloud tops (slightly cool white)
 const NIGHT_COLOR = [0.05, 0.07, 0.11] as const; // night clouds (dark blue-grey)
@@ -77,23 +75,18 @@ export function createClouds(planetRadius: number): CloudsHandle {
     const dir = positionWorld.sub(uCenter).normalize(); // stable surface direction (drift via wind only)
     const drift = vec3(uTime.mul(WIND), 0, uTime.mul(WIND * 0.6));
 
-    // Three-octave coverage field from the direction (stable on the globe): big cells PLACE the puffs,
-    // finer octaves shape their cauliflower edges → discrete scattered cumulus rather than a smooth sheet.
+    // Two-octave coverage field from the direction (stable on the globe).
     const fA = mx_noise_vec3(dir.mul(FREQ_A).add(drift)).x;
     const fB = mx_noise_vec3(dir.mul(FREQ_B).add(drift.mul(1.7))).x;
-    const fC = mx_noise_vec3(dir.mul(FREQ_C).add(drift.mul(2.3))).x;
-    const cover = fA.mul(0.55).add(fB.mul(0.30)).add(fC.mul(0.15));
-    const dens = smoothstep(COVER_LO, COVER_HI, cover); // 0 clear → 1 dense puff core
-    const alpha = dens.mul(CLOUD_OPACITY);
+    const cover = fA.mul(0.65).add(fB.mul(0.35));
+    const alpha = smoothstep(COVER_LO, COVER_HI, cover).mul(CLOUD_OPACITY);
 
-    // Lighting from the real sun: day white, night dark, warm at the terminator. A dense core reads
-    // brighter than a wispy edge — a cheap fake of a sunlit puffy top vs a thin translucent rim.
+    // Lighting from the real sun: day white, night dark, warm at the terminator.
     const sunUp = dir.dot(sun);
     const day = smoothstep(-0.15, 0.25, sunUp);
     const dusk = smoothstep(0.35, 0.0, sunUp).mul(smoothstep(-0.15, 0.05, sunUp)); // peak near terminator
     const lit = mix(vec3(...NIGHT_COLOR), vec3(...DAY_COLOR), day);
-    const litPuff = lit.mul(mix(float(0.82), float(1.0), dens)); // brighter dense cores, dimmer thin edges
-    const color = mix(litPuff, vec3(...DUSK_COLOR), dusk.mul(0.6));
+    const color = mix(lit, vec3(...DUSK_COLOR), dusk.mul(0.6));
 
     return vec4(color, alpha);
   });
