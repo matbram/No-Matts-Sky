@@ -276,19 +276,29 @@ canonical values use the pinned **PCG hash** with `Math.imul` + `>>> 0` (no `Mat
     `clamp(altitude × 0.7, 20 m/s, 0.3c)` × throttle; `[`/`]` throttle, Shift boost. The Moon is reachable in
     seconds, the Sun in ~minutes (the old ~40 km/s ladder made the Moon ~2.7 h away — that's why "fly to it" felt
     broken). HUD shows cruise speed + distance-to-Moon/Sun.
-  - **FF (free-flight overhaul) — Phase 1 DONE** (`player.ts` + `scene.ts`): user feedback "stuck on an axis /
-    invisible guideline." Movement is fully **camera-relative 6DOF** (W=look, A/D=camera right, Space/Ctrl=camera
-    up). The LOOK uses the **stable yaw/pitch radial-up basis** (same as walk) so mouse-look never drifts
-    off-level (an earlier free-quaternion look accumulated roll — "unlevel a lot" — and was reverted); **Q/E**
-    bank a `roll` that persists, **R** eases it smoothly back to level (`LEVEL_RATE`). Tradeoff: always-level
-    horizon, so no full inversion/looping (a free-look toggle can be added later if wanted). **Speed is player-controlled** (replaced altitude
-    auto-scaling): an absolute **throttle ladder** (`[`/`]` + mouse wheel), the velocity **eases** toward the
-    throttle target (critically-damped, no overshoot), **Shift** boosts, **X** full-stops. **Free-fly is the
+  - **FF (free-flight overhaul) — Phase 1 + untethered look + planet collision DONE** (`player.ts` + `scene.ts`):
+    user feedback "stuck on an axis / invisible guideline." Movement is fully **camera-relative 6DOF** (W=look,
+    A/D=camera right, Space/Ctrl=camera up). The LOOK is now a **free orientation quaternion** (`_flyQuat`):
+    mouse yaw/pitch + **Q/E** roll all act in the camera's **LOCAL** frame — **untethered**, so you can point/fly
+    any direction incl. straight up, over the top, and inverted, and hold any bank. (A brief "stable-up" variant
+    was tried to keep the horizon level but felt re-tethered — "stuck on an invisible axis" — so per the user we
+    went **full 6DOF, no auto-level assist**.) Tradeoff the user accepted: circling the look can slowly tilt the
+    horizon; **R** smoothly re-levels it (slerp toward a leveled target that keeps the look dir, snaps within ~1°,
+    **cancels on any look input** so it never fights you). **Solid-planet collision** (newest ask — "can't fly
+    through the planet, under water maybe but not through it"): `collideFly()` clamps the radius above the SOLID
+    terrain surface (analytic footprint via `surfaceAt`, lifted to the rendered mesh when higher — never sea
+    level) and removes only the **inward radial velocity** so you **slide** along the ground, not stop dead. So
+    you can descend below sea level into the water but not through the seabed/ground; no gravity; `FLY_CLEARANCE`
+    keeps the near plane off the rock. (Per-frame radial clamp: robust vs radial tunnelling; lateral tunnelling at
+    relativistic throttle skimming the deck is out of slice scope.) **Speed is player-controlled** (replaced
+    altitude auto-scaling): an absolute **throttle ladder** (`[`/`]` + mouse wheel), the velocity **eases** toward
+    the throttle target (critically-damped, no overshoot), **Shift** boosts, **X** full-stops. **Free-fly is the
     default camera on load** (aimed at the planet); orbit-drag + **1/2/3** presets and **F** walk remain; **G**
     toggles. **T** cycles the game-time rate (1×/60×/360×/pause) so things run at real speed; HUD shows it. Walk
     mode unchanged. Headless-confirmed: presets + walk still render, typecheck + 129 tests + build green. ⚠
-    Real-GPU: the 6DOF feel. **Phase 2 (deferred):** altitude-aware frame — inertial in space (planet rotates
-    beneath), body-fixed + gravity in the atmosphere — with a smooth blend (gravity feel to be confirmed).
+    Real-GPU: the 6DOF feel + collision (dive at land → stop & slide; dive at ocean → sink underwater, stop at
+    seabed). **Phase 2 (deferred):** altitude-aware frame — inertial in space (planet rotates beneath), body-fixed
+    + gravity in the atmosphere — with a smooth blend (gravity feel to be confirmed).
 - **Step 6 (S1) — atmosphere sky + sun glow** (`src/render/atmosphere.ts`, this commit). A planet-centered shell
   at `R·1.025` (BackSide, additive, depth-tested but not depth-writing) with an analytic single-scatter colour
   (Rayleigh blue + limb/horizon brightening + a Mie forward-glow sun halo), fed the SAME real `_sunDir` as the
