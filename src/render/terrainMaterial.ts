@@ -41,6 +41,7 @@ import {
   positionWorld,
   cameraPosition,
   smoothstep,
+  sin,
   mx_noise_vec3,
   Fn,
   If,
@@ -85,6 +86,26 @@ export const DETAIL_A_FAR_M = 50_000;
 // Retained for the manager's [NMS step] gB diagnostic only (the 6 m octave they gated is no longer shaded).
 export const DETAIL_B_NEAR_M = 200;
 export const DETAIL_B_FAR_M = 6_000;
+
+// ── Triplanar detail + strata (Phase B materials, master plan §5.8) ──────────
+// Blend three axis-plane noise projections of the BODY-fixed detail coord, weighted by the (body-fixed)
+// surface normal^TRIPLANAR_SHARP, so the procedural detail conforms to the surface on every cube face with
+// no UV stretch on cliffs. Costs 3 mx_noise taps vs 1 — gated behind the same per-fragment wA branch as
+// the old single tap, so orbit/altitude (wA≈0) still pays nothing; only the near surface pays. [T]
+const TRIPLANAR_SHARP = 4;
+// Sedimentary strata: altitude-banded layering, analytic (a sine of normalized elevation — NO noise tap),
+// shown only on the steep rock zones so cliffs read as layered rock instead of one flat tone. [T]
+const STRATA_FREQ = 38; // ~bands per unit elevation (height m); ~700–900 m strata spacing
+const STRATA_AMP = 0.07; // ± albedo tint amplitude on rock
+// Distance-reveal (anti-pop/morph, the Star Citizen "planet shader" trick): the micro-relief perturbation
+// darkens the lit surface on average as it fades IN with proximity (a bumpy surface self-shadows vs a flat
+// one), which reads as a brightness "morph" while flying. Pre-apply that mean darkening at distance, where
+// the real relief is absent, and lift it back to 1 as the relief arrives — so total brightness is CONTINUOUS
+// across the detail band and the detail REVEALS rather than flashes. Band sits just inside the geomorph so
+// geometry + shading arrive together. [T]
+export const REVEAL_NEAR_M = 900;
+export const REVEAL_FAR_M = 60_000;
+const REVEAL_DARKEN = 0.9; // far brightness floor ≈ the mean self-shadowing of the unloaded micro-relief
 
 // ── Aerial perspective (S2) ──────────────────────────────────────────────────
 // Haze the surface into the sky with distance: out-scatter DIMS the lit surface (× transmittance),
@@ -258,31 +279,44 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     // AND a distance gate (anti-alias: 0 before the feature drops below a pixel).
     const morphW = mFinal.oneMinus(); // 1 near (full geometry detail) → 0 far (parent)
     const wA = morphW.mul(smoothstep(DETAIL_A_FAR_M, DETAIL_A_NEAR_M, dist));
-    // One gradient-noise vec3 (≈[-1,1]³), reused for albedo mottle + normal perturbation — but the
-    // mx_noise_vec3 is the dominant per-fragment fill-rate cost (?nodetail was buttery) and at orbit/altitude
-    // its weight wA is 0, so evaluating it there is pure wasted fill. Gate it behind a per-fragment branch:
-    // a Fn establishes the build stack If() needs (calling If during top-level material construction has no
-    // stack → the earlier "Cannot read properties of null (reading 'If')"), and the compiler emits a REAL
-    // WGSL `if`, so the noise is genuinely SKIPPED where wA≈0 — not hoisted. The branch is coherent per-leaf
-    // (wA is a distance/morph function, ~constant across a leaf), so GPU divergence is negligible. Returns 0
-    // when skipped, matching the ×wA≈0 contribution it would otherwise have produced.
+    const rc = pDetail.mul(1 / DETAIL_A_SCALE_M);
+    // TRIPLANAR detail (§5.8): three axis-plane noise projections of the body-fixed coord, blended by the
+    // body normal^TRIPLANAR_SHARP, so the procedural relief conforms to the surface on any cube face with no
+    // UV stretch on cliffs. The three mx_noise taps are the dominant per-fragment fill cost, and at
+    // orbit/altitude wA is 0 — so gate them behind a per-fragment branch (a Fn establishes the build stack
+    // If() needs; the compiler emits a REAL WGSL `if`, so the taps are genuinely SKIPPED where wA≈0). The
+    // branch is coherent per-leaf (wA ~constant across a leaf) → negligible GPU divergence. Returns the
+    // blended vec3 ∈ ~[-1,1]³ (reused for albedo mottle + roughness + normal perturbation), 0 when skipped.
     const ndA = Fn(() => {
       const out = vec3(0).toVar();
       If(wA.greaterThan(0.001), () => {
-        out.assign(mx_noise_vec3(pDetail.mul(1 / DETAIL_A_SCALE_M)));
+        const w = nGeom.abs().pow(vec3(TRIPLANAR_SHARP));
+        const ws = w.x.add(w.y).add(w.z).max(1e-4);
+        const sX = mx_noise_vec3(vec3(rc.y, rc.z, rc.x.mul(0.37))); // project onto the YZ plane (X-facing)
+        const sY = mx_noise_vec3(vec3(rc.z, rc.x, rc.y.mul(0.37)));
+        const sZ = mx_noise_vec3(vec3(rc.x, rc.y, rc.z.mul(0.37)));
+        out.assign(sX.mul(w.x).add(sY.mul(w.y)).add(sZ.mul(w.z)).div(ws));
       });
       return out;
     })();
 
-    // Albedo mottle: ±detail near, fading to the flat band colour with distance.
+    // Albedo: ±fine mottle near (fading to the flat band colour with distance) PLUS analytic sedimentary
+    // strata on the steep ROCK zones (band→0 = rock) — altitude-banded layering that reads as layered cliffs
+    // without a noise tap. Both fade out with wA.
     const mottle = ndA.x.mul(wA).mul(0.22);
-    mat.colorNode = albedo.mul(mottle.add(1));
+    const strata = sin(elev.mul(STRATA_FREQ)).mul(band.oneMinus()).mul(wA).mul(STRATA_AMP);
+    // Distance-reveal (anti-pop): pre-apply the micro-relief's mean self-shadow darkening where the relief
+    // is still absent (far), lifting to 1 as it arrives (near) — so brightness is continuous across the band
+    // and the detail REVEALS instead of flashing. The reveal band sits just inside the geomorph (REVEAL_NEAR
+    // > DETAIL_A_NEAR) so geometry and shading resolve together.
+    const meanDarken = mix(float(REVEAL_DARKEN), float(1), smoothstep(REVEAL_FAR_M, REVEAL_NEAR_M, dist));
+    mat.colorNode = albedo.mul(mottle.add(strata).add(1)).mul(meanDarken);
     // Gentle roughness break-up so the surface doesn't read as one uniform sheen up close.
     mat.roughnessNode = float(0.92).sub(ndA.y.mul(wA).mul(0.06)).clamp(0.4, 1);
 
-    // Normal perturbation: tilt the morph normal by the TANGENTIAL part of the detail noise (remove the
-    // along-normal component so it tilts, not inflates), weighted so it vanishes where geometry morphs to
-    // the parent. Gives fine relief shading up close, smoothing out with distance.
+    // Normal perturbation: tilt the morph normal by the TANGENTIAL part of the (triplanar) detail noise
+    // (remove the along-normal component so it tilts, not inflates), weighted so it vanishes where geometry
+    // morphs to the parent. Gives fine relief shading up close, smoothing out with distance.
     const pert = ndA.mul(wA);
     const pertTang = pert.sub(nGeom.mul(pert.dot(nGeom)));
     mat.normalNode = nGeom.add(pertTang.mul(0.3)).normalize();
