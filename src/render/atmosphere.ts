@@ -57,7 +57,7 @@ import { buildCubeSphere } from '../core/cubesphere.ts';
 // ── "Breathable" (Earth-like) preset — Bruneton coefficients, per-metre, metres. ──
 // Tuned for real blue sky + white horizon + sunset reddening. [T] cosmetic (Stage E locks these).
 // Exported so the LUT builder (atmosphereLUT.ts) shares the exact same "breathable" preset.
-export const ATM_THICKNESS_M = 100_000; // atmosphere top = R + 100 km (generous so the limb reads)
+export const ATM_THICKNESS_M = 150_000; // atmosphere top = R + 150 km (extends the glow band so the limb reads lusher from low orbit)
 export const HR = 8_000; // Rayleigh scale height (m)
 export const HM = 1_200; // Mie scale height (m)
 export const BETA_R: readonly [number, number, number] = [5.802e-6, 13.558e-6, 33.1e-6]; // Rayleigh scatter=extinction
@@ -67,11 +67,11 @@ export const MIE_G = 0.8; // Mie anisotropy (forward sun glow)
 export const BETA_OZ: readonly [number, number, number] = [0.65e-6, 1.881e-6, 0.085e-6]; // ozone absorption
 export const OZ_CENTER = 25_000; // ozone tent centre (m)
 export const OZ_WIDTH = 15_000; // ozone tent half-width (m)
-export const SUN_INTENSITY = 40; // HDR sun illuminance (one brightness knob; ACESFilmic, exposure 1.0) [Stage E tunes]
+export const SUN_INTENSITY = 90; // HDR sun illuminance (one brightness knob; ACESFilmic, exposure 1.0) — raised 40→90 for a thicker/more-glowing sky [Stage E tunes]
 // Cheap multiscatter proxy (Stage C): an isotropic skylight term present even where the direct sun is
 // extinguished, gated by the SUN's elevation at the camera — lifts the day sky and keeps twilight from
 // going black (single-scatter alone makes twilight dead). A fraction of the local scattering; [T] tune.
-const MS_AMBIENT = 0.35;
+const MS_AMBIENT = 0.5; // raised 0.35→0.5 to lift the day/twilight sky (thicker-reading atmosphere)
 const PRIMARY_STEPS = 16; // view-ray march samples (analytic sun transmittance → no nested loop)
 const ATM_SUBDIV = 24; // shell tessellation (round silhouette; the colour is per-pixel ray math)
 
