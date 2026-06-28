@@ -170,8 +170,10 @@ describe('cross-LOD apron gap (the crack adaptive octaves reopened)', () => {
 
   it('the gap shrinks geometrically with depth (deepest leaves are crack-free)', () => {
     // Each level deeper halves the finest-octave amplitude (gain 0.5), so the gap is
-    // largest at coarse transitions and negligible near the player; lod 11–15 clamp to
-    // OCT_MAX and share an octave count → zero gap (mutually watertight, no skirts).
+    // largest at coarse transitions and negligible near the player; once a level reaches
+    // OCT_MAX (lod ≥ OCT_MAX−recipe.octaves) adjacent leaves share an octave count → zero
+    // gap (mutually watertight, no skirts). gapAt(14) is in that clamped band for any
+    // OCT_MAX ≤ 14, so this holds whether OCT_MAX is 11 or 15.
     const gapAt = (coarseLod: number): number => {
       const octC = lodOctaves(RECIPE, coarseLod);
       const octF = lodOctaves(RECIPE, coarseLod + 1);
@@ -189,7 +191,7 @@ describe('cross-LOD apron gap (the crack adaptive octaves reopened)', () => {
     };
     expect(gapAt(2)).toBeLessThan(gapAt(1)); // deeper → smaller crack
     // At/above OCT_MAX both leaves share the same octave count → no surface mismatch.
-    expect(gapAt(14)).toBe(0); // lodOctaves(14)==lodOctaves(15)==OCT_MAX
+    expect(gapAt(14)).toBe(0); // lodOctaves(14)==lodOctaves(15)==OCT_MAX (both clamp)
   });
 });
 

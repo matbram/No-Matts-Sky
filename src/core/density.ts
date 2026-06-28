@@ -57,10 +57,22 @@ export interface TerrainRecipe {
 
 /**
  * Max fBm octaves at the finest LOD. Bounds per-leaf cost (fBm is O(octaves)) and
- * caps detail once finer octaves fall below the cell size, where they'd only
- * alias. [T] tunable — lower it for perf headroom on weaker GPUs.
+ * caps detail once finer octaves fall below the cell size, where they'd only alias.
+ *
+ * Sized to the DEEPEST mesh resolution: at MAX_DEPTH=15 the cells are ~9.5 m, so the
+ * finest octave that the mesh can actually resolve (cell ≤ ½·wavelength) is octave ~10
+ * (~44 m wavelength → resolved by ~19 m / depth-14 cells, with a level of margin). Octaves
+ * beyond that have wavelengths BELOW the cell size: the mesh can never represent them, so
+ * they don't add visible relief — they only make the surface SHIMMER/SHIFT as you move (each
+ * step re-samples the sub-cell field at a slightly different point) and float the walk
+ * collision above the drawn ground (the analytic probe sees bumps the mesh smooths away).
+ * 11 octaves (0..10) keeps every octave the deepest mesh can show and drops only the
+ * unresolvable ones, so the ground reads CALMER and stays stable underfoot. The material's
+ * render-space detail (terrainMaterial octave A ~40 m) still supplies finer visual texture by
+ * shading, so the surface isn't bland. [T] tunable — pair any MAX_DEPTH change with this
+ * (finest resolvable octave ≈ recipe.octaves + (MAX_DEPTH−1)).
  */
-export const OCT_MAX = 15;
+export const OCT_MAX = 11;
 
 /**
  * Octave count for a leaf at quadtree depth `lod`: ONE finer octave per level.
