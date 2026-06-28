@@ -89,6 +89,6 @@ describe('surfaceAt — collision/orientation probe', () => {
       packed[(s - 1) * 4 + 2] = out[2]!;
       packed[(s - 1) * 4 + 3] = out[3]!;
     }
-    expect(fnv1a(packed)).toMatchInlineSnapshot(`"1cdf809f"`);
+    expect(fnv1a(packed)).toMatchInlineSnapshot(`"3d0c7e72"`);
   });
 });

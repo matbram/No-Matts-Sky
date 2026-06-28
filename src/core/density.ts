@@ -75,17 +75,31 @@ export interface TerrainRecipe {
 export const OCT_MAX = 11;
 
 /**
- * Octave count for a leaf at quadtree depth `lod`: ONE finer octave per level.
- * With lacunarity 2 the finest octave's wavelength then stays a constant ratio to
- * the cell size (which halves each level) → detail is always "matched," never
- * aliased. Capped at OCT_MAX. The geomorph relies on adjacent levels differing by
- * exactly one octave: a fine leaf's morph target (its value minus the finest
- * octave) is then its coarse parent's detail level → crack-free LOD transitions.
- *
- * lod 0 → recipe.octaves (== today), so coarse/orbit leaves are unchanged.
+ * LOD→octave OFFSET. octaves(lod) = clamp(lod − LOD_OCT_OFFSET, 1, OCT_MAX). The slope is 1 octave per
+ * level (lacunarity 2 → cell halves each level → one new resolvable octave per level), but the OFFSET is
+ * what aligns the finest octave to the cell size. The old schedule (`recipe.octaves + lod`, offset −4)
+ * put the finest octave ~55× BELOW the cell at every LOD, so the top ~7 octaves aliased into spiky
+ * "blades" at any coarse view. With offset +4 the finest octave is ≈4.7 cells wide (cell ÷ wavelength
+ * ≈ 0.21) — comfortably above Nyquist, no aliasing. Derived from noiseScale (45.5 km oct-0 wavelength)
+ * vs cell(lod) ≈ 9.5 m · 2^(15−lod); RECOMPUTE if noiseScale changes. Lower to 3 for ~2.3-cell (sharper)
+ * detail if the result reads too smooth.
  */
-export function lodOctaves(recipe: TerrainRecipe, lod: number): number {
-  return Math.min(OCT_MAX, recipe.octaves + lod);
+export const LOD_OCT_OFFSET = 4;
+
+/**
+ * Octave count for a leaf at quadtree depth `lod`: clamp(lod − LOD_OCT_OFFSET, 1, OCT_MAX) — one finer
+ * octave per level (so the finest octave's wavelength stays a fixed ~4.7× the cell size, which halves
+ * each level → detail matched to resolution, never sub-cell/aliased), floored at 1 and capped at OCT_MAX.
+ * The geomorph relies on adjacent levels differing by AT MOST one octave: a fine leaf's morph target (its
+ * value minus the finest octave) is then its coarse parent's detail level → crack-free LOD transitions.
+ *
+ * The floor of 1 (not 0) is deliberate: it keeps the coarsest leaves at one shared octave count (like the
+ * OCT_MAX cap does at the deep end) so the morph stays crack-free there, and it avoids fbm3's octaves=0
+ * divide-by-zero (norm=0 → NaN). Coarse/orbit leaves carry only the few low-frequency octaves the mesh can
+ * resolve (smooth); finer detail fades in matched to the cell on descent.
+ */
+export function lodOctaves(_recipe: TerrainRecipe, lod: number): number {
+  return Math.max(1, Math.min(OCT_MAX, lod - LOD_OCT_OFFSET));
 }
 
 /** The slice's single recipe, keyed off the planet's terrain seed. [T] tunable. */
@@ -102,20 +116,25 @@ export function sliceTerrainRecipe(terrainSeed: number): TerrainRecipe {
     // 2nd domain-warp iteration OFF: stacked on the 1st (0.7) it over-warped the terrain into a mushy,
     // spiky mess (master plan §5.2: "more gets mushy"). The single warp already gives plenty of character.
     warpStrength2: 0,
-    // Ridged mountains: ~50 ranges across the sphere, rising up to ridgeAmp·height on continents only.
-    // GENTLE amplitude — 0.45 made jagged 60° spikes that read as harsh salt-and-pepper under the sun.
-    ridgeScale: 50,
-    ridgeAmp: 0.2,
-    ridgeOct: 4,
+    // Ridged mountains → coherent ranges visible from low orbit ("balanced" relief). ridgeOct 2 (was 4)
+    // keeps the ranges BROAD so their finest octave (~63 km) is resolvable from low orbit instead of
+    // aliasing into spikes (the old ridgeOct 4 reached ~16 km features that shattered on 300 km+ orbit
+    // cells). ridgeScale 30 (was 50) = fewer, larger ranges; ridgeAmp 0.3 (was 0.2) makes them read as
+    // real elevated mountains. Folded (1−|m|)² crests, on continents only. [T] tune on screenshots.
+    ridgeScale: 30,
+    ridgeAmp: 0.3,
+    ridgeOct: 2,
     maskLo: -0.2,
     maskHi: 0.5,
     // Continental mask: ~8 big landmasses across the sphere, biasing the surface ±contAmp·height so
     // land/sea reads as coherent continents instead of uniform island-noise. The spline knees are WIDE
     // (±0.35, not ±0.15) so continental margins are gradual SLOPES, not the sharp shelves/cliffs that
     // produced spiky cross-LOD triangles when streaming; lower amplitude (0.45) keeps the relief modest.
+    // contOct 2 (was 3) so even the finest continental octave (~398 km) is resolvable at the coarsest LOD
+    // (no continent-edge aliasing from orbit).
     contScale: 8,
     contAmp: 0.45,
-    contOct: 3,
+    contOct: 2,
     contLo: -0.35,
     contHi: 0.35,
     seed: terrainSeed >>> 0,

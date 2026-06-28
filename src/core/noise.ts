@@ -149,14 +149,17 @@ const _gn = new Float64Array(4);
  * the chain-rule frequency factor per octave. Octaves are decorrelated by a
  * deterministic per-octave seed offset.
  *
- * Optional `outLo` (length ≥ 4) receives the normalized VALUE AND GRADIENT using
- * all but the FINEST octave — the LOD geomorph target (a smoother, "parent-
- * resolution" surface, `[value, ∂/∂x, ∂/∂y, ∂/∂z]`). Both are captured for free
- * here (no extra noise evals) and are pure functions of position, so neighbouring
- * chunks agree on them exactly → no seams mid-morph. The gradient lets the mesher
- * compute the morph-target's ANALYTIC normal (matching the base normal's source),
- * so a fully-morphed leaf shades identically to its same-octave neighbour.
- * `out[0..3]` is bit-identical whether or not `outLo` is passed.
+ * Optional `outLo` (length ≥ 4) receives the LOD geomorph target: the VALUE AND
+ * GRADIENT of all but the FINEST octave, normalized over THOSE (octaves−1)
+ * amplitudes — i.e. EXACTLY the surface a parent leaf with one fewer octave renders.
+ * (Normalizing over the full `octaves` denominator instead would scale the parent's
+ * value by normLo/norm — negligible at many octaves (~1.6% at 6→5) but a large 33%
+ * at 2→1, so a morph to it would POP at shallow-LOD swaps. Normalizing over its own
+ * amplitudes makes morph=1 reproduce the parent at ANY octave count.) Captured for
+ * free here (no extra noise evals) and a pure function of position, so neighbouring
+ * chunks agree exactly → no seams mid-morph; the gradient gives the morph target an
+ * ANALYTIC normal matching the parent. `out[0..3]` is bit-identical with or without
+ * `outLo`.
  */
 export function fbm3(
   seed: number,
@@ -177,9 +180,10 @@ export function fbm3(
   let freq = 1;
   let norm = 0;
   let vLo = 0, dxLo = 0, dyLo = 0, dzLo = 0; // value + gradient captured before the finest octave
+  let normLo = 0; // amplitude sum of all but the finest octave (the parent's own denominator)
   const loCount = octaves - 1;
   for (let o = 0; o < octaves; o++) {
-    if (o === loCount) { vLo = v; dxLo = dx; dyLo = dy; dzLo = dz; }
+    if (o === loCount) { vLo = v; dxLo = dx; dyLo = dy; dzLo = dz; normLo = norm; }
     const os = (seed + Math.imul(o, 0x9e3779b1)) >>> 0;
     gradNoise3(os, x * freq, y * freq, z * freq, _gn);
     v += amp * _gn[0]!;
@@ -195,15 +199,16 @@ export function fbm3(
   out[1] = dx * inv;
   out[2] = dy * inv;
   out[3] = dz * inv;
-  // Same normalization as out → outLo is out minus only the finest octave's
-  // contribution: a small, purely high-frequency displacement (value AND gradient).
-  // Octaves<2: no finer octave to drop, so outLo == out.
+  // outLo = the (octaves−1)-octave surface normalized over ITS OWN amplitudes (1/normLo), so it equals
+  // exactly what a parent leaf with one fewer octave renders → a morph to it is pop-free at any octave
+  // count (see the header). Octaves<2: no finer octave to drop, so outLo == out.
   if (outLo) {
     if (octaves > 1) {
-      outLo[0] = vLo * inv;
-      outLo[1] = dxLo * inv;
-      outLo[2] = dyLo * inv;
-      outLo[3] = dzLo * inv;
+      const invLo = 1 / normLo;
+      outLo[0] = vLo * invLo;
+      outLo[1] = dxLo * invLo;
+      outLo[2] = dyLo * invLo;
+      outLo[3] = dzLo * invLo;
     } else {
       outLo[0] = out[0];
       outLo[1] = out[1];
