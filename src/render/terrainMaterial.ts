@@ -43,6 +43,7 @@ import {
   smoothstep,
   sin,
   mx_noise_vec3,
+  transformNormalToView,
   Fn,
   If,
 } from 'three/tsl';
@@ -271,7 +272,11 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     // and the normal perturbation are NOT in the compiled shader). Just the morph normal + slope-band albedo.
     mat.colorNode = albedo;
     mat.roughnessNode = float(0.92);
-    mat.normalNode = nGeom;
+    // normalNode must be in VIEW space: r184 uses a custom normalNode DIRECTLY as `normalView` with no
+    // transform (Normal.js:113), so feeding the body/object-space nGeom made lit brightness swing with the
+    // CAMERA's look direction (the sun gets viewMatrix'd each frame, the normal didn't). transformNormalToView
+    // applies modelNormalMatrix (incl. the planetGroup spin) + cameraViewMatrix → view-independent, spin-stable.
+    mat.normalNode = transformNormalToView(nGeom);
   } else {
     // ── Surface detail (fades in with proximity, on the morph's schedule) ───────
     // TWO octaves: A (~40 m, near grain) + C (~500 m, altitude band). Both use the same stable, float-precise
@@ -331,7 +336,9 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     // shading that turns the surface from flat "clay" into terrain when viewed from altitude.
     const pert = ndA.mul(wA).add(ndC.mul(wC).mul(0.7));
     const pertTang = pert.sub(nGeom.mul(pert.dot(nGeom)));
-    mat.normalNode = nGeom.add(pertTang.mul(0.3)).normalize();
+    // To VIEW space (see the noDetail branch): r184 takes a custom normalNode AS the view normal, so an
+    // object-space normal here makes lighting rotate with the camera. transformNormalToView fixes that.
+    mat.normalNode = transformNormalToView(nGeom.add(pertTang.mul(0.3)).normalize());
   }
 
   // ── Aerial perspective (S2): haze the surface into the atmosphere ────────────
