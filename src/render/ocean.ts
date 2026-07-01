@@ -50,7 +50,8 @@ import { buildCubeSphere } from '../core/cubesphere.ts';
 
 const OCEAN_SUBDIV = 64; // coarse — per-fragment analytic normal keeps it smooth near the player
 // Water palette ([T] cosmetic). Deep = near-black blue-green; sky reflection = atmosphere-matching blue.
-const DEEP = [0.012, 0.045, 0.075] as const;
+const DEEP = [0.02, 0.09, 0.17] as const; // brighter ocean-blue so water reads BLUE from orbit (looking
+// straight down = low Fresnel = almost pure DEEP; the old near-black made the planet look like a dark moon)
 const SKY_HORIZON = [0.52, 0.66, 0.82] as const; // pale horizon sky (reflected at grazing angles)
 const SKY_ZENITH = [0.12, 0.30, 0.62] as const; // deeper overhead sky (reflected near vertical)
 const SUN_GLINT = [1.0, 0.95, 0.82] as const;

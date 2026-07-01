@@ -136,11 +136,13 @@ describe('cross-LOD apron gap (the crack adaptive octaves reopened)', () => {
   const SKIRT_SAFETY = 4;
 
   it('different LODs place the shared edge at different radii, and a skirt covers it', () => {
-    const coarseLod = 1;
-    const fineLod = 2;
-    const octC = lodOctaves(RECIPE, coarseLod); // 5
-    const octF = lodOctaves(RECIPE, fineLod); // 6
-    expect(octF).toBe(octC + 1); // adjacent levels differ by exactly one octave
+    // Use lods in the schedule's LINEAR range (clamp(lod−4,1,OCT_MAX) is floored at 1 for lod≤5 and
+    // capped at OCT_MAX=11 at lod 15, so a true one-octave step exists only between).
+    const coarseLod = 6;
+    const fineLod = 7;
+    const octC = lodOctaves(RECIPE, coarseLod); // 2
+    const octF = lodOctaves(RECIPE, fineLod); // 3
+    expect(octF).toBe(octC + 1); // adjacent levels (in the linear range) differ by exactly one octave
 
     // Sample the shared u=0 edge of face 2 over the finer leaf's overlap v∈[-1,-0.5];
     // measure the radial gap between the coarse (octC) and fine (octF) surfaces.
@@ -169,9 +171,10 @@ describe('cross-LOD apron gap (the crack adaptive octaves reopened)', () => {
   });
 
   it('the gap shrinks geometrically with depth (deepest leaves are crack-free)', () => {
-    // Each level deeper halves the finest-octave amplitude (gain 0.5), so the gap is
-    // largest at coarse transitions and negligible near the player; lod 11–15 clamp to
-    // OCT_MAX and share an octave count → zero gap (mutually watertight, no skirts).
+    // Each level deeper halves the finest-octave amplitude (gain 0.5), so the gap is largest at coarse
+    // transitions and negligible near the player. Where the schedule is FLAT — the floor (lod ≤ 5, all 1
+    // octave) and the OCT_MAX cap — adjacent leaves share an octave count → zero gap (mutually watertight,
+    // no skirts). gapAt(2) is in the floor band → 0; the linear range shrinks with depth.
     const gapAt = (coarseLod: number): number => {
       const octC = lodOctaves(RECIPE, coarseLod);
       const octF = lodOctaves(RECIPE, coarseLod + 1);
@@ -187,9 +190,9 @@ describe('cross-LOD apron gap (the crack adaptive octaves reopened)', () => {
       }
       return g;
     };
-    expect(gapAt(2)).toBeLessThan(gapAt(1)); // deeper → smaller crack
-    // At/above OCT_MAX both leaves share the same octave count → no surface mismatch.
-    expect(gapAt(14)).toBe(0); // lodOctaves(14)==lodOctaves(15)==OCT_MAX
+    expect(gapAt(7)).toBeLessThan(gapAt(6)); // deeper → smaller crack (linear range)
+    // In the floor band both leaves share the same octave count (1) → no surface mismatch.
+    expect(gapAt(2)).toBe(0); // lodOctaves(2)==lodOctaves(3)==1 (floor)
   });
 });
 
@@ -256,12 +259,12 @@ describe('meshChunk', () => {
       triangleCount: m.triangleCount,
     }).toMatchInlineSnapshot(`
       {
-        "indices": "506acfe2",
-        "morphTargetNormals": "4757522c",
-        "normals": "00144975",
-        "positions": "4b7b7717",
-        "triangleCount": 1258,
-        "vertexCount": 618,
+        "indices": "91b2db8e",
+        "morphTargetNormals": "37a45fda",
+        "normals": "9112e126",
+        "positions": "0a42595a",
+        "triangleCount": 1386,
+        "vertexCount": 710,
       }
     `);
   });
@@ -341,7 +344,7 @@ describe('meshChunk morph targets (LOD geomorph)', () => {
     const m = meshChunk(req, RECIPE, R, 16, 10);
     // RE-BLESSED for the parent-grid morph fix: the morph target is now the parent LEAF's grid surface
     // (so morph=1 is a true no-op swap), not the coarser field on this leaf's finer grid.
-    expect(fnv1a(m.morphTargets)).toMatchInlineSnapshot(`"4a61ebd8"`);
+    expect(fnv1a(m.morphTargets)).toMatchInlineSnapshot(`"fcfe46cd"`);
   });
 
   it('emits one UNIT morph-target NORMAL per vertex (geomorph shading source)', () => {
@@ -384,7 +387,10 @@ describe('meshChunk morph targets (LOD geomorph)', () => {
     // smoothed version of the per-point analytic coarser normal (so the dot is high, not ~1). The
     // decisive invariant: it matches the coarser normal MUCH better than the fine (base) normal does.
     const m = meshChunk(req, RECIPE, R, 16, 10);
-    const morphOct = lodOctaves(RECIPE, req.lod) - 1; // mesher drops the finest octave for the target
+    // The morph target is the PARENT leaf's field — octaves lodOctaves(req.lod−1) — matching the mesher
+    // (chunk.ts octParent). In the schedule's linear range this equals lodOctaves(req.lod)−1, but at the
+    // floor (req.lod=2 → 1 octave) the parent is also floored to 1, NOT 0 (0 octaves would be a NaN field).
+    const morphOct = lodOctaves(RECIPE, req.lod - 1);
     const s = new Float64Array(7);
     let dotMorph = 0;
     for (let v = 0; v < m.vertexCount; v++) {
@@ -480,30 +486,30 @@ describe('meshChunk morph targets (LOD geomorph)', () => {
 });
 
 describe('swapDelta (residual morph=1 vs parent leaf — diagnostic)', () => {
-  // With the parent-grid morph fix, a child born at morph=1 reproduces the parent leaf's GRID surface,
-  // so the dominant ~17° grid-discretization pop is gone. swapDelta now measures the only residual the
-  // grid alignment can't remove: the field-level difference between the mesher's morph-target source
-  // (the oct-normalized one-octave-coarser `_tLo`) and the actual parent leaf's base field. Because
-  // `_tLo` shares the child's larger amplitude denominator, that is a smooth ~1.6% scaling of the
-  // parent value → a tiny radial offset + ≲ a couple degrees of normal tilt. SMALL ⇒ morph=1 ≈ parent
-  // (pop-free swap). This is the EQUIVALENCE check that the fix landed.
-  const child: ChunkRequest = { face: 2, path: [2, 1], lod: 2 };
+  // The parent-grid morph fix removed the grid-discretization pop; the fbm3 outLo-normalization fix
+  // (normalize the morph target over the parent's OWN (octaves−1) amplitudes) removes the last residual.
+  // The morph target is now BIT-IDENTICAL to the parent leaf's field at matched directions, so a child
+  // born at morph=1 reproduces the parent exactly → swapDelta is the ZERO delta. (Before the normalization
+  // fix this read dNrm≈7° at a shallow 1→2-octave swap, the largest where the child/parent denominators
+  // diverge most.) This test guards that exact reproduction.
+  // Uses a lod in the schedule's LINEAR range (lodOctaves(6)=2 → parent lodOctaves(5)=1, a real
+  // one-octave drop) so the check exercises an actual octave step, not the degenerate floor.
+  const child: ChunkRequest = { face: 2, path: [2, 1, 0, 3, 2, 1], lod: 6 };
 
   it('is deterministic: same request → identical deltas', () => {
     expect(swapDelta(child, RECIPE, R)).toEqual(swapDelta(child, RECIPE, R));
   });
 
-  it('the morph target reproduces the parent leaf (residual is small)', () => {
+  it('the morph target reproduces the parent leaf EXACTLY (residual ≈ 0, float roundoff only)', () => {
     const d = swapDelta(child, RECIPE, R, 4);
     expect(d.samples).toBe(16); // perAxis² = 4×4
     expect(d.dPosAvg).toBeLessThanOrEqual(d.dPosMax);
     expect(d.dNrmAvgDeg).toBeLessThanOrEqual(d.dNrmMaxDeg);
-    // The decisive assertion: the swap is now effectively pop-free — only the pre-existing `_tLo`
-    // normalization residual remains (a smooth ~1.6% radial scaling), NOT the ~17°/~km grid pop the
-    // child-grid morph target showed. (Before the fix this read dNrm≈32°, dPos≈7 km here.)
-    expect(d.dNrmMaxDeg).toBeLessThan(5);
-    expect(d.dPosMax).toBeLessThan(RECIPE.height * 0.05); // ≲ 700 m vs the old ~7 km
-    expect(d.dPosMax).toBeGreaterThan(0); // the residual is real (nonzero), just tiny
+    // outLo is normalized over the parent's own (octaves−1) amplitudes, so the morph target equals the
+    // parent field bit-identically up to float roundoff (~µm / ~1e-6°) → the morph=1 swap is pop-free at
+    // ANY octave count. (Pre-fix this read ~hundreds of m / ~7° at this shallow 1→2-octave swap.)
+    expect(d.dPosMax).toBeLessThan(0.1); // ≪ 1 mm vs the old hundreds of metres
+    expect(d.dNrmMaxDeg).toBeLessThan(0.01); // vs the old ~7°
   });
 
   it('is the zero delta at the root (no parent to swap from)', () => {
@@ -530,10 +536,10 @@ describe('swapDelta (residual morph=1 vs parent leaf — diagnostic)', () => {
       samples: d.samples,
     }).toMatchInlineSnapshot(`
       {
-        "dNrmAvgDeg": 0.2,
-        "dNrmMaxDeg": 0.35,
-        "dPosAvg": 23.07,
-        "dPosMax": 56.98,
+        "dNrmAvgDeg": 0,
+        "dNrmMaxDeg": 0,
+        "dPosAvg": 0,
+        "dPosMax": 0,
         "samples": 16,
       }
     `);
@@ -566,12 +572,12 @@ describe('production seed path (the live planet, end-to-end determinism)', () =>
       triangleCount: m.triangleCount,
     }).toMatchInlineSnapshot(`
       {
-        "indices": "a9ff7c46",
-        "morphTargets": "8c12ce42",
-        "normals": "fc7c26f1",
-        "positions": "0f595388",
-        "triangleCount": 1238,
-        "vertexCount": 606,
+        "indices": "54713f22",
+        "morphTargets": "7bd3cfe2",
+        "normals": "e7b56f86",
+        "positions": "e029a2b0",
+        "triangleCount": 1390,
+        "vertexCount": 703,
       }
     `);
   });

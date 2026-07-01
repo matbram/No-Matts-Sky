@@ -46,6 +46,9 @@ import { createAtmosphere } from './atmosphere.ts';
 import { createAtmosphereLUT } from './atmosphereLUT.ts';
 import { createOcean } from './ocean.ts';
 import { createClouds } from './clouds.ts';
+import {
+  SLOPE_PRESETS, PEAK_COLOR, LOW_COLOR, PEAK_LO, PEAK_HI, LOW_HI, LOW_LO,
+} from './terrainMaterial.ts';
 
 // Injected by Vite at build time (git short hash + build time) — logged at startup
 // so we can tell a stale deploy from the latest fix during remote diagnosis.
@@ -108,6 +111,22 @@ const CREATIVE_SPLIT_PX = 520;
 // Fly/orbit split threshold (px) — the manager default; shared with the CDLOD morph so the
 // distance-morph band matches the cut's split distance exactly.
 const FLY_SPLIT_PX = 300;
+
+// ── ?landlog land-diagnostic helpers (mirror the scene's two lights + the shader palette on the CPU so
+// the [LAND] console block reports exactly what the on-screen land does). The decisive lighting signal is
+// N·sun (day/night), which is colour-independent; the lit-RGB is approximate (three sRGB→linearizes the
+// light colours; we don't, so treat lit-RGB as relative, N·sun + diffuse as authoritative).
+const LAND_SUN_INT = 1.55;                           // DirectionalLight intensity (scene.ts sun)
+const LAND_SUN_COL = [1.0, 0.957, 0.902] as const;   // 0xfff4e6
+const LAND_HEMI_SKY = [0.533, 0.667, 0.8] as const;  // 0x88aacc HemisphereLight sky
+const LAND_HEMI_GROUND = [0.078, 0.063, 0.094] as const; // 0x141018 HemisphereLight ground
+const LAND_HEMI_INT = 0.12;
+const _landSs = (e0: number, e1: number, x: number): number => {
+  let t = (x - e0) / (e1 - e0);
+  if (t < 0) t = 0; else if (t > 1) t = 1;
+  return t * t * (3 - 2 * t);
+};
+const _landLerp = (a: number, b: number, t: number): number => a + (b - a) * t;
 
 // Finished meshes uploaded to the GPU per frame (slice spec §7 — the only
 // generation cost allowed in the frame). The rest queue and drain over frames.
@@ -295,10 +314,13 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const camera = new PerspectiveCamera(55, 1, R * 0.4, R * 8);
   const fovY = (camera.fov * Math.PI) / 180;
 
-  const sun = new DirectionalLight(0xfff4e6, 1.4);
+  // Sun a touch brighter + the sky-fill cut roughly in half: the strong hemisphere ambient was
+  // filling shadowed slopes and washing relief into flat "clay." Less fill ⇒ lit/shadow contrast
+  // returns and slopes read as relief. (Mirror these in the ?landlog constants below.)
+  const sun = new DirectionalLight(0xfff4e6, 1.55);
   sun.position.set(1, 0.35, 0.6);
   scene.add(sun);
-  scene.add(new HemisphereLight(0x88aacc, 0x141018, 0.25));
+  scene.add(new HemisphereLight(0x88aacc, 0x141018, 0.12));
 
   const controls = new OrbitControls(camera, canvas);
   controls.enableDamping = true;
@@ -319,8 +341,15 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // `aLodR`/`aParentR` attributes, so there is no per-leaf material clone.
   // splitPx 300 (smaller, gentler LOD steps — affordable after the ~13× meshing
   // speedup); maxDepth = MAX_DEPTH gives meter-scale near-field cells for walking.
+  // ?split=N overrides the fly/orbit split threshold LIVE (smaller = finer tiles load at altitude =
+  // sharper silhouette + crisper coastlines, but more leaves/draw-calls → costs frame budget). Default
+  // stays 300; this lets the perf/quality tradeoff be A/B'd on a real GPU (watch ?perf worstDt) without a
+  // redeploy. Clamped ≥120 so a typo can't melt the budget. Used for BOTH the cut and the morph kDist below.
+  const flySplitPx = params.has('split')
+    ? Math.max(120, Number(params.get('split')) || FLY_SPLIT_PX)
+    : FLY_SPLIT_PX;
   const manager = new QuadtreeManager(planetGroup, recipe, R, {
-    splitPx: FLY_SPLIT_PX,
+    splitPx: flySplitPx,
     maxDepth: MAX_DEPTH,
     wireframe: params.has('wire'), // debug: see the tessellation / where lines fall
     // ?slopeband=N: pick a slope-band "look" preset (0=hard, 1=wide, 2=low-contrast, 3=soft).
@@ -409,7 +438,11 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   // concentric with the terrain. ?noocean A/B.
   const _seaProbe = new Float64Array(7);
   surfaceAt(recipe, R, SURFACE_DIR.x, SURFACE_DIR.y, SURFACE_DIR.z, _seaProbe, groundOct);
-  const seaLevelR = Math.min(R + 4000, _seaProbe[0]! - 400);
+  // Sea level → the blue-ocean world: ~R+4 km floods most of the ±14 km terrain into ocean with island
+  // continents (the look the user chose to revert to). Still clamped below the walk spawn's terrain so the
+  // player spawns on land. ?sea=METERS overrides the offset from R (e.g. ?sea=-6000 for a mostly-land look).
+  const seaOffset = params.has('sea') ? Number(params.get('sea')) : 4000;
+  const seaLevelR = Math.min(R + seaOffset, _seaProbe[0]! - 400);
   const ocean = createOcean(seaLevelR);
   ocean.mesh.visible = !params.has('noocean');
   scene.add(ocean.mesh);
@@ -446,7 +479,15 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
   const _qSpin = new Quaternion(); // planet spin: body → inertial (+theta about the tilted axis)
   const _qSpinInv = new Quaternion(); // inertial → body (for the body-fixed cut camera in fly/orbit)
   const _skyV = new Vector3();
-  const _spunOrigin = new Vector3(); // renderOrigin rotated by qSpin, for the slope-band `up` uniform
+  const _spunOrigin = new Vector3(); // renderOrigin rotated by qSpin, for atmosphere/ocean/clouds/body placement
+  const _sunDirBody = new Vector3(); // _qSpinInv·_sunDir — the BODY-frame sun for the terrain's aerial haze
+  // ?landlog state: a throttled, copy-pasteable [LAND] diagnostic of the land under the camera.
+  const landLog = params.has('landlog');
+  const _landSurf = new Float64Array(7); // surfaceAt scratch (radius, normal xyz, radial xyz)
+  const _landPrevCam = new Vector3(); // worldCam at the last log (to measure the cut-camera drift)
+  let _landPrevCamSet = false;
+  let landLogLast = 0; // performance.now() of the last [LAND] line
+  let landRecuts = 0; // recuts since the last [LAND] line (→ recut Hz = the churn the user sees)
   const _camUp = new Vector3(); // scene-space camera radial up (for the atmosphere ray-march), per frame
   let hudDistMoon = 0; // true camera→body distances (scene space), for the HUD readout
   let hudDistSun = 0;
@@ -849,7 +890,6 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       }
       planetGroup.quaternion.copy(_qSpin);
       _spunOrigin.copy(renderOrigin).applyQuaternion(_qSpin);
-      manager.setSpunOrigin([_spunOrigin.x, _spunOrigin.y, _spunOrigin.z]);
       // S1: the atmosphere shell sits at the planet centre (scene `−_spunOrigin`, same frame as the
       // Sun/Moon bodies) and consumes the REAL inertial sun direction — so day/night + the sun halo
       // come from the same geometry as the lit terrain (no separate sky light).
@@ -893,18 +933,20 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // CDLOD: feed the per-vertex distance-morph the same projected-size constant the cut
       // uses (kDist = (vpH/(2·tan(fovY/2)))/splitPx for the current mode), so detail fades in
       // continuously with distance and reaches the parent surface exactly at the split distance.
-      const curSplitPx = mode === 'walk' ? WALK_SPLIT_PX : mode === 'creative' ? CREATIVE_SPLIT_PX : FLY_SPLIT_PX;
+      const curSplitPx = mode === 'walk' ? WALK_SPLIT_PX : mode === 'creative' ? CREATIVE_SPLIT_PX : flySplitPx;
       const kDist = vpHeight / (2 * Math.tan(fovY / 2)) / curSplitPx;
       manager.setMorphParams(kDist, worldCam.x, worldCam.y, worldCam.z, approachRateEMA);
 
       // Dynamic near/far from altitude + horizon distance, every frame.
       const distCenter = worldCam.length();
       const horizon = Math.sqrt(Math.max(0, distCenter * distCenter - R * R));
-      // S2: feed the terrain's aerial-perspective haze — the real sun direction (so ground haze matches the
-      // sky shell at the horizon) + the air density at this altitude (exp falloff; →0 by orbit so the planet
-      // reads crisp from space). Cheap; render-only.
+      // S2: feed the terrain's aerial-perspective haze — the BODY-frame sun direction (qSpinInv·_sunDir, so
+      // the haze day factor matches the now body-fixed surface `up`; the dot is rotation-invariant so the
+      // ground haze still agrees with the inertial sky shell at the horizon) + the air density at this
+      // altitude (exp falloff; →0 by orbit so the planet reads crisp from space). Cheap; render-only.
+      _sunDirBody.copy(_sunDir).applyQuaternion(_qSpinInv);
       manager.setAtmosphere(
-        [_sunDir.x, _sunDir.y, _sunDir.z],
+        [_sunDirBody.x, _sunDirBody.y, _sunDirBody.z],
         noHaze ? 0 : Math.exp(-Math.max(0, distCenter - R) / AERIAL_SCALE_H_M),
       );
 
@@ -977,6 +1019,7 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       // reports the front is still climbing; it stops on its own once the cut reaches its target depth.
       const refineRecut = manager.isRefining() && now - lastCutTime > RECUT_MAX_MS;
       if (forceCut || moved > recutDist || turned || timeRecut || refineRecut) {
+        landRecuts++; // ?landlog: count recuts/sec (the streaming churn the user perceives as "morphing")
         let halfFov: number;
         let splitPxOverride: number | undefined;
         if (ctrlMode) {
@@ -1032,6 +1075,61 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SliceScene
       const tT = perf ? performance.now() : 0;
       manager.tick(dt); // advance LOD geomorphs
       if (perf) perfMaxTick = Math.max(perfMaxTick, performance.now() - tT);
+
+      // ── ?landlog — definitive per-second land diagnostic (copy/paste the whole [LAND] block) ──────
+      // Answers, for the ground UNDER the camera, the two open questions: WHY is the land dark (night vs
+      // dark palette vs near-black lit) and IS it drifting/morphing (cut-camera drift m/s + recut Hz).
+      // Everything is computed CPU-side mirroring the GPU shader + lights, so it reflects on-screen pixels.
+      if (landLog) {
+        if (landLogLast === 0) { landLogLast = now; _landPrevCam.copy(worldCam); _landPrevCamSet = true; }
+        if (now - landLogLast >= 1000) {
+          const dtS = (now - landLogLast) / 1000;
+          const alt = distCenter - R;
+          // View-center proxy: the ground directly under the camera (sub-camera radial point), BODY frame.
+          const cl = worldCam.length() || 1;
+          const dxs = worldCam.x / cl, dys = worldCam.y / cl, dzs = worldCam.z / cl;
+          surfaceAt(recipe, R, dxs, dys, dzs, _landSurf, groundOct);
+          const surfR = _landSurf[0]!;
+          const nX = _landSurf[1]!, nY = _landSurf[2]!, nZ = _landSurf[3]!; // body-frame outward normal
+          const elevN = (surfR - R) / recipe.height; // == the shader's normalized elevation
+          const slope = Math.max(0, Math.min(1, nX * dxs + nY * dys + nZ * dzs)); // body N · body up
+          // Lighting: N·sun is body·body ≡ world·world (rotation-invariant) → the day/night term.
+          const nDotSun = nX * _sunDirBody.x + nY * _sunDirBody.y + nZ * _sunDirBody.z;
+          const diffuse = Math.max(0, nDotSun) * LAND_SUN_INT;
+          // Albedo — mirror terrainMaterial: slope band (default preset 2) → elevation low/peak tiers.
+          const sb = SLOPE_PRESETS[2]!;
+          const band = _landSs(sb.lo, sb.hi, slope);
+          const sa0 = _landLerp(sb.rock[0], sb.sand[0], band);
+          const sa1 = _landLerp(sb.rock[1], sb.sand[1], band);
+          const sa2 = _landLerp(sb.rock[2], sb.sand[2], band);
+          const lowW = _landSs(LOW_HI, LOW_LO, elevN), peakW = _landSs(PEAK_LO, PEAK_HI, elevN);
+          const a0 = _landLerp(_landLerp(sa0, LOW_COLOR[0], lowW), PEAK_COLOR[0], peakW);
+          const a1 = _landLerp(_landLerp(sa1, LOW_COLOR[1], lowW), PEAK_COLOR[1], peakW);
+          const a2 = _landLerp(_landLerp(sa2, LOW_COLOR[2], lowW), PEAK_COLOR[2], peakW);
+          const ht = 0.5 + 0.5 * nY; // HemisphereLight: sky up (+Y)
+          const amb0 = _landLerp(LAND_HEMI_GROUND[0], LAND_HEMI_SKY[0], ht) * LAND_HEMI_INT;
+          const amb1 = _landLerp(LAND_HEMI_GROUND[1], LAND_HEMI_SKY[1], ht) * LAND_HEMI_INT;
+          const amb2 = _landLerp(LAND_HEMI_GROUND[2], LAND_HEMI_SKY[2], ht) * LAND_HEMI_INT;
+          const lit0 = a0 * (diffuse * LAND_SUN_COL[0] + amb0);
+          const lit1 = a1 * (diffuse * LAND_SUN_COL[1] + amb1);
+          const lit2 = a2 * (diffuse * LAND_SUN_COL[2] + amb2);
+          const drift = _landPrevCamSet ? worldCam.distanceTo(_landPrevCam) / dtS : 0;
+          const recutHz = landRecuts / dtS;
+          const st = manager.stats();
+          const f3 = (v: number): string => v.toFixed(3);
+          const sunElevDeg = Math.asin(Math.max(-1, Math.min(1, nDotSun))) * 180 / Math.PI;
+          const dayState = nDotSun > 0.02 ? 'DAY' : nDotSun > -0.05 ? 'TERMINATOR' : 'NIGHT';
+          const litState = lit0 < 0.06 && lit1 < 0.06 && lit2 < 0.06 ? 'NEAR-BLACK' : 'visible';
+          console.log(
+            `[LAND] mode=${mode} time=${timeScale}× gameDay=${(gameTimeS / 86400).toFixed(2)} alt=${(alt / 1000).toFixed(2)}km dist=${(distCenter / 1000).toFixed(0)}km\n` +
+            `[LAND] DRIFT cut-cam Δ=${drift.toFixed(1)} m/s (≈0 = steady; large at spd0 = planet sweeping under camera)  |  CHURN recut=${recutHz.toFixed(1)}/s  cut live=${st.live} pend=${st.pending} infl=${st.inflight} rdy=${st.ready}\n` +
+            `[LAND] SPOT dir=(${f3(dxs)},${f3(dys)},${f3(dzs)}) elev=${(surfR - R).toFixed(0)}m (norm ${elevN.toFixed(2)}) N=(${f3(nX)},${f3(nY)},${f3(nZ)}) slope=${slope.toFixed(2)}\n` +
+            `[LAND] SUN dirBody=(${f3(_sunDirBody.x)},${f3(_sunDirBody.y)},${f3(_sunDirBody.z)}) N·sun=${nDotSun.toFixed(3)} → ${dayState} (sunElev=${sunElevDeg.toFixed(0)}°)  diffuse=${diffuse.toFixed(2)} ambient≈${f3((amb0 + amb1 + amb2) / 3)}\n` +
+            `[LAND] COLOR band=${band.toFixed(2)} low=${lowW.toFixed(2)} peak=${peakW.toFixed(2)}  albedo=(${f3(a0)},${f3(a1)},${f3(a2)})  ⇒ LIT≈(${f3(lit0)},${f3(lit1)},${f3(lit2)}) [${litState}]`,
+          );
+          landLogLast = now; landRecuts = 0; _landPrevCam.copy(worldCam); _landPrevCamSet = true;
+        }
+      }
 
       // [NMS perf] — the breakdown that separates a real stutter's CAUSE. The HUD (Stats) shows the
       // worst frame dt; this says WHICH main-thread stage spiked (recut/upload/tick) vs GPU/other

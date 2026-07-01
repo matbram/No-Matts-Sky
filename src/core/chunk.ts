@@ -49,9 +49,14 @@ export interface MeshJob {
 }
 
 /** Default grid resolution: fine tangentially, modest radially (a thin shell). [T]
- *  Sized for streaming throughput (Step 3) — a leaf must mesh fast on a worker. */
-export const CHUNK_GRID_TANGENTIAL = 32;
-export const CHUNK_GRID_RADIAL = 12;
+ *  Sized for streaming throughput (Step 3) — a leaf must mesh fast on a worker.
+ *  Bumped 32→40 tangential / 12→14 radial to sharpen the surface silhouette + vertical
+ *  precision (the "sticky dough" look was the leaf undersampling the terrain at altitude).
+ *  GOLDEN-SAFE: the frozen mesh tests call meshChunk(...) with their OWN tan/rad (16/10),
+ *  so they never read these — raising them doesn't touch any recorded hash. Cost is ~quadratic
+ *  in tan (40²/32²=1.56×) but meshing is off-thread (worker), NOT in the frame budget. */
+export const CHUNK_GRID_TANGENTIAL = 40;
+export const CHUNK_GRID_RADIAL = 14;
 
 // Reused intermediate scratch. `meshChunk` is sequential and non-reentrant (one
 // leaf at a time per worker — and each worker has its own module instance), so
@@ -118,8 +123,11 @@ export function meshChunk(
   const cdir = faceDirection(req.face, uc, vc);
   const origin: [number, number, number] = [cdir[0] * radius, cdir[1] * radius, cdir[2] * radius];
 
-  // Radial range straddles the surface (r ≈ radius + height·noise, noise ∈ ~[-1,1]).
-  const margin = recipe.height * 1.6;
+  // Radial range straddles the surface. tv = base fBm (∈[-1,1]) + continental bias (±contAmp) + ridged
+  // mountains (+ridgeAmp), so the shell must reach |tv|·height at the extremes or tall peaks/deep basins
+  // clip flat against the grid top/bottom. 1.6 keeps the original 0.6 headroom over the base fBm; the
+  // macro amplitudes widen it. Byte-identical to the old `·1.6` when contAmp=ridgeAmp=0.
+  const margin = recipe.height * (1.6 + recipe.contAmp + recipe.ridgeAmp);
   const rMin = radius - margin;
   const rMax = radius + margin;
 

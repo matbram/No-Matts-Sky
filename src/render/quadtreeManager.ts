@@ -19,6 +19,7 @@ import {
   selectCut,
   balanceCut,
   clampCutToReachableFrontier,
+  completeCoverage,
   maxNeighborDelta as maxNeighborDeltaCore,
   nodeBounds,
   lodBoundRadius,
@@ -203,13 +204,8 @@ export class QuadtreeManager {
   // the leaf-CENTRE morph for ?lodmorphdebug/?morphcolor; the actual morph is per-vertex in TSL.
   private readonly sharedMat: Material;
   private readonly kDistUniform: { value: number };
-  // Material world-origin uniforms (set on every floating-origin recenter): the FULL render origin
-  // (direction, for slope bands) and renderOrigin reduced mod L in double (the stable, float-precise
-  // base for the surface-detail coordinate). See terrainMaterial.ts.
-  private readonly matRenderOrigin: { value: Vector3 };
-  private readonly matDetailPhase: { value: Vector3 };
   private readonly matNow: { value: number }; // manager clock → per-leaf birth-ease floor
-  private readonly matSunDir: { value: Vector3 }; // inertial sun dir → aerial-perspective day factor
+  private readonly matSunDir: { value: Vector3 }; // BODY-frame sun dir → aerial-perspective day factor
   private readonly matHazeDensity: { value: number }; // air density at camera altitude → haze strength
   private kDist = 0;
   private camX = 0;
@@ -225,6 +221,7 @@ export class QuadtreeManager {
   private auditSummary = ''; // HUD mirror of the [NMS audit] line
   private readonly _tA = new Float64Array(4);
   private readonly _tB = new Float64Array(4);
+  private readonly _centerPhase = new Vector3(); // scratch: m.origin reduced mod L (per-leaf upload)
 
   constructor(
     // Step 5: a container Object3D (a planetGroup the render shell spins by qSpin) — was the Scene.
@@ -234,7 +231,9 @@ export class QuadtreeManager {
     private readonly radius: number,
     private readonly opts: ManagerOpts,
   ) {
-    this.heightMargin = recipe.height * 1.6;
+    // Match the mesher's radial shell (chunk.ts): the LOD bound must cover the full terrain relief
+    // (base fBm + continents + ridges) so tall peaks aren't under-tessellated or horizon-culled early.
+    this.heightMargin = recipe.height * (1.6 + recipe.contAmp + recipe.ridgeAmp);
     // The ONE shared terrain material (per-leaf data rides in the `aLodR`/`aParentR` attributes); its kDist
     // uniform is updated each frame via setMorphParams.
     const handle = createTerrainMaterial({
@@ -246,8 +245,6 @@ export class QuadtreeManager {
     });
     this.sharedMat = handle.material;
     this.kDistUniform = handle.kDist;
-    this.matRenderOrigin = handle.renderOrigin;
-    this.matDetailPhase = handle.detailPhase;
     this.matNow = handle.now;
     this.matSunDir = handle.sunDir;
     this.matHazeDensity = handle.hazeDensity;
@@ -267,34 +264,23 @@ export class QuadtreeManager {
     }
   }
 
-  /** Re-center the render frame; reposition all live meshes relative to it. Also feed the material's
-   *  world-origin uniforms so the surface detail stays anchored to absolute world space (no swim) and
-   *  precise (the detail phase is renderOrigin reduced mod L in double — the float shader can't). */
+  /** Re-center the render frame; reposition all live meshes relative to it. (Surface shading is now
+   *  body-fixed via the per-leaf aCenter/aCenterPhase attributes, so no material origin uniform is fed
+   *  here — and the old slope-band swim under spin is gone with it.) */
   setRenderOrigin(o: [number, number, number]): void {
     this.renderOrigin = o;
-    this.matRenderOrigin.value.set(o[0], o[1], o[2]);
-    detailPhaseOf(o[0], o[1], o[2], this.matDetailPhase.value);
     for (const e of this.entries.values()) {
       if (e.mesh) e.mesh.position.set(e.center[0] - o[0], e.center[1] - o[1], e.center[2] - o[2]);
     }
   }
 
   /**
-   * Step 5: the terrain renders under a planetGroup the shell spins by qSpin, so the slope-band `up`
-   * (reconstructed in the material as normalize(positionWorld + uRenderOrigin)) needs the render origin
-   * ROTATED by the same spin — otherwise the bands swim as the planet turns. The shell passes
-   * qSpin·renderOrigin here each frame. Leaf POSITIONS stay body-fixed (origin − renderOrigin); only the
-   * group's rotation places them in the inertial frame, so this just keeps the lighting `up` consistent.
-   */
-  setSpunOrigin(o: [number, number, number]): void {
-    this.matRenderOrigin.value.set(o[0], o[1], o[2]);
-  }
-
-  /**
-   * Step 6 (S2): feed the aerial-perspective haze. `sunDir` is the inertial planet→sun direction (the same
-   * `_sunDir` the atmosphere shell uses — the shell and the ground haze then agree at the horizon); `density`
-   * is the air density at the camera altitude (~1 at the surface, →0 at orbit), which scales the haze so it
-   * fades to nothing from space. Render-only; no effect on the cut/streaming.
+   * Step 6 (S2): feed the aerial-perspective haze. `sunDir` is the BODY-frame planet→sun direction
+   * (`_qSpinInv·_sunDir`) so the haze day/night factor stays consistent with the body-frame `up`
+   * (bodyUp·bodySun ≡ inertialUp·inertialSun, so the ground haze still agrees with the inertial sky shell
+   * at the horizon, and day/night still sweeps as the planet spins); `density` is the air density at the
+   * camera altitude (~1 at the surface, →0 at orbit), which scales the haze so it fades to nothing from
+   * space. Render-only; no effect on the cut/streaming.
    */
   setAtmosphere(sunDir: [number, number, number], density: number): void {
     this.matSunDir.value.set(sunDir[0], sunDir[1], sunDir[2]);
@@ -398,7 +384,14 @@ export class QuadtreeManager {
     let clampedDepth = 0;
     for (const c of clamped) clampedDepth += c.path.length;
     this.frontierActive = clampedDepth < idealDepth;
-    const cut = balanceCut(clamped, this.opts.maxDepth);
+    // Coverage completion (BEFORE balanceCut): tile the uncovered slivers of any partially-tiled base
+    // cell so the cut is a COMPLETE partition — closes the cull-edge (limb) coverage hole that showed as
+    // random black pop-in when the camera moved (see completeCoverage in /core). Runs on the clamped cut
+    // and before balance so balance force-splits any >1-level step a coarse fill leaf introduces. The
+    // frontierActive accounting above is measured on the PRE-completion clamped cut (the fill must not
+    // perturb the "still climbing" signal). No-op when baseDepth=0.
+    const completed = completeCoverage(clamped, baseDepth);
+    const cut = balanceCut(completed, this.opts.maxDepth);
 
     const wanted = new Set<string>();
     for (const node of cut) {
@@ -892,8 +885,21 @@ export class QuadtreeManager {
       const lodR = lodBoundRadius(depth, this.radius);
       const parentR = depth > 0 ? lodBoundRadius(depth - 1, this.radius) : lodR * 2;
       const vc = m.positions.length / 3;
-      geometry.setAttribute('aLodR', new BufferAttribute(new Float32Array(vc).fill(lodR), 1));
-      geometry.setAttribute('aParentR', new BufferAttribute(new Float32Array(vc).fill(parentR), 1));
+      // Body-fixed per-leaf center — makes the surface SHADING (slope `up`, elevation band, procedural
+      // detail) a function of the planet BODY frame, not the spinning inertial frame, so the detail stays
+      // locked to the ground as the planet rotates (no "swim"). positionLocal (= m.positions) is relative
+      // to m.origin, so positionLocal + aCenter is the true body-absolute vertex; aCenterPhase is m.origin
+      // reduced mod DETAIL_PHASE_MOD_M (in double) so the detail coordinate stays small + float-precise.
+      // Constant per leaf (broadcast to every vertex), exactly like aLodR.
+      const oc = m.origin;
+      const aCenter = new Float32Array(vc * 3);
+      for (let q = 0; q < vc; q++) { aCenter[q * 3] = oc[0]; aCenter[q * 3 + 1] = oc[1]; aCenter[q * 3 + 2] = oc[2]; }
+      geometry.setAttribute('aCenter', new BufferAttribute(aCenter, 3));
+      detailPhaseOf(oc[0], oc[1], oc[2], this._centerPhase);
+      const px = this._centerPhase.x, py = this._centerPhase.y, pz = this._centerPhase.z;
+      const aCenterPhase = new Float32Array(vc * 3);
+      for (let q = 0; q < vc; q++) { aCenterPhase[q * 3] = px; aCenterPhase[q * 3 + 1] = py; aCenterPhase[q * 3 + 2] = pz; }
+      geometry.setAttribute('aCenterPhase', new BufferAttribute(aCenterPhase, 3));
       // Per-leaf go-live clock (ms) for the birth-ease floor: a leaf born late fades up from the
       // parent over BIRTH_MS instead of snapping in already-detailed (the bornM=0 pop). That ease is
       // RIGHT for refinement & cold loads (a leaf appearing over a COARSER ancestor or the backdrop), but
@@ -913,7 +919,14 @@ export class QuadtreeManager {
         }
       }
       const birthClock = mergeTarget ? this.clockMs - BIRTH_MS : this.clockMs;
-      geometry.setAttribute('aBirthMs', new BufferAttribute(new Float32Array(vc).fill(birthClock), 1));
+      // Pack the three per-leaf scalars (lodR, parentR, birthMs) into ONE vec3 attribute so the leaf
+      // geometry stays within WebGPU's 8-vertex-buffer limit: position + normal + morphTarget +
+      // morphTargetNormal (4) + aCenter + aCenterPhase (2) + aLodPack (1) = 7. Three separate scalars made
+      // it 9 → CreateRenderPipeline failed ("Vertex buffer count (9) exceeds the maximum (8)") and the
+      // terrain didn't render at all. The shader reads aLodPack.x/.y/.z (terrainMaterial.ts).
+      const aLodPack = new Float32Array(vc * 3);
+      for (let q = 0; q < vc; q++) { aLodPack[q * 3] = lodR; aLodPack[q * 3 + 1] = parentR; aLodPack[q * 3 + 2] = birthClock; }
+      geometry.setAttribute('aLodPack', new BufferAttribute(aLodPack, 3));
       // Render with the shared material. Debug-tint modes (?lodcolor/?skirtcolor/?morphcolor) clone
       // it and null its colorNode so a flat per-leaf colour shows (diagnostic + rare → clone cost is
       // fine, and the cloned graph still carries the morph nodes so the geomorph is unaffected).
@@ -1006,7 +1019,7 @@ export class QuadtreeManager {
         const sm = this.sharedMat as unknown as { positionNode: unknown; normalNode: unknown };
         console.log(
           `[NMS audit] wiring: morphTargetNormal=${!!geometry.getAttribute('morphTargetNormal')} ` +
-            `aLodR=${!!geometry.getAttribute('aLodR')} ` +
+            `aLodPack=${!!geometry.getAttribute('aLodPack')} aCenter=${!!geometry.getAttribute('aCenter')} ` +
             `positionNode=${!!sm.positionNode} normalNode=${!!sm.normalNode}`,
         );
       }

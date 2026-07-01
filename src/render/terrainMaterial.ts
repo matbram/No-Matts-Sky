@@ -18,14 +18,15 @@
 //    per-pixel function of distance, independent of chunk streaming) and no shimmer
 //    (each octave fades out before its features drop below a pixel).
 //
-// Precision (master plan Part 4): the morph's distance uses render-space positionWorld
-// (the floating-origin offset cancels). The detail COORDINATE needs an absolute, stable
-// world position; render-space positionWorld would "swim" when the origin recenters, and
-// the true absolute position is too large for float detail. So we add back a per-frame
-// `detailPhase = renderOrigin mod L` (reduced in DOUBLE on the CPU): positionWorld+phase
-// tracks the absolute position continuously through recenters yet stays small (< L) so
-// metre-scale detail stays float-precise. The slope `up` uses the full renderOrigin
-// (direction only — robust to the large magnitude).
+// Precision + spin (master plan Part 4): the morph's distance uses render-space positionWorld (the
+// floating-origin offset cancels there). Everything else — slope `up`, elevation, and the detail
+// COORDINATE — is computed in the planet BODY frame from per-leaf attributes (aCenter = the leaf's
+// body-fixed centre; aCenterPhase = that centre reduced mod L in DOUBLE on the CPU) plus positionLocal.
+// positionWorld bakes the planet's spin, so shading the surface there makes the detail/mottle "swim"
+// across the ground as the planet rotates; bodyAbs = positionLocal + aCenter is spin-invariant (and
+// recenter-invariant), and positionLocal + aCenterPhase keeps the detail coordinate small (< L) so
+// metre-scale detail stays float-precise. (Dot products are rotation-invariant, so body-frame slope ≡
+// inertial slope but constant under spin.)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { DoubleSide, Vector3 } from 'three';
@@ -40,7 +41,9 @@ import {
   positionWorld,
   cameraPosition,
   smoothstep,
+  sin,
   mx_noise_vec3,
+  transformNormalToView,
   Fn,
   If,
 } from 'three/tsl';
@@ -75,15 +78,40 @@ export const BIRTH_MS = 500;
 // in a normal fly descent (the origin is fixed per preset), rare in a long walk.
 const DETAIL_PHASE_MOD_M = 100_000;
 
-// Procedural detail (ONE octave — the 6 m fine-grain octave was dropped for fill-rate; see the material
-// body). Coarse 40 m mottle fades in from ~50 km. Its distance gate (smoothstep far→near) is also its
-// anti-alias guard: it reaches 0 before the feature projects below ~1 px, so detail never shimmers. [T] tune.
-const DETAIL_A_SCALE_M = 40; // coarse mottle (~40 m features)
+// Procedural detail — TWO octaves, each with a distance gate that is also its anti-alias guard (the
+// smoothstep far→near reaches 0 before the feature projects below ~1 px, so detail never shimmers):
+//   • octave A (~40 m): near-ground fine grain, fades in from ~50 km (the 6 m octave was dropped for fill-rate).
+//   • octave C (~500 m): the ALTITUDE-BAND octave (NEW). The 40 m grain can't reach orbit (it would shimmer
+//     below a pixel), so from 130–280 km the surface had NO high-frequency content and read as flat "clay."
+//     A 500 m feature still projects to >~1 px at ~280 km, so this octave can run up to ~400 km, giving the
+//     surface relief shading + mottle from altitude. It's a BAND (off below ~2.5 km where octave A + the
+//     geometry already carry it, so we don't pay both noise taps at the surface). [T] tune.
+const DETAIL_A_SCALE_M = 40; // fine mottle (~40 m features)
 export const DETAIL_A_NEAR_M = 1_000;
 export const DETAIL_A_FAR_M = 50_000;
+const DETAIL_C_SCALE_M = 500; // coarse relief (~500 m features) for the altitude/orbit band
+export const DETAIL_C_NEAR_M = 12_000; // distance gate "near" (full strength at/below this)
+export const DETAIL_C_FAR_M = 400_000; // …fades to 0 beyond (anti-alias: a 500 m feature is ~1 px at ~280 km)
+const DETAIL_C_FADE_LO = 2_500; // band floor: octave C off below this (octave A + geometry cover the near field)
+const DETAIL_C_FADE_HI = 9_000; // …ramps to full by here
 // Retained for the manager's [NMS step] gB diagnostic only (the 6 m octave they gated is no longer shaded).
 export const DETAIL_B_NEAR_M = 200;
 export const DETAIL_B_FAR_M = 6_000;
+
+// ── Detail strata + anti-pop reveal (Phase B materials) ──────────────────────
+// Sedimentary strata: altitude-banded layering, analytic (a sine of normalized elevation — NO noise tap),
+// shown only on the steep rock zones so cliffs read as layered rock instead of one flat tone. [T]
+const STRATA_FREQ = 38; // ~bands per unit elevation (height m); ~700–900 m strata spacing
+const STRATA_AMP = 0.07; // ± albedo tint amplitude on rock
+// Distance-reveal (anti-pop/morph, the Star Citizen "planet shader" trick): the micro-relief perturbation
+// darkens the lit surface on average as it fades IN with proximity (a bumpy surface self-shadows vs a flat
+// one), which reads as a brightness "morph" while flying. Pre-apply that mean darkening at distance, where
+// the real relief is absent, and lift it back to 1 as the relief arrives — so total brightness is CONTINUOUS
+// across the detail band and the detail REVEALS rather than flashes. Band sits just inside the geomorph so
+// geometry + shading arrive together. [T]
+export const REVEAL_NEAR_M = 900;
+export const REVEAL_FAR_M = 60_000;
+const REVEAL_DARKEN = 0.9; // far brightness floor ≈ the mean self-shadowing of the unloaded micro-relief
 
 // ── Aerial perspective (S2) ──────────────────────────────────────────────────
 // Haze the surface into the sky with distance: out-scatter DIMS the lit surface (× transmittance),
@@ -117,12 +145,13 @@ export interface SlopePreset {
 // the dominant per-fragment noise cost (the very cost S4 must bound) for no visible gain. The elevation
 // band is the S3 palette win instead; triplanar is the right tool only if a future 2D-textured archetype
 // is added.
-const PEAK_COLOR = [0.66, 0.62, 0.55] as const; // pale dusty highlands
-const LOW_COLOR = [0.33, 0.27, 0.23] as const; // darker lowland regolith
-const PEAK_LO = 0.20; // elevation (× height amplitude) where highlands start to fade in
-const PEAK_HI = 0.85; // …and reach full highland colour
-const LOW_HI = -0.10; // lowland tint starts fading in as elevation drops below this
-const LOW_LO = -0.70; // …and reaches full lowland colour
+// Exported so the ?landlog diagnostic (scene.ts) can mirror this exact palette on the CPU.
+export const PEAK_COLOR = [0.66, 0.62, 0.55] as const; // pale dusty highlands
+export const LOW_COLOR = [0.33, 0.27, 0.23] as const; // darker lowland regolith
+export const PEAK_LO = 0.20; // elevation (× height amplitude) where highlands start to fade in
+export const PEAK_HI = 0.85; // …and reach full highland colour
+export const LOW_HI = -0.10; // lowland tint starts fading in as elevation drops below this
+export const LOW_LO = -0.70; // …and reaches full lowland colour
 
 export const SLOPE_PRESETS: readonly SlopePreset[] = [
   { lo: 0.55, hi: 0.82, rock: [0.40, 0.36, 0.33], sand: [0.62, 0.55, 0.45] }, // 0 current — hard mottle (A/B ref)
@@ -153,16 +182,11 @@ export interface TerrainMaterialHandle {
    * distance-morph band reaches the parent surface exactly at the split distance (no seams).
    */
   kDist: { value: number };
-  /** Full render origin (m). Set `.value` whenever the floating origin recenters. Used (direction
-   *  only) to reconstruct the per-pixel radial "up" for slope material bands. */
-  renderOrigin: { value: Vector3 };
-  /** renderOrigin reduced modulo DETAIL_PHASE_MOD_M IN DOUBLE (set with renderOrigin). Added back to
-   *  render-space positionWorld to give a stable, float-precise absolute coordinate for the detail. */
-  detailPhase: { value: Vector3 };
   /** Manager clock (ms). Set `.value` every frame; drives the per-leaf birth-ease floor. */
   now: { value: number };
-  /** Inertial planet→sun direction (same `_sunDir` the atmosphere uses). Set `.value` each frame —
-   *  gives the aerial-perspective haze a day/night factor that matches the sky. */
+  /** BODY-frame planet→sun direction (`_qSpinInv·_sunDir`). Set `.value` each frame — gives the
+   *  aerial-perspective haze a day/night factor consistent with the body-frame `up` (a body-frame sun
+   *  still sweeps as the planet spins, so day/night animates; bodyUp·bodySun ≡ inertialUp·inertialSun). */
   sunDir: { value: Vector3 };
   /** Air density at the camera altitude (0 at orbit → 1 at the surface). Set `.value` each frame;
    *  scales the aerial-perspective haze so it fades to nothing from space. */
@@ -176,10 +200,8 @@ export interface TerrainMaterialHandle {
  */
 export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMaterialHandle {
   const kDist = uniform(0);
-  const uRenderOrigin = uniform(new Vector3());
-  const uDetailPhase = uniform(new Vector3());
   const uNow = uniform(0); // manager clock (ms), for the per-leaf birth-ease floor
-  const uSunDir = uniform(new Vector3(1, 0, 0)); // inertial planet→sun dir (aerial-perspective day factor)
+  const uSunDir = uniform(new Vector3(1, 0, 0)); // BODY-frame planet→sun dir (aerial-perspective day factor)
   const uHazeDensity = uniform(0); // air density at the camera altitude (0 orbit → 1 surface); 0 = no haze
   const mat = new MeshStandardNodeMaterial({
     color: 0x9a8c7a,
@@ -190,10 +212,14 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
   mat.wireframe = !!opts.wireframe;
 
   // ── CDLOD geomorph ─────────────────────────────────────────────────────────
-  // Per-leaf bound radii (constant within a leaf), as two scalar attributes. dChild/dParent are the
-  // split/merge distances — 2·radius·kDist, matching selectCut's projected-size test exactly.
-  const lodR = float(attribute<'float'>('aLodR', 'float'));
-  const parentR = float(attribute<'float'>('aParentR', 'float'));
+  // Per-leaf CDLOD data (constant within a leaf) PACKED into ONE vec3 attribute: x=lodR, y=parentR,
+  // z=birthMs. WebGPU caps a pipeline at 8 vertex buffers; position+normal+morphTarget+morphTargetNormal
+  // (4) + aCenter + aCenterPhase (2) + three separate scalars would be 9 → the terrain pipeline fails to
+  // create and NO land renders. Packing the three scalars into one vec3 keeps us at 7 buffers.
+  // dChild/dParent are the split/merge distances — 2·radius·kDist, matching selectCut's projected-size test.
+  const lodPack = attribute<'vec3'>('aLodPack', 'vec3');
+  const lodR = lodPack.x;
+  const parentR = lodPack.y;
   const dChild = lodR.mul(2).mul(kDist);
   const dParent = parentR.mul(2).mul(kDist);
   const e0 = mix(dChild, dParent, MORPH_START_FRAC);
@@ -201,8 +227,9 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
   const mFactor = smoothstep(e0, dParent, dist); // 0 near (full detail) → 1 far (parent surface)
   // Birth-ease FLOOR: a freshly-live leaf starts at 1 (= the parent it replaced → invisible) and
   // decays to its distance-morph over BIRTH_MS, so a late arrival (mFactor already ≈0) fades up
-  // instead of snapping. aBirthMs is constant per leaf (set at upload = the go-live clock).
-  const birthMs = float(attribute<'float'>('aBirthMs', 'float'));
+  // instead of snapping. birthMs is constant per leaf (set at upload = the go-live clock), packed as
+  // aLodPack.z (see above).
+  const birthMs = lodPack.z;
   const birthFloor = uNow.sub(birthMs).div(BIRTH_MS).clamp(0, 1).oneMinus();
   const mFinal = mFactor.max(birthFloor); // 0 near (full) → 1 far (parent), floored while fresh
 
@@ -216,14 +243,16 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     mFinal,
   ).normalize();
 
-  // Slope material bands (always). r = the fragment's inertial position (precision-robust as a direction);
-  // reused for both the radial `up` and the elevation band below. slope=1 where the surface faces straight
-  // up (flat) → sand; lower → rock.
-  const r = positionWorld.add(uRenderOrigin);
-  // One radial length, reused for BOTH the slope `up` (= r/|r|) and the elevation band below — saves a
-  // sqrt per fragment vs a separate normalize()+length() in the hottest (every-terrain-fragment) path.
-  const rLen = r.length();
-  const up = r.div(rLen);
+  // Slope material bands + elevation band (always), computed in the planet BODY frame so the surface
+  // shading stays LOCKED to the ground as the planet spins (no swim). bodyAbs = positionLocal + the leaf's
+  // body-fixed centre (aCenter) = the true body-absolute vertex; `up` is its radial direction, `rLen` its
+  // radius. slope = (body normal)·(body up) is rotation-invariant, so it equals the inertial slope but is
+  // constant under spin. slope=1 where the surface faces straight up (flat) → sand; lower → rock.
+  const bodyAbs = positionLocal.add(attribute('aCenter', 'vec3'));
+  // One radial length, reused for BOTH the slope `up` (= bodyAbs/|bodyAbs|) and the elevation band below —
+  // saves a sqrt per fragment vs a separate normalize()+length() in the hottest (every-fragment) path.
+  const rLen = bodyAbs.length();
+  const up = bodyAbs.div(rLen);
   const slope = nGeom.dot(up).clamp(0, 1);
   const sb = SLOPE_PRESETS[Math.min(Math.max((opts.slopePreset ?? 0) | 0, 0), SLOPE_PRESETS.length - 1)]!;
   const band = smoothstep(sb.lo, sb.hi, slope);
@@ -243,44 +272,73 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
     // and the normal perturbation are NOT in the compiled shader). Just the morph normal + slope-band albedo.
     mat.colorNode = albedo;
     mat.roughnessNode = float(0.92);
-    mat.normalNode = nGeom;
+    // normalNode must be in VIEW space: r184 uses a custom normalNode DIRECTLY as `normalView` with no
+    // transform (Normal.js:113), so feeding the body/object-space nGeom made lit brightness swing with the
+    // CAMERA's look direction (the sun gets viewMatrix'd each frame, the normal didn't). transformNormalToView
+    // applies modelNormalMatrix (incl. the planetGroup spin) + cameraViewMatrix → view-independent, spin-stable.
+    mat.normalNode = transformNormalToView(nGeom);
   } else {
     // ── Surface detail (fades in with proximity, on the morph's schedule) ───────
-    // ONE octave only (the fine 6 m octave was dropped — it only shows within ~6 km, rarely on screen).
-    // Stable, float-precise absolute coordinate (see header): render-space position + renderOrigin mod L.
-    const pDetail = positionWorld.add(uDetailPhase);
+    // TWO octaves: A (~40 m, near grain) + C (~500 m, altitude band). Both use the same stable, float-precise
+    // BODY-fixed coordinate (see header): positionLocal + the leaf centre reduced mod L (aCenterPhase).
+    // Body-fixed ⇒ the detail is locked to the ground through the planet's spin AND through floating-origin
+    // recenters. The mod-L (100 km) wrap seam is body-fixed and off-screen — L ≫ both detail scales and the
+    // 500 m octave only renders within ~400 km, so the 100 km-spaced seam never shows on screen.
+    const pDetail = positionLocal.add(attribute('aCenterPhase', 'vec3'));
     // Weight: tie to the geometry morph (off where geometry collapses to its parent, so the two never fight)
     // AND a distance gate (anti-alias: 0 before the feature drops below a pixel).
     const morphW = mFinal.oneMinus(); // 1 near (full geometry detail) → 0 far (parent)
     const wA = morphW.mul(smoothstep(DETAIL_A_FAR_M, DETAIL_A_NEAR_M, dist));
-    // One gradient-noise vec3 (≈[-1,1]³), reused for albedo mottle + normal perturbation — but the
-    // mx_noise_vec3 is the dominant per-fragment fill-rate cost (?nodetail was buttery) and at orbit/altitude
-    // its weight wA is 0, so evaluating it there is pure wasted fill. Gate it behind a per-fragment branch:
-    // a Fn establishes the build stack If() needs (calling If during top-level material construction has no
-    // stack → the earlier "Cannot read properties of null (reading 'If')"), and the compiler emits a REAL
-    // WGSL `if`, so the noise is genuinely SKIPPED where wA≈0 — not hoisted. The branch is coherent per-leaf
-    // (wA is a distance/morph function, ~constant across a leaf), so GPU divergence is negligible. Returns 0
-    // when skipped, matching the ×wA≈0 contribution it would otherwise have produced.
+    // Octave C weight: distance gate (full ≤12 km, off >400 km) × a near-field floor so it's a BAND that
+    // switches off below ~2.5 km (octave A + the geometry carry the near field — avoids paying both taps).
+    const wC = morphW
+      .mul(smoothstep(DETAIL_C_FAR_M, DETAIL_C_NEAR_M, dist))
+      .mul(smoothstep(DETAIL_C_FADE_LO, DETAIL_C_FADE_HI, dist));
+    const rc = pDetail.mul(1 / DETAIL_A_SCALE_M);
+    const rcC = pDetail.mul(1 / DETAIL_C_SCALE_M);
+    // Each gradient-noise vec3 (≈[-1,1]³, reused for albedo mottle + roughness + normal perturbation). The
+    // mx_noise tap is the dominant per-fragment fill cost, so each is gated behind a per-fragment branch (a Fn
+    // establishes the build stack If() needs; the compiler emits a REAL WGSL `if`, so the noise is genuinely
+    // SKIPPED where the weight ≈0). Near the surface octave A runs and C is off; at altitude A is off and C
+    // runs — so it's ~one tap either way, not two (except a thin overlap band). Returns 0 when skipped.
     const ndA = Fn(() => {
       const out = vec3(0).toVar();
       If(wA.greaterThan(0.001), () => {
-        out.assign(mx_noise_vec3(pDetail.mul(1 / DETAIL_A_SCALE_M)));
+        out.assign(mx_noise_vec3(rc));
+      });
+      return out;
+    })();
+    const ndC = Fn(() => {
+      const out = vec3(0).toVar();
+      If(wC.greaterThan(0.001), () => {
+        out.assign(mx_noise_vec3(rcC));
       });
       return out;
     })();
 
-    // Albedo mottle: ±detail near, fading to the flat band colour with distance.
-    const mottle = ndA.x.mul(wA).mul(0.22);
-    mat.colorNode = albedo.mul(mottle.add(1));
+    // Albedo: ±fine mottle near + ±coarse mottle through the altitude band (so the surface isn't one flat
+    // tone from orbit) PLUS analytic sedimentary strata on the steep ROCK zones (band→0 = rock) — altitude-
+    // banded layering that reads as layered cliffs without a noise tap. All fade out with their weights.
+    const mottle = ndA.x.mul(wA).mul(0.22).add(ndC.x.mul(wC).mul(0.16));
+    const strata = sin(elev.mul(STRATA_FREQ)).mul(band.oneMinus()).mul(wA).mul(STRATA_AMP);
+    // Distance-reveal (anti-pop): pre-apply the micro-relief's mean self-shadow darkening where the relief
+    // is still absent (far), lifting to 1 as it arrives (near) — so brightness is continuous across the band
+    // and the detail REVEALS instead of flashing. The reveal band sits just inside the geomorph (REVEAL_NEAR
+    // > DETAIL_A_NEAR) so geometry and shading resolve together.
+    const meanDarken = mix(float(REVEAL_DARKEN), float(1), smoothstep(REVEAL_FAR_M, REVEAL_NEAR_M, dist));
+    mat.colorNode = albedo.mul(mottle.add(strata).add(1)).mul(meanDarken);
     // Gentle roughness break-up so the surface doesn't read as one uniform sheen up close.
     mat.roughnessNode = float(0.92).sub(ndA.y.mul(wA).mul(0.06)).clamp(0.4, 1);
 
     // Normal perturbation: tilt the morph normal by the TANGENTIAL part of the detail noise (remove the
-    // along-normal component so it tilts, not inflates), weighted so it vanishes where geometry morphs to
-    // the parent. Gives fine relief shading up close, smoothing out with distance.
-    const pert = ndA.mul(wA);
+    // along-normal component so it tilts, not inflates), weighted so it vanishes where geometry morphs to the
+    // parent. Octave A gives fine relief up close; octave C (weighted a little lower) gives the coarse relief
+    // shading that turns the surface from flat "clay" into terrain when viewed from altitude.
+    const pert = ndA.mul(wA).add(ndC.mul(wC).mul(0.7));
     const pertTang = pert.sub(nGeom.mul(pert.dot(nGeom)));
-    mat.normalNode = nGeom.add(pertTang.mul(0.3)).normalize();
+    // To VIEW space (see the noDetail branch): r184 takes a custom normalNode AS the view normal, so an
+    // object-space normal here makes lighting rotate with the camera. transformNormalToView fixes that.
+    mat.normalNode = transformNormalToView(nGeom.add(pertTang.mul(0.3)).normalize());
   }
 
   // ── Aerial perspective (S2): haze the surface into the atmosphere ────────────
@@ -308,8 +366,6 @@ export function createTerrainMaterial(opts: TerrainMaterialOpts = {}): TerrainMa
   return {
     material: mat,
     kDist: kDist as unknown as { value: number },
-    renderOrigin: uRenderOrigin as unknown as { value: Vector3 },
-    detailPhase: uDetailPhase as unknown as { value: Vector3 },
     now: uNow as unknown as { value: number },
     sunDir: uSunDir as unknown as { value: Vector3 },
     hazeDensity: uHazeDensity as unknown as { value: number },

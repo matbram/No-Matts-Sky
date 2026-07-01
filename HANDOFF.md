@@ -442,7 +442,37 @@ leaves (no spike), no rAF `[Violation]` stalls.
        that isn't the bottleneck violates the prime directive. Revisit only if a real-GPU `?perf` shows upload as
        the spike, or when a 2D-textured archetype makes true triplanar (and per-mesh data) worthwhile.
    - Deferred refinements: velocity inheritance on launch; unify orbit presets into one seamless free-flight;
-     nearest-body speed scaling; un-swim surface detail under spin; analytic eclipse; Moon as a real landable body.
+     nearest-body speed scaling; analytic eclipse; Moon as a real landable body. (**un-swim surface detail
+     under spin: DONE** — see the ground-stability session below.)
+
+- **Ground stability (un-swim) + Earth-like desert look (branch `claude/ground-stability-audit-41y51i`).**
+  Render-only; all 129 goldens unchanged, typecheck + build green. Two user-reported problems:
+  - **Ground "procedurally drifting" under spin — FIXED.** The terrain renders under `planetGroup`
+    (rotation `qSpin(t)`), but `terrainMaterial.ts` did its surface SHADING (slope `up`, elevation band,
+    procedural detail) in INERTIAL space via `positionWorld` (which bakes the spin) while the mesh
+    normals/positions are body-fixed → the detail noise field was effectively fixed in space while the
+    ground rotated through it = the swim (loud at 360× time). Fix: compute all surface shading in the
+    planet BODY frame. Two constant-per-leaf vec3 attributes (`quadtreeManager.uploadReady`): `aCenter` =
+    `m.origin` (body-fixed leaf centre) and `aCenterPhase` = `detailPhaseOf(m.origin)` (centre mod
+    `DETAIL_PHASE_MOD_M=100 km` in double). In the material `bodyAbs = positionLocal + aCenter` gives the
+    body `up`/`rLen`/`elev`, and `pDetail = positionLocal + aCenterPhase` the float-precise body-fixed
+    detail coord. `slope = bodyNormal·bodyUp` is rotation-invariant → spin-stable. The CDLOD morph keeps
+    `dist = positionWorld.distance(cameraPosition)` (render-space, correct). The haze sun is fed in body
+    frame (`_qSpinInv·_sunDir`) so day/night still sweeps. Removed the now-dead `uRenderOrigin`/
+    `uDetailPhase` uniforms + `setSpunOrigin` (kept `_spunOrigin` for shell/body placement). Real diffuse
+    lighting is unaffected (Three transforms the body-space `normalNode` to world via the object's normal
+    matrix). ⚠ Real-GPU: at 360× the surface detail/mottle should stay LOCKED to the ground while the
+    day/night terminator still sweeps.
+  - **Earth-like desert look (user: balanced land/sea, scattered cumulus, valley-shaded rivers).** Sea
+    level dropped from R+4 km to R−1 km (`scene.ts`; `?sea=METERS` override) for a balanced land/sea split
+    (was ~64% ocean = the "blue island world"). Desert palette in `terrainMaterial.ts`: warm tan/ochre
+    slope preset 2 (the default), darker warm lowland tint (valley/drainage = rivers) + paler highlands,
+    and the blue aerial haze halved (`HAZE_LUMA` 0.5→0.32) so land shows its tan. Clouds (`clouds.ts`)
+    retuned to scattered puffy cumulus: sparser (`COVER_LO` 0.06→0.17), tighter band, smaller cells
+    (`FREQ_A` 2.6→5, `FREQ_B` 7→15) + a fine billow octave, brighter dense cores. Headless `?webgl&daylit`
+    orbit: tan continents + blue basins + scattered white puffs + thin limb. ⚠ Real-GPU: judge the day-side
+    look + tune `?sea=`/palette/clouds. (Note: large COHERENT continents would need a low-frequency
+    continental mask in the density recipe — a core change, deferred.)
 
 ## 7. Reading the diagnostics (`?lodaudit`) — how to judge LOD health
 - `[NMS] cut: leaves=N lod={depth:count} maxNbrΔ=k` — the live cut. **`maxNbrΔ>1`** = a >1-level edge step →

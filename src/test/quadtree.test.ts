@@ -8,6 +8,7 @@ import {
   balanceCut,
   maxNeighborDelta,
   clampCutToReachableFrontier,
+  completeCoverage,
   isPathPrefix,
   retainedShouldRemove,
   packRegion,
@@ -392,6 +393,114 @@ describe('clampCutToReachableFrontier (gated incremental refinement)', () => {
 function refineToDepth(node: QuadNode, depth: number): QuadNode[] {
   return node.path.length >= depth ? [node] : childrenOf(node).flatMap((c) => refineToDepth(c, depth));
 }
+
+describe('completeCoverage (cull-edge coverage hole fix)', () => {
+  const BASE = 2;
+  const MAXD = 12;
+  const n = (face: number, path: number[]): QuadNode => ({ face, path });
+  const skey = (q: QuadNode): string => `${q.face}/${q.path.join('')}`;
+
+  // Covering depth of surface dir (face,u,v) in a leaf set: walk root→down, return the first prefix
+  // present (the cut is a partition, so that's THE covering leaf), or -1 if uncovered. Mirrors the
+  // balanceCut block's coveringDepthT — but standalone so it's in scope here.
+  const coverDepth = (set: Set<string>, face: number, u: number, v: number): number => {
+    let u0 = -1, u1 = 1, v0 = -1, v1 = 1;
+    const path: number[] = [];
+    for (let d = 1; d <= MAXD; d++) {
+      const um = (u0 + u1) / 2, vm = (v0 + v1) / 2;
+      let q = 0;
+      if (u >= um) { q |= 1; u0 = um; } else u1 = um;
+      if (v >= vm) { q |= 2; v0 = vm; } else v1 = vm;
+      path.push(q);
+      if (set.has(`${face}/${path.join('')}`)) return d;
+    }
+    return -1;
+  };
+  // A base cell [face, [a,b]] is a clean PARTITION of the cut iff every sampled (u,v) inside it is
+  // covered at depth ≥ BASE (no gap) AND no two leaves in the cell are prefix-related (no overlap).
+  const cellIsPartition = (cut: QuadNode[], face: number, base: number[]): boolean => {
+    const set = new Set(cut.map(skey));
+    const r = uvRectFromPath(base);
+    for (let i = 1; i < 8; i++) {
+      for (let j = 1; j < 8; j++) {
+        const u = r.u0 + ((r.u1 - r.u0) * i) / 8;
+        const v = r.v0 + ((r.v1 - r.v0) * j) / 8;
+        if (coverDepth(set, face, u, v) < BASE) return false; // a gap → black hole
+      }
+    }
+    const inCell = cut.filter((q) => q.face === face && isPathPrefix(base, q.path));
+    for (const a of inCell)
+      for (const b of inCell)
+        if (a !== b && isPathPrefix(a.path, b.path)) return false; // overlap (ancestor + descendant)
+    return true;
+  };
+
+  it('is identity when baseDepth=0 (determinism guard)', () => {
+    const cut = [n(0, [0, 0, 0]), n(0, [0, 0, 1]), n(1, [2, 3])];
+    expect(completeCoverage(cut, 0)).toEqual(cut);
+  });
+
+  it('THE BUG: a partially-tiled base cell is completed into a full partition', () => {
+    // Base cell [0,[0,0]] refined to P0,P1 only — P2,P3 were culled at the cone edge (the limb).
+    // Plus an unrelated, fully-tiled far cell that must be left exactly as-is.
+    const cut = [n(0, [0, 0, 0]), n(0, [0, 0, 1]), ...refineToDepth(n(3, [2, 1]), 2)];
+    expect(cellIsPartition(cut, 0, [0, 0])).toBe(false); // input has the hole
+    const out = completeCoverage(cut, BASE);
+    expect(cellIsPartition(out, 0, [0, 0])).toBe(true); // hole closed: [0,0] is now fully tiled
+    // The missing quadrants are now covered (single coarse fill leaves at depth 3).
+    const set = new Set(out.map(skey));
+    expect(set.has('0/002')).toBe(true);
+    expect(set.has('0/003')).toBe(true);
+  });
+
+  it('fills empty quadrants with ONE coarse leaf each (not subdivided deeper)', () => {
+    // Only P0 present in [0,[0,0]] → fill must emit exactly [0,0,1],[0,0,2],[0,0,3] at depth 3.
+    const cut = [n(0, [0, 0, 0])];
+    const out = completeCoverage(cut, BASE);
+    const set = new Set(out.map(skey));
+    expect(set.has('0/001')).toBe(true);
+    expect(set.has('0/002')).toBe(true);
+    expect(set.has('0/003')).toBe(true);
+    // No deeper fill leaf was emitted under those quadrants.
+    expect(out.every((q) => q.path.length <= 3)).toBe(true);
+    expect(cellIsPartition(out, 0, [0, 0])).toBe(true);
+  });
+
+  it('is a superset with no duplicate leaves', () => {
+    const cut = [n(0, [0, 0, 0]), n(0, [0, 0, 1]), n(2, [1, 1, 1])];
+    const out = completeCoverage(cut, BASE);
+    const keys = out.map(skey);
+    expect(new Set(keys).size).toBe(keys.length); // no duplicates
+    for (const c of cut) expect(keys).toContain(skey(c)); // originals preserved
+  });
+
+  it('leaves an already-complete cut unchanged (set-equal)', () => {
+    // A base cell fully tiled at depth 3 (all 4 children present) needs no fill.
+    const cut = [...refineToDepth(n(0, [0, 0]), 3), n(1, [2, 2])];
+    const out = completeCoverage(cut, BASE);
+    expect(new Set(out.map(skey))).toEqual(new Set(cut.map(skey)));
+  });
+
+  it('is deterministic (same input → identical output)', () => {
+    const cut = [n(0, [0, 0, 0]), n(0, [0, 0, 1]), n(4, [3, 0, 2]), n(2, [1])].filter(
+      (q) => q.path.length >= BASE,
+    );
+    const a = completeCoverage(cut, BASE);
+    const b = completeCoverage(cut, BASE);
+    expect(a).toEqual(b);
+  });
+
+  it('composes to a balanced partition (completeCoverage → balanceCut)', () => {
+    // A cell straddling the cull edge: P0 refined deep (depth 5) in-cone, P1 at depth 3, P2/P3 culled.
+    // After completion+balance the whole cell tiles AND every cross-LOD step is ≤1 level (morphable).
+    const cut = [...refineToDepth(n(0, [0, 0, 0]), 5), n(0, [0, 0, 1])];
+    const completed = completeCoverage(cut, BASE);
+    expect(cellIsPartition(completed, 0, [0, 0])).toBe(true);
+    const balanced = balanceCut(completed, MAXD);
+    expect(maxNeighborDelta(balanced, MAXD)).toBeLessThanOrEqual(1);
+    expect(cellIsPartition(balanced, 0, [0, 0])).toBe(true);
+  });
+});
 
 describe('production cut composition (FROZEN)', () => {
   // Freeze the LOD decision layer — the cut drives every meshed leaf, so silent drift here
